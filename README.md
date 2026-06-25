@@ -42,6 +42,15 @@ Camera + IMU → GPU-accelerated SLAM on Jetson → Nav2 path planning → micro
 | MCU ROS bridge | micro-ROS for ESP-IDF |
 
 ## System Pipeline
+[IMX219 CSI camera]
+↓
+[isaac_ros_visual_slam] → /visual_slam/tracking/odometry
+↓
+[Nav2] → /cmd_vel
+↓
+[micro-ROS agent] ←→ UART 115200 ←→ [ESP32]
+↓ ↓
+[/odom, /imu] [TB6612FNG → TT motors]
 
 
 ## ESP32 Firmware (FreeRTOS)
@@ -66,4 +75,8 @@ Camera + IMU → GPU-accelerated SLAM on Jetson → Nav2 path planning → micro
 | 8 | Stress test, metrics, GitHub, demo video |
 
 ## Repository Structure
-
+slam-amr/
+├── esp32/
+│ └── microros_hello/
+│ └── microros_hello.c # Week 1: micro-ROS publisher with auto-reconnect
+└── README.md
