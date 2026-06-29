@@ -4,9 +4,21 @@ Autonomous Mobile Robot with Visual-Inertial SLAM on NVIDIA Jetson Orin Nano Sup
 
 **Ngoc Giang — Fulbright University Vietnam — June–August 2026**
 
-## What it does
+## Input / Output
 
-Camera + IMU → GPU-accelerated SLAM on Jetson → Nav2 path planning → micro-ROS → ESP32 motor control → differential drive robot navigates autonomously.
+**Input:** a goal position — `(x, y)` coordinate on a map, clicked in RViz2 on the Jetson
+
+**Output:** the robot physically drives itself to that position and stops, correcting its path in real time
+
+Everything in between (SLAM, Nav2, PID, odometry) is the pipeline making that happen automatically.
+
+## Business Context
+
+Factory logistics in Vietnam is still largely manual. Mid-size manufacturers (electronics, garments, F&B) move parts between stations by hand or with basic forklifts. Imported AMRs (MiR, Omron) cost $20,000–$50,000 per unit — out of reach for most.
+
+This project demonstrates a camera-based AMR (no lidar) built on commodity hardware. Replacing lidar with a $20 camera module cuts hardware cost significantly while GPU-accelerated SLAM on the Jetson maintains navigation quality. The Week 6 semantic navigation capability — navigate to a *detected object*, not a hardcoded coordinate — is the feature that makes this commercially relevant: a robot that can find a labeled bin or pallet without pre-programming exact positions.
+
+Target users: Vietnamese manufacturers, logistics companies, and robotics startups who need autonomous internal transport but cannot justify imported AMR pricing.
 
 ## Performance Targets
 
@@ -43,24 +55,22 @@ Camera + IMU → GPU-accelerated SLAM on Jetson → Nav2 path planning → micro
 
 ## System Pipeline
 
-[IMX219 CSI camera]
-
-↓
-
-[isaac_ros_visual_slam] → /visual_slam/tracking/odometry
-
-↓
-
-[Nav2] → /cmd_vel
-
-↓
-
-[micro-ROS agent] ←→ UART 115200 ←→ [ESP32]
-
-↓ ↓
-
-[/odom, /imu] [TB6612FNG → TT motors]
-
+```mermaid
+flowchart TD
+    A["RViz2 — click goal (x, y)"] --> B["Nav2\nPath Planner + Costmap"]
+    C["IMX219 CSI Camera"] --> D["isaac_ros_visual_slam\nGPU-accelerated on Jetson"]
+    D -->|"/visual_slam/tracking/odometry"| B
+    D -->|"/map"| B
+    B -->|"/cmd_vel\ngeometry_msgs/Twist"| F["micro-ROS Agent\nJetson"]
+    F <-->|"UART 115200 baud"| G["ESP32 — FreeRTOS\n4 tasks"]
+    G -->|"PWM + DIR"| H["TB6612FNG\nMotor Driver"]
+    H --> I["TT Motor L + TT Motor R"]
+    I --> J["LM393 Encoders x2"]
+    J -->|"pulse count → RPM"| G
+    G -->|"/odom nav_msgs/Odometry"| F
+    G -->|"/imu sensor_msgs/Imu\nMPU6050 @ 200 Hz"| D
+    F -->|"/odom + /imu"| B
+```
 
 ## ESP32 Firmware (FreeRTOS)
 
@@ -70,7 +80,7 @@ Camera + IMU → GPU-accelerated SLAM on Jetson → Nav2 path planning → micro
 - `pid_task` — velocity PID @ 100 Hz → PWM + `/odom`
 - `uros_task` — micro-ROS spin, subscribes `/cmd_vel`
 
-## 8-Week Roadmap
+## Roadmap
 
 | Week | Deliverable |
 |------|-------------|
@@ -78,19 +88,17 @@ Camera + IMU → GPU-accelerated SLAM on Jetson → Nav2 path planning → micro
 | 2 | Motor driver + encoder wiring, ESP32 publishes `/odom` |
 | 3 | IMX219 → isaac_ros_visual_slam → trajectory in RViz2 |
 | 4 | PID velocity control, `/cmd_vel` → accurate robot movement |
-| 5 | Nav2 integration, autonomous navigation to goal pose |
-| 6 | Full end-to-end: camera → SLAM → Nav2 → motors |
-| 7 | Semantic navigation: TensorRT object detection → navigate to target |
-| 8 | Stress test, metrics, GitHub, demo video |
+| 5 | Nav2 + full end-to-end: camera → SLAM → Nav2 → motors autonomous |
+| 6 | Semantic navigation: TensorRT object detection → navigate to target |
+| 7 | Stress test, metrics, GitHub, demo video |
+| 8 | Buffer / stretch goals (waypoint patrol, return-to-dock, multi-session map) |
 
 ## Repository Structure
 
+```
 slam-amr/
-
 ├── esp32/
-
-│ └── microros_hello/
-
-│ └── microros_hello.c # Week 1: micro-ROS publisher with auto-reconnect
-
+│   └── microros_hello/
+│       └── microros_hello.c   # Week 1: micro-ROS publisher with auto-reconnect
 └── README.md
+```
