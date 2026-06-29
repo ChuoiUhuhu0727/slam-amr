@@ -41,6 +41,7 @@ Target users: Vietnamese manufacturers, logistics companies, and robotics startu
 | TB6612FNG motor driver | Dual H-bridge PWM control |
 | LM393 encoders x2 | Wheel velocity feedback |
 | TT DC motors x2 | Differential drive |
+| Powerbank 20000mAh | 5V 3A USB output — main power source |
 
 ## Software Stack
 

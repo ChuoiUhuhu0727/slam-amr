@@ -40,8 +40,7 @@ Build an Autonomous Mobile Robot (AMR) that navigates real environments using ca
 | LM393 encoder x2 | 20-slot optical disk | Wheel velocity feedback |
 | MPU6050 | 6-DOF IMU, I2C 400 kHz | Visual-inertial sensor fusion |
 | TB6612FNG | Dual H-bridge, 1.2 A/channel | Motor PWM driver |
-| 3×18650 LiPo pack | 11.1 V nominal, 12.6 V max | Main power source |
-| LM2596 buck converter | 11.1 V → 5 V regulated | Motor \+ ESP32 power regulation |
+| Powerbank | 20000mAh, USB 5V 3A output | Main power source (replaces LiPo + LM2596) |
 
  
 
@@ -124,7 +123,7 @@ Build an Autonomous Mobile Robot (AMR) that navigates real environments using ca
 | Risk | Likelihood | Mitigation |
 | :---- | :---- | :---- |
 | Isaac ROS Docker fails on JetPack 6.x | Medium | Pin exact JetPack \+ Isaac ROS version matrix from NVIDIA compatibility table |
-| TT motor burns at 11.1 V | High if unmitigated | LM2596 → 5 V before TB6612FNG. Non-negotiable. |
+| Powerbank auto-shutoff during idle | Medium | Verified stays on during idle; monitor during long autonomous runs |
 | micro-ROS serial latency spikes | Low–Medium | Use hardware UART (not USB-CDC); 115200 baud; ring buffer in uros\_task |
 | SLAM drift \> 5 cm without IMU | Medium | Add MPU6050 to ESP32 I2C bus at Week 3 if drift measured above threshold |
 | Nav2 config complexity | High | Start with single minimal YAML, tune one parameter at a time; disable unused layers |
