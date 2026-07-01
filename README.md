@@ -107,3 +107,7 @@ slam-amr/
 ## PID Control Block Diagram
 
 ![](<images/PID pipeline.drawio.png>)
+
+## PID Control Block Diagram
+
+![](<images/PID pipeline.drawio.png>)
