@@ -103,3 +103,7 @@ slam-amr/
 │       └── microros_hello.c   # Week 1: micro-ROS publisher with auto-reconnect
 └── README.md
 ```
+
+## PID Control Block Diagram
+
+![](<images/PID pipeline.drawio.png>)
