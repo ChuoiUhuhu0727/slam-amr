@@ -58,91 +58,29 @@ Target users: Vietnamese manufacturers, logistics companies, and robotics startu
 
 ![](<images/H-Bridge in TB6612FNG.drawio.png>)
 
-## Wiring Diagram (ESP32 ↔ TB6612FNG ↔ Motors ↔ Encoders)
+## Wiring Table (ESP32 ↔ TB6612FNG ↔ Motors ↔ Encoders ↔ IMU)
 
-Motor driver path is wired and verified in `esp32/motor_f1` (F1 milestone). Encoders are wired (F2, in progress). IMU is planned only — not wired yet, shown dashed.
+Motor driver path is wired and verified in `esp32/motor_f1` (F1 milestone). Encoders are wired (F2, in progress). IMU is wired but not read in firmware yet.
 
-```mermaid
-flowchart LR
-    subgraph ESP32["ESP32 38-pin DevKit"]
-        G16["GPIO16"]
-        G17["GPIO17"]
-        G18["GPIO18"]
-        G19["GPIO19"]
-        G21["GPIO21"]
-        G22["GPIO22"]
-        G23["GPIO23"]
-        G34["GPIO34"]
-        G35["GPIO35"]
-        ESDA["SDA (TBD)"]
-        ESCL["SCL (TBD)"]
-        E3V3["3V3"]
-        E5V["5V"]
-        EGND["GND"]
-    end
+| ESP32 Pin | Connects To | Component | Purpose | Status |
+|-----------|-------------|-----------|---------|--------|
+| GPIO16 | PWMA | TB6612FNG | Motor A speed | ✅ wired |
+| GPIO17 | PWMB | TB6612FNG | Motor B speed | ✅ wired |
+| GPIO18 | AIN1 | TB6612FNG | Motor A direction | ✅ wired |
+| GPIO19 | AIN2 | TB6612FNG | Motor A direction | ✅ wired |
+| GPIO21 | BIN1 | TB6612FNG | Motor B direction | ✅ wired |
+| GPIO22 | BIN2 | TB6612FNG | Motor B direction | ✅ wired |
+| GPIO23 | STBY | TB6612FNG | Enable (HIGH = run) | ✅ wired |
+| GPIO34 | OUT | LM393 Encoder L | Wheel L pulse count | ✅ wired |
+| GPIO35 | OUT | LM393 Encoder R | Wheel R pulse count | ✅ wired |
+| SDA / SCL | SDA / SCL | MPU6050 IMU | I2C sensor read | 🔌 wired, not read in firmware yet |
+| 3V3 | VCC | TB6612FNG, both encoders, IMU | Logic power | ✅ wired |
+| 5V | VM | TB6612FNG | Motor power (temporary passthrough) | ✅ wired |
+| GND | GND | All above + powerbank | Common ground | ✅ wired |
 
-    subgraph TB["TB6612FNG Driver"]
-        PWMA["PWMA"]
-        PWMB["PWMB"]
-        AIN1["AIN1"]
-        AIN2["AIN2"]
-        BIN1["BIN1"]
-        BIN2["BIN2"]
-        STBY["STBY"]
-        VCC["VCC (logic)"]
-        VM["VM (motor power)"]
-        TGND["GND"]
-        AO["AO1 / AO2"]
-        BO["BO1 / BO2"]
-    end
+**Downstream of TB6612FNG:** AO1/AO2 → Motor L (red/black) · BO1/BO2 → Motor R (red/black)
 
-    G16 --> PWMA
-    G17 --> PWMB
-    G18 --> AIN1
-    G19 --> AIN2
-    G21 --> BIN1
-    G22 --> BIN2
-    G23 --> STBY
-    E3V3 --> VCC
-    E5V -.->|"temporary passthrough"| VM
-    EGND --> TGND
-
-    AO --> ML["Motor L (red=AO1, black=AO2)"]
-    BO --> MR["Motor R (red=BO1, black=BO2)"]
-
-    PB["Powerbank 20000mAh (5V/3A)"] -.->|"shared GND"| EGND
-
-    subgraph ENCL["LM393 Encoder L"]
-        ELOUT["OUT"]
-        ELVCC["VCC"]
-        ELGND["GND"]
-    end
-
-    subgraph ENCR["LM393 Encoder R"]
-        EROUT["OUT"]
-        ERVCC["VCC"]
-        ERGND["GND"]
-    end
-
-    ELOUT --> G34
-    E3V3 --> ELVCC
-    EGND --> ELGND
-
-    EROUT --> G35
-    E3V3 --> ERVCC
-    EGND --> ERGND
-
-    subgraph MPU["MPU6050 IMU — not wired yet"]
-        ISDA["SDA"]
-        ISCL["SCL"]
-    end
-
-    ISDA -.-> ESDA
-    ISCL -.-> ESCL
-```
-
-> Motor power currently passes through the ESP32's 5V pin (temporary). Once the powerbank feeds VM directly, update this diagram.
-> IMU box is dashed — I2C pins are placeholders until MPU6050 gets wired (later in F2/F3).
+> Motor power (VM) currently passes through the ESP32's 5V pin — temporary until the powerbank feeds VM directly.
 
 ## System Pipeline
 
