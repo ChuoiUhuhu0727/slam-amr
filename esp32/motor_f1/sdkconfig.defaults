@@ -1,0 +1,6 @@
+# This board's crystal is NOT the usual 40 MHz. Building with the default
+# 40 MHz assumption gave garbled serial output and a boot loop in F1.
+# Autodetect lets the runtime measure the real crystal frequency.
+#   (menuconfig path: Component config -> Hardware Settings
+#    -> Main XTAL Config -> Main XTAL frequency -> Autodetect)
+CONFIG_XTAL_FREQ_AUTO=y
