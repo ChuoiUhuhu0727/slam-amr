@@ -54,6 +54,96 @@ Target users: Vietnamese manufacturers, logistics companies, and robotics startu
 | MCU framework | ESP-IDF + FreeRTOS |
 | MCU ROS bridge | micro-ROS for ESP-IDF |
 
+## Motor Driver Schematic (TB6612FNG H-Bridge)
+
+![](<images/H-Bridge in TB6612FNG.drawio.png>)
+
+## Wiring Diagram (ESP32 ↔ TB6612FNG ↔ Motors ↔ Encoders)
+
+Motor driver path is wired and verified in `esp32/motor_f1` (F1 milestone). Encoders are wired (F2, in progress). IMU is planned only — not wired yet, shown dashed.
+
+```mermaid
+flowchart LR
+    subgraph ESP32["ESP32 38-pin DevKit"]
+        G16["GPIO16"]
+        G17["GPIO17"]
+        G18["GPIO18"]
+        G19["GPIO19"]
+        G21["GPIO21"]
+        G22["GPIO22"]
+        G23["GPIO23"]
+        G34["GPIO34"]
+        G35["GPIO35"]
+        ESDA["SDA (TBD)"]
+        ESCL["SCL (TBD)"]
+        E3V3["3V3"]
+        E5V["5V"]
+        EGND["GND"]
+    end
+
+    subgraph TB["TB6612FNG Driver"]
+        PWMA["PWMA"]
+        PWMB["PWMB"]
+        AIN1["AIN1"]
+        AIN2["AIN2"]
+        BIN1["BIN1"]
+        BIN2["BIN2"]
+        STBY["STBY"]
+        VCC["VCC (logic)"]
+        VM["VM (motor power)"]
+        TGND["GND"]
+        AO["AO1 / AO2"]
+        BO["BO1 / BO2"]
+    end
+
+    G16 --> PWMA
+    G17 --> PWMB
+    G18 --> AIN1
+    G19 --> AIN2
+    G21 --> BIN1
+    G22 --> BIN2
+    G23 --> STBY
+    E3V3 --> VCC
+    E5V -.->|"temporary passthrough"| VM
+    EGND --> TGND
+
+    AO --> ML["Motor L (red=AO1, black=AO2)"]
+    BO --> MR["Motor R (red=BO1, black=BO2)"]
+
+    PB["Powerbank 20000mAh (5V/3A)"] -.->|"shared GND"| EGND
+
+    subgraph ENCL["LM393 Encoder L"]
+        ELOUT["OUT"]
+        ELVCC["VCC"]
+        ELGND["GND"]
+    end
+
+    subgraph ENCR["LM393 Encoder R"]
+        EROUT["OUT"]
+        ERVCC["VCC"]
+        ERGND["GND"]
+    end
+
+    ELOUT --> G34
+    E3V3 --> ELVCC
+    EGND --> ELGND
+
+    EROUT --> G35
+    E3V3 --> ERVCC
+    EGND --> ERGND
+
+    subgraph MPU["MPU6050 IMU — not wired yet"]
+        ISDA["SDA"]
+        ISCL["SCL"]
+    end
+
+    ISDA -.-> ESDA
+    ISCL -.-> ESCL
+```
+
+> Motor power currently passes through the ESP32's 5V pin (temporary). Once the powerbank feeds VM directly, update this diagram.
+> IMU box is dashed — I2C pins are placeholders until MPU6050 gets wired (later in F2/F3).
+
 ## System Pipeline
 
 ```mermaid
@@ -80,6 +170,52 @@ flowchart TD
 - `encoder_task` — GPIO ISR on LM393 → RPM per wheel
 - `pid_task` — velocity PID @ 100 Hz → PWM + `/odom`
 - `uros_task` — micro-ROS spin, subscribes `/cmd_vel`
+
+### F1 — Basic Motor Spin (`esp32/motor_f1`)
+
+First firmware milestone for the drivetrain: prove the **ESP32 → TB6612FNG → TT motor**
+path works. Fixed 50% PWM, both motors forward. No encoder, no PID yet (those are F2 / F3).
+
+**Pin map (ESP32 38-pin DevKit → TB6612FNG)**
+
+| ESP32 | TB6612FNG | Purpose |
+|-------|-----------|---------|
+| GPIO16 | PWMA | Motor A speed |
+| GPIO17 | PWMB | Motor B speed |
+| GPIO18 | AIN1 | Motor A direction |
+| GPIO19 | AIN2 | Motor A direction |
+| GPIO21 | BIN1 | Motor B direction |
+| GPIO22 | BIN2 | Motor B direction |
+| GPIO23 | STBY | Enable (HIGH = run) |
+| 3V3 | VCC | Logic power |
+| 5V | VM | Motor power (temporary: ESP32 5V passthrough) |
+| GND | GND | Common ground (shared with powerbank) |
+
+Motor L: red → AO1, black → AO2 · Motor R: red → BO1, black → BO2
+
+**Build & flash**
+
+```bash
+cd esp32/motor_f1
+idf.py build
+sudo chmod 666 /dev/ttyUSB0
+python -m esptool --chip esp32 --no-stub -p /dev/ttyUSB0 -b 115200 \
+  write_flash --flash_mode dio --flash_size 2MB --flash_freq 40m \
+  0x1000  build/bootloader/bootloader.bin \
+  0x8000  build/partition_table/partition-table.bin \
+  0x10000 build/motor_f1.bin
+```
+
+**Gotchas hit during F1 (so we don't repeat them)**
+
+1. **Non-standard crystal.** This board's XTAL is not the usual 40 MHz.
+   A default build gave garbled serial + a boot loop. Fix is baked into
+   `sdkconfig.defaults` (`CONFIG_XTAL_FREQ_AUTO=y`).
+2. **Stub flashing fails** with `Failed to start stub`. Flash with
+   `--no-stub` at `-b 115200` (see command above).
+3. **Predict-then-measure debugging.** Every pin has an *expected* voltage
+   you can work out before touching the meter. Two points on the same wire
+   showing different voltages ⇒ a broken/cold solder joint between them.
 
 ## Roadmap
 
