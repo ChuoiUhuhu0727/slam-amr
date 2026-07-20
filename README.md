@@ -186,14 +186,14 @@ This is the boundary the two halves of the team build against. Either side can d
 
 ## Team & Work Split
 
-Two-person team. Split is drawn along one line: **does this task require physically touching the robot?** The remote teammate cannot solder, reseat a cable, or hear a motor to tune PID — so anything requiring hands-on-hardware iteration stays with the on-site owner. Anything that is pure software/config, or can be developed and dry-run against logged/simulated data (e.g. a `ros2 bag` recording, or mock topic publishers), is fair game to build remotely and integrate later.
+Two-person team. Split is drawn along one line: **does this task require physically touching the robot?** Alex (remote) cannot solder, reseat a cable, or hear a motor to tune PID — so anything requiring hands-on-hardware iteration stays with the on-site owner. Anything that is pure software/config, or can be developed and dry-run against logged/simulated data (e.g. a `ros2 bag` recording, or mock topic publishers), is fair game to build remotely and integrate later.
 
 **Ngoc Giang (vịt) — on-site, owns the physical stack:**
 - ESP32 firmware requiring real hardware feedback: `encoder_task`, `pid_task` (PID tuning needs to hear/see the real motor respond — cannot be tuned blind), odometry math, `uros_task`
 - All hardware bring-up: soldering, wiring, camera mounting/calibration, IMU mounting
 - On-device validation: carrying the robot to check SLAM trajectory (Week 3), physically measuring drift (Week 7)
 
-**Teammate (remote) — owns the software/config stack, buildable without the physical robot:**
+**Alex (remote) — owns the software/config stack, buildable without the physical robot:**
 - Isaac ROS Docker setup + `visual_slam` launch/config (Week 3) — can be built and dry-run against a sample rosbag or public IMX219 dataset before the real camera feed is ready
 - Nav2 stack: YAML config, planner selection, costmap layers (Week 5) — develop against simulated `/odom` + `/map` data, tune for real once camera/SLAM (vịt's side) is live
 - Semantic navigation: train/export detection model, write TensorRT inference node (Week 6) — training and most integration work doesn't need the physical robot, only final on-device deployment does
