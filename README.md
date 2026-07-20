@@ -168,6 +168,39 @@ python -m esptool --chip esp32 --no-stub -p /dev/ttyUSB0 -b 115200 \
 | 7 | Stress test, metrics, GitHub, demo video |
 | 8 | Buffer / stretch goals (waypoint patrol, return-to-dock, multi-session map) |
 
+## ROS2 Topic Interface (contract between ESP32 stack and Jetson stack)
+
+This is the boundary the two halves of the team build against. Either side can develop independently as long as message type and topic name match — the ESP32 side doesn't need to know how `/cmd_vel` was computed, and the Jetson side doesn't need to know how `/odom` was computed.
+
+| Topic | Message Type | Publisher | Subscriber |
+|-------|-------------|-----------|------------|
+| `/camera/image_raw` | `sensor_msgs/Image` | argus_camera (Jetson) | visual_slam (Jetson) |
+| `/camera/camera_info` | `sensor_msgs/CameraInfo` | argus_camera (Jetson) | visual_slam (Jetson) |
+| `/imu` | `sensor_msgs/Imu` | ESP32 (micro-ROS) | visual_slam (Jetson) |
+| `/odom` | `nav_msgs/Odometry` | ESP32 (micro-ROS) | Nav2 (Jetson) |
+| `/visual_slam/tracking/odometry` | `nav_msgs/Odometry` | visual_slam (Jetson) | Nav2 (Jetson) |
+| `/map` | `nav_msgs/OccupancyGrid` | visual_slam (Jetson) | Nav2 costmap (Jetson) |
+| `/cmd_vel` | `geometry_msgs/Twist` | Nav2 (Jetson) | ESP32 (micro-ROS) |
+| `/tf` | `tf2_msgs/TFMessage` | visual_slam + Nav2 (Jetson) | All nodes |
+| `/goal_pose` | `geometry_msgs/PoseStamped` | RViz2 / mission (Jetson) | Nav2 (Jetson) |
+
+## Team & Work Split
+
+Two-person team. Split is drawn along one line: **does this task require physically touching the robot?** The remote teammate cannot solder, reseat a cable, or hear a motor to tune PID — so anything requiring hands-on-hardware iteration stays with the on-site owner. Anything that is pure software/config, or can be developed and dry-run against logged/simulated data (e.g. a `ros2 bag` recording, or mock topic publishers), is fair game to build remotely and integrate later.
+
+**Ngoc Giang (vịt) — on-site, owns the physical stack:**
+- ESP32 firmware requiring real hardware feedback: `encoder_task`, `pid_task` (PID tuning needs to hear/see the real motor respond — cannot be tuned blind), odometry math, `uros_task`
+- All hardware bring-up: soldering, wiring, camera mounting/calibration, IMU mounting
+- On-device validation: carrying the robot to check SLAM trajectory (Week 3), physically measuring drift (Week 7)
+
+**Teammate (remote) — owns the software/config stack, buildable without the physical robot:**
+- Isaac ROS Docker setup + `visual_slam` launch/config (Week 3) — can be built and dry-run against a sample rosbag or public IMX219 dataset before the real camera feed is ready
+- Nav2 stack: YAML config, planner selection, costmap layers (Week 5) — develop against simulated `/odom` + `/map` data, tune for real once camera/SLAM (vịt's side) is live
+- Semantic navigation: train/export detection model, write TensorRT inference node (Week 6) — training and most integration work doesn't need the physical robot, only final on-device deployment does
+- Tooling: evaluation/metrics scripts (Week 7), RViz2 dashboard config, repo docs
+
+**Handoff points:** the [ROS2 Topic Interface](#ros2-topic-interface-contract-between-esp32-stack-and-jetson-stack) table above is the contract — build against topic name + message type, not against the other person's implementation. When a physical milestone lands (e.g. `/odom` is real and flowing), that's the signal to switch from mock data to live integration testing together.
+
 ## Repository Structure
 
 ```
