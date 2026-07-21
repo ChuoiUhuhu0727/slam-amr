@@ -166,7 +166,7 @@ void app_main(void) {
     setup_gpio();
     setup_pwm();
 
-    gpio_set_level(STBY_PIN, 1);   /* wake the TB6612FNG out of standby */
+    //gpio_set_level(STBY_PIN, 1);   /* wake the TB6612FNG out of standby */
 
     /* Motor A forward: AIN1 = HIGH, AIN2 = LOW */
     gpio_set_level(AIN1_PIN, 1);
