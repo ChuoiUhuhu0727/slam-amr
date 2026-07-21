@@ -66,7 +66,7 @@ static volatile float rpm_right_shared = 0.0f;
 
 /* Spinlock used to make "read + reset" atomic (avoids the lost-pulse race
  * where a pulse arrives between reading the counter and zeroing it). */
-static portMUX_TYPE encoder_mux = portMUX_INITIALIZE_DEFAULT;
+static portMUX_TYPE encoder_mux = portMUX_INITIALIZER_UNLOCKED;
 
 /* One ISR handles both pins; `arg` tells it which counter to bump.
  * IRAM_ATTR: ISR code must live in IRAM so it still runs even while
