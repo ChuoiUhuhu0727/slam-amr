@@ -155,6 +155,67 @@ python -m esptool --chip esp32 --no-stub -p /dev/ttyUSB0 -b 115200 \
    you can work out before touching the meter. Two points on the same wire
    showing different voltages ⇒ a broken/cold solder joint between them.
 
+### F2 — Encoder RPM Read (`esp32/motor_f1`, merged with F1)
+
+Second firmware milestone: `encoder_task` counts LM393 pulses via GPIO ISR
+and computes RPM per wheel every 1s. Merged into the same project as F1
+(not a separate one) because F3 (PID) needs both motor and encoder together
+anyway. **Confirmed working on real hardware 2026-07-21** — hand-spun each
+wheel, RPM tracked correctly and independently per side, returned to 0 at rest.
+
+**Pin map (ESP32 → LM393 encoders)**
+
+| ESP32 | Encoder | Purpose |
+|-------|---------|---------|
+| GPIO34 | Left OUT | Pulse count (input-only pin, no internal pull-up needed) |
+| GPIO35 | Right OUT | Pulse count (input-only pin, no internal pull-up needed) |
+
+**Test procedure** — verify the encoder alone before trusting it under PID:
+comment out the `gpio_set_level(STBY_PIN, 1)` line in `app_main` so the
+motors stay off, flash, then hand-spin each wheel and check the RPM printed
+over serial looks sane. Only once confirmed, uncomment and let F1 + F2 run
+together.
+
+**Build, flash & monitor** — pipe the monitor output to a timestamped file
+so a milestone test run isn't lost to terminal scrollback:
+
+```bash
+cd esp32/motor_f1
+idf.py build
+sudo chmod 666 /dev/ttyUSB0
+python -m esptool --chip esp32 --no-stub -p /dev/ttyUSB0 -b 115200 \
+  write_flash --flash_mode dio --flash_size 2MB --flash_freq 40m \
+  0x1000  build/bootloader/bootloader.bin \
+  0x8000  build/partition_table/partition-table.bin \
+  0x10000 build/motor_f1.bin
+idf.py -p /dev/ttyUSB0 monitor | tee "test_f2_$(date +%Y%m%d_%H%M).log"
+```
+
+**Gotchas hit during F2 (so we don't repeat them)**
+
+1. **Wrong FreeRTOS macro.** `portMUX_INITIALIZE_DEFAULT` doesn't exist —
+   the correct static spinlock initializer is `portMUX_INITIALIZER_UNLOCKED`.
+   Compiler catches this immediately, but noting it here to save the lookup.
+2. **Read-then-reset race condition.** The shared pulse counter is written
+   by the ISR and read+reset by `encoder_task` every second. Without
+   protection, a pulse that arrives between the read and the reset gets
+   silently lost (the reset unconditionally zeroes the counter, discarding
+   whatever was there). Fixed by wrapping the read+reset in
+   `portENTER_CRITICAL`/`portEXIT_CRITICAL`.
+3. **RPM is quantized in steps of 3.** With 20 slots/rev and a 1-second
+   sample window, one pulse = `(1/20) * 60 = 3` RPM — every value in the
+   test log is a multiple of 3. This isn't a bug; it's the sensor's actual
+   resolution. **Relevant for F3:** at low speed this granularity can look
+   like noise/jitter to a PID loop — if Kp tuning looks unexpectedly twitchy
+   at low RPM, check whether it's real oscillation or just this quantization
+   before assuming the gains are wrong.
+
+**TODO before F3 (not done yet, don't build early):** write a small Python
+script to parse a `test_f2_*.log` and plot RPM vs. time. Not worth it for F2
+(the numbers were readable by eye), but PID tuning in F3 needs to see
+step-response curves (overshoot, settling time) that aren't readable from
+scrolling terminal output.
+
 ## Roadmap
 
 | Week | Deliverable |
