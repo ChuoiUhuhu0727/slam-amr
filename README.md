@@ -43,6 +43,25 @@ Target users: Vietnamese manufacturers, logistics companies, and robotics startu
 | TT DC motors x2 | Differential drive |
 | Powerbank 20000mAh | 5V 3A USB output — main power source |
 
+### Power Architecture — Known Issue + Planned Fix (2026-07-22)
+
+**Problem found during F3 (PID) testing:** motor power (VM on TB6612FNG) was wired through the ESP32's own 5V pin, which itself was powered off the Jetson's USB port. Jetson USB ports are current-limited and were never meant to supply motor-driver current. Once PID pushed PWM higher during startup (highest current draw is near-stall, i.e. near 0 RPM), the shared 5V rail sagged enough to brown out the ESP32, which then rebooted, re-enabled the motor immediately in `app_main`, sagged again — a self-sustaining reset loop.
+
+Separately, the Jetson's own supply (powerbank → PD Trigger → 12V barrel jack) tops out at ~12V/1.5A (~18W), well under the ~45W (19V/2.37A) the stock adapter is rated for — fine at idle, but a real risk once Week 3 GPU/SLAM workloads start drawing more.
+
+**Planned fix — dedicated LiPo + buck-boost for the Jetson, decoupling it from the ESP32/motor power path:**
+
+| Item | Spec to match | Search terms |
+|------|----------------|--------------|
+| LiPo battery pack | 4S, 5000mAh, XT60 connector + balance connector | `4S 5000mAh XT60 lipo` |
+| Balance charger | Supports 4S balance charging | `lipo balance charger 4S` |
+| Buck-boost converter | Adjustable output, input range covering 3S–6S (~9–25V), ≥5A rated output — built around the `LTC3780` controller IC | `LTC3780 buck boost converter module 10A` |
+| LiPo safety bag | Fireproof charging/storage bag | `lipo safe bag fireproof` |
+
+**Before connecting to the Jetson:** power the buck-boost from the LiPo alone (Jetson disconnected), measure output with a multimeter, trim to exactly 19V, confirm polarity — only then connect to the barrel jack. Same verify-before-connect discipline as the camera cable fix.
+
+**Separately (not yet done):** motor VM still needs its own wire straight from a powerbank output, bypassing the ESP32 entirely — this is the fix that unblocks F3 testing; the LiPo/buck-boost work above is for the Jetson's own supply and is lower priority (works fine at today's idle-ish load, becomes urgent before Week 3 GPU workloads).
+
 ## Software Stack
 
 | Layer | Technology |
