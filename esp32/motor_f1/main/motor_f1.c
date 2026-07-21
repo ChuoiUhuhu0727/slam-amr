@@ -121,14 +121,22 @@ static void encoder_task(void *arg) {
     }
 }
 
-/* error(t) = target - actual; u(t) = Kp * error(t); PWM = clamp(u(t), 0, 255).
+/* TEMPORARY safety cap while VM still shares the weak ESP32/Jetson-USB rail
+ * (see README "Power Architecture" note). Real fix is rewiring VM straight
+ * to the powerbank; this just keeps peak current low enough to tune Kp
+ * today without tripping another brownout reset loop. Raise cautiously,
+ * watching for resets, once VM has its own supply — this line should not
+ * stay at 100 forever. */
+#define MAX_SAFE_PWM 100.0f
+
+/* error(t) = target - actual; u(t) = Kp * error(t); PWM = clamp(u(t), 0, MAX_SAFE_PWM).
  * P-only for now — Ki/Kd are Week 2 stretch, not required to move to F4. */
 static uint32_t pid_step(float target_rpm, float actual_rpm) {
     float error = target_rpm - actual_rpm;
     float u = KP * error;
 
-    if (u < 0.0f)   u = 0.0f;    /* clamp: can't spin backward with AIN/BIN fixed forward */
-    if (u > 255.0f) u = 255.0f;  /* clamp: LEDC 8-bit duty tops out at 255 */
+    if (u < 0.0f)           u = 0.0f;           /* clamp: can't spin backward with AIN/BIN fixed forward */
+    if (u > MAX_SAFE_PWM)   u = MAX_SAFE_PWM;   /* clamp: temporary current-safety ceiling, not the LEDC max */
 
     return (uint32_t)u;
 }
