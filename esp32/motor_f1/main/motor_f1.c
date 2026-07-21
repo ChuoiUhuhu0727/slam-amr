@@ -53,6 +53,10 @@
 #define ENC_R_PIN GPIO_NUM_35   /* right encoder signal */
 #define SLOTS_PER_REV 20        /* LM393 disk: 20 slots = 1 full wheel revolution */
 
+/* --- F3: P-only velocity control (Ki/Kd come later, tune Kp first) --- */
+#define TARGET_RPM 30.0f   /* hardcoded target for now; /cmd_vel comes in F5 */
+#define KP 3.0f            /* start small, increase until oscillation appears, back off */
+
 static const char *TAG = "encoder_task";
 
 /* Shared between ISR (writer) and encoder_task (reader) -> must be volatile
@@ -117,6 +121,35 @@ static void encoder_task(void *arg) {
     }
 }
 
+/* error(t) = target - actual; u(t) = Kp * error(t); PWM = clamp(u(t), 0, 255).
+ * P-only for now — Ki/Kd are Week 2 stretch, not required to move to F4. */
+static uint32_t pid_step(float target_rpm, float actual_rpm) {
+    float error = target_rpm - actual_rpm;
+    float u = KP * error;
+
+    if (u < 0.0f)   u = 0.0f;    /* clamp: can't spin backward with AIN/BIN fixed forward */
+    if (u > 255.0f) u = 255.0f;  /* clamp: LEDC 8-bit duty tops out at 255 */
+
+    return (uint32_t)u;
+}
+
+static void pid_task(void *arg) {
+    TickType_t last_wake = xTaskGetTickCount();
+    const TickType_t period = pdMS_TO_TICKS(10);   /* 100 Hz = 10 ms period */
+
+    while (1) {
+        vTaskDelayUntil(&last_wake, period);
+
+        uint32_t pwm_left  = pid_step(TARGET_RPM, rpm_left_shared);
+        uint32_t pwm_right = pid_step(TARGET_RPM, rpm_right_shared);
+
+        ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0, pwm_left);
+        ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0);
+        ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1, pwm_right);
+        ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1);
+    }
+}
+
 /* Configure the five direction/enable pins as digital outputs. */
 static void setup_gpio(void) {
     gpio_config_t cfg = {
@@ -166,7 +199,7 @@ void app_main(void) {
     setup_gpio();
     setup_pwm();
 
-    //gpio_set_level(STBY_PIN, 1);   /* wake the TB6612FNG out of standby */
+    gpio_set_level(STBY_PIN, 1);   /* wake the TB6612FNG out of standby */
 
     /* Motor A forward: AIN1 = HIGH, AIN2 = LOW */
     gpio_set_level(AIN1_PIN, 1);
@@ -177,7 +210,8 @@ void app_main(void) {
     gpio_set_level(BIN2_PIN, 0);
 
     xTaskCreate(encoder_task, "encoder_task", 4096, NULL, 5, NULL);
+    xTaskCreate(pid_task, "pid_task", 4096, NULL, 5, NULL);
 
-    /* app_main returns here; the GPIO levels, LEDC PWM, and encoder_task
-     * keep running. */
+    /* app_main returns here; the GPIO levels, LEDC PWM, encoder_task, and
+     * pid_task keep running. */
 }
