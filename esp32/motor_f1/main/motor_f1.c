@@ -57,14 +57,14 @@
 #define TARGET_RPM 30.0f   /* hardcoded target for now; /cmd_vel comes in F5 */
 #define KP 3.0f            /* start small, increase until oscillation appears, back off */
 
-static const char *TAG = "encoder_task";
+static const char *TAG = "control_task";
 
-/* Shared between ISR (writer) and encoder_task (reader) -> must be volatile
+/* Shared between ISR (writer) and control_task (reader) -> must be volatile
  * so the compiler never caches a stale copy in a register. */
 static volatile uint32_t pulse_count_left = 0;
 static volatile uint32_t pulse_count_right = 0;
 
-/* Latest computed RPM, exposed for pid_task (F3) to read later. */
+/* Latest computed RPM, exposed for uros_task (F5) to read later. */
 static volatile float rpm_left_shared = 0.0f;
 static volatile float rpm_right_shared = 0.0f;
 
@@ -97,30 +97,6 @@ static void encoder_gpio_init(void) {
     gpio_isr_handler_add(ENC_R_PIN, encoder_isr_handler, (void *)&pulse_count_right);
 }
 
-static void encoder_task(void *arg) {
-    encoder_gpio_init();
-
-    uint32_t snapshot_left, snapshot_right;
-    TickType_t last_wake = xTaskGetTickCount();
-    const TickType_t period = pdMS_TO_TICKS(1000);
-
-    while (1) {
-        vTaskDelayUntil(&last_wake, period);   /* fixed absolute cadence, no drift */
-
-        portENTER_CRITICAL(&encoder_mux);
-        snapshot_left = pulse_count_left;
-        pulse_count_left = 0;
-        snapshot_right = pulse_count_right;
-        pulse_count_right = 0;
-        portEXIT_CRITICAL(&encoder_mux);
-
-        rpm_left_shared  = (snapshot_left  / (float)SLOTS_PER_REV) * 60.0f;
-        rpm_right_shared = (snapshot_right / (float)SLOTS_PER_REV) * 60.0f;
-
-        ESP_LOGI(TAG, "RPM L=%.1f  R=%.1f", rpm_left_shared, rpm_right_shared);
-    }
-}
-
 /* TEMPORARY safety cap while VM still shares the weak ESP32/Jetson-USB rail
  * (see README "Power Architecture" note). Real fix is rewiring VM straight
  * to the powerbank; this just keeps peak current low enough to tune Kp
@@ -141,20 +117,64 @@ static uint32_t pid_step(float target_rpm, float actual_rpm) {
     return (uint32_t)u;
 }
 
-static void pid_task(void *arg) {
+/* Caps how much the applied PWM can change in one cycle, regardless of how
+ * big a jump pid_step() wants. This limits di/dt on the shared power rail —
+ * a sudden PWM jump stresses a marginal supply harder than the same
+ * steady-state current reached gradually. Does not replace the VM rewire;
+ * it reduces (not eliminates) brownout risk while that's still pending. */
+#define MAX_PWM_STEP_PER_CYCLE 10.0f
+
+static float slew_limit(float applied, float target) {
+    if (target > applied + MAX_PWM_STEP_PER_CYCLE) return applied + MAX_PWM_STEP_PER_CYCLE;
+    if (target < applied - MAX_PWM_STEP_PER_CYCLE) return applied - MAX_PWM_STEP_PER_CYCLE;
+    return target;
+}
+
+/* Encoder read + PID + PWM write, all in ONE task/cycle — replaces the old
+ * separate encoder_task (1 Hz) + pid_task (100 Hz). That split meant PID
+ * recomputed 100x/sec against an RPM value that was up to 1 full second
+ * stale. Running both halves in the same 20 Hz loop means PID always acts
+ * on the reading from THIS cycle — zero cross-task staleness.
+ *
+ * Trade-off: 20 Hz (50 ms window) means coarser RPM resolution than the
+ * old 1 Hz window (1 pulse = 60 RPM/step now, vs. 3 RPM/step before) —
+ * faster feedback costs resolution with only 20 slots/rev. Accepted for now. */
+#define CONTROL_PERIOD_MS 50   /* 20 Hz */
+
+static void control_task(void *arg) {
+    encoder_gpio_init();
+
+    uint32_t snapshot_left, snapshot_right;
+    float applied_pwm_left = 0.0f, applied_pwm_right = 0.0f;
     TickType_t last_wake = xTaskGetTickCount();
-    const TickType_t period = pdMS_TO_TICKS(10);   /* 100 Hz = 10 ms period */
+    const TickType_t period = pdMS_TO_TICKS(CONTROL_PERIOD_MS);
 
     while (1) {
         vTaskDelayUntil(&last_wake, period);
 
-        uint32_t pwm_left  = pid_step(TARGET_RPM, rpm_left_shared);
-        uint32_t pwm_right = pid_step(TARGET_RPM, rpm_right_shared);
+        portENTER_CRITICAL(&encoder_mux);
+        snapshot_left = pulse_count_left;
+        pulse_count_left = 0;
+        snapshot_right = pulse_count_right;
+        pulse_count_right = 0;
+        portEXIT_CRITICAL(&encoder_mux);
 
-        ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0, pwm_left);
+        rpm_left_shared  = (snapshot_left  / (float)SLOTS_PER_REV) * (60000.0f / CONTROL_PERIOD_MS);
+        rpm_right_shared = (snapshot_right / (float)SLOTS_PER_REV) * (60000.0f / CONTROL_PERIOD_MS);
+
+        float target_pwm_left  = (float)pid_step(TARGET_RPM, rpm_left_shared);
+        float target_pwm_right = (float)pid_step(TARGET_RPM, rpm_right_shared);
+
+        applied_pwm_left  = slew_limit(applied_pwm_left,  target_pwm_left);
+        applied_pwm_right = slew_limit(applied_pwm_right, target_pwm_right);
+
+        ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0, (uint32_t)applied_pwm_left);
         ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0);
-        ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1, pwm_right);
+        ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1, (uint32_t)applied_pwm_right);
         ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1);
+
+        ESP_LOGI(TAG, "RPM L=%.1f R=%.1f  PWM L=%.0f R=%.0f",
+                 rpm_left_shared, rpm_right_shared, applied_pwm_left, applied_pwm_right);
     }
 }
 
@@ -217,9 +237,8 @@ void app_main(void) {
     gpio_set_level(BIN1_PIN, 1);
     gpio_set_level(BIN2_PIN, 0);
 
-    xTaskCreate(encoder_task, "encoder_task", 4096, NULL, 5, NULL);
-    xTaskCreate(pid_task, "pid_task", 4096, NULL, 5, NULL);
+    xTaskCreate(control_task, "control_task", 4096, NULL, 5, NULL);
 
-    /* app_main returns here; the GPIO levels, LEDC PWM, encoder_task, and
-     * pid_task keep running. */
+    /* app_main returns here; the GPIO levels, LEDC PWM, and control_task
+     * keep running. */
 }
