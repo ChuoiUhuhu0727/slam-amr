@@ -294,3 +294,11 @@ slam-amr/
 ## PID Control Block Diagram
 
 ![](<images/PID pipeline.drawio.png>)
+
+## Open Questions / Next Session (2026-07-23)
+
+**Camera debugging — resolved but lesson not yet locked in.**
+
+`nvgstcapture-1.0` crashed (`Elements could not link encoder & parser`, core dump) before capturing anything. Teammate's fix: skip that tool entirely and drive `gst-launch-1.0` directly — `nvarguscamerasrc ! nvvidconv ! autovideosink` connected fine (`CONSUMER: Producer has connected`), and a `nvjpegenc` still-capture pipeline completed cleanly. So the IMX219/Argus camera itself was never broken — the crash was isolated to `nvgstcapture-1.0`'s H.264 encoder-linking step, a stage the SLAM pipeline doesn't even need (OpenCV/visual_slam wants raw frames, not encoded video).
+
+**Question to answer out loud next session, before writing any camera capture code for Week 3:** why did dropping to a minimal explicit `gst-launch-1.0` pipeline reveal that the camera was fine all along, and what does that imply about how to debug the next weird failure in this pipeline (capture / SLAM / serial / servo) — test each stage in isolation before assuming the earliest/loudest error is the root cause?
