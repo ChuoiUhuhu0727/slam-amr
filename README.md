@@ -60,7 +60,7 @@ Separately, the Jetson's own supply (powerbank → PD Trigger → 12V barrel jac
 
 **Before connecting to the Jetson:** power the buck-boost from the LiPo alone (Jetson disconnected), measure output with a multimeter, trim to exactly 19V, confirm polarity — only then connect to the barrel jack. Same verify-before-connect discipline as the camera cable fix.
 
-**Separately (not yet done):** motor VM still needs its own wire straight from a powerbank output, bypassing the ESP32 entirely — this is the fix that unblocks F3 testing; the LiPo/buck-boost work above is for the Jetson's own supply and is lower priority (works fine at today's idle-ish load, becomes urgent before Week 3 GPU workloads).
+**✅ Fixed 2026-07-24:** motor VM now has its own wire straight from a powerbank output, bypassing the ESP32 entirely. Confirmed on real hardware — F3 (PID) ran continuously through the PWM ramp with no brownout/reset loop. The Jetson's own LiPo/buck-boost supply (above) is still open — lower priority, becomes urgent before Week 3 GPU workloads.
 
 ## Software Stack
 
@@ -92,14 +92,13 @@ Motor driver path is wired and verified in `esp32/motor_f1` (F1 milestone). Enco
 | GPIO23 | STBY | TB6612FNG | Enable (HIGH = run) | ✅ wired |
 | GPIO34 | OUT | LM393 Encoder L | Wheel L pulse count | ✅ wired |
 | GPIO35 | OUT | LM393 Encoder R | Wheel R pulse count | ✅ wired |
-| SDA / SCL | SDA / SCL | MPU6050 IMU | I2C sensor read | 🔌 wired, not read in firmware yet |
+| GPIO26 | SDA | MPU6050 IMU | I2C data line | 🔌 wired, not read in firmware yet |
+| GPIO25 | SCL | MPU6050 IMU | I2C clock line | 🔌 wired, not read in firmware yet |
 | 3V3 | VCC | TB6612FNG, both encoders, IMU | Logic power | ✅ wired |
-| 5V | VM | TB6612FNG | Motor power (temporary passthrough) | ✅ wired |
+| Powerbank (direct) | VM | TB6612FNG | Motor power | ✅ wired — direct from powerbank, no longer via ESP32 5V (fixed 2026-07-24) |
 | GND | GND | All above + powerbank | Common ground | ✅ wired |
 
 **Downstream of TB6612FNG:** AO1/AO2 → Motor L (red/black) · BO1/BO2 → Motor R (red/black)
-
-> Motor power (VM) currently passes through the ESP32's 5V pin — temporary until the powerbank feeds VM directly.
 
 ## System Pipeline
 
@@ -145,8 +144,9 @@ path works. Fixed 50% PWM, both motors forward. No encoder, no PID yet (those ar
 | GPIO22 | BIN2 | Motor B direction |
 | GPIO23 | STBY | Enable (HIGH = run) |
 | 3V3 | VCC | Logic power |
-| 5V | VM | Motor power (temporary: ESP32 5V passthrough) |
 | GND | GND | Common ground (shared with powerbank) |
+
+> Motor power (VM) no longer connects to the ESP32 — wired directly from the powerbank as of 2026-07-24. See [Power Architecture](#power-architecture--known-issue--planned-fix-2026-07-22) for the fix history.
 
 Motor L: red → AO1, black → AO2 · Motor R: red → BO1, black → BO2
 

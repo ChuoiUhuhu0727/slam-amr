@@ -13,7 +13,7 @@
  *   GPIO19 -> AIN2      GPIO22 -> BIN2     (direction)
  *   GPIO23 -> STBY                         (enable, HIGH = run)
  *   3V3    -> VCC   (logic power)
- *   5V     -> VM    (motor power — temporary: ESP32 5V passthrough)
+ *   VM     <- powerbank (direct, bypasses ESP32 — fixed 2026-07-24)
  *   GND    -> GND   (must be common with the powerbank ground)
  *
  * Pin map (ESP32 -> LM393 encoders):
@@ -97,12 +97,11 @@ static void encoder_gpio_init(void) {
     gpio_isr_handler_add(ENC_R_PIN, encoder_isr_handler, (void *)&pulse_count_right);
 }
 
-/* TEMPORARY safety cap while VM still shares the weak ESP32/Jetson-USB rail
- * (see README "Power Architecture" note). Real fix is rewiring VM straight
- * to the powerbank; this just keeps peak current low enough to tune Kp
- * today without tripping another brownout reset loop. Raise cautiously,
- * watching for resets, once VM has its own supply — this line should not
- * stay at 100 forever. */
+/* VM now has its own wire from the powerbank (fixed 2026-07-24, see README
+ * "Power Architecture") — the brownout reset loop this cap was guarding
+ * against is confirmed gone. Left at 100 for now since Kp hasn't been
+ * retuned with valid encoder data yet; raise deliberately, not by default,
+ * once real RPM tracking data says the controller needs more headroom. */
 #define MAX_SAFE_PWM 100.0f
 
 /* error(t) = target - actual; u(t) = Kp * error(t); PWM = clamp(u(t), 0, MAX_SAFE_PWM).
