@@ -140,11 +140,21 @@ static float slew_limit(float applied, float target) {
  * faster feedback costs resolution with only 20 slots/rev. Accepted for now. */
 #define CONTROL_PERIOD_MS 50   /* 20 Hz */
 
+/* Silent-failure guard: if PWM is clearly high enough to move the wheel but
+ * pulse count stays 0 for this many consecutive cycles, the encoder is
+ * almost certainly dead (misaligned, unglued, wiring fault) rather than the
+ * wheel legitimately being stopped. 20 cycles = 1s at 20Hz — one slot alone
+ * only needs ~100ms at TARGET_RPM, so this has generous margin against
+ * false positives from startup transients. */
+#define STALL_PWM_THRESHOLD 30.0f
+#define STALL_CYCLE_LIMIT   20
+
 static void control_task(void *arg) {
     encoder_gpio_init();
 
     uint32_t snapshot_left, snapshot_right;
     float applied_pwm_left = 0.0f, applied_pwm_right = 0.0f;
+    uint32_t stall_cycles_left = 0, stall_cycles_right = 0;
     TickType_t last_wake = xTaskGetTickCount();
     const TickType_t period = pdMS_TO_TICKS(CONTROL_PERIOD_MS);
 
@@ -171,6 +181,28 @@ static void control_task(void *arg) {
         ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0);
         ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1, (uint32_t)applied_pwm_right);
         ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1);
+
+        /* Stall watch, left wheel */
+        if (applied_pwm_left > STALL_PWM_THRESHOLD && snapshot_left == 0) {
+            stall_cycles_left++;
+            if (stall_cycles_left == STALL_CYCLE_LIMIT) {
+                ESP_LOGW(TAG, "LEFT encoder stall suspected: PWM=%.0f but 0 pulses for %ds",
+                         applied_pwm_left, STALL_CYCLE_LIMIT * CONTROL_PERIOD_MS / 1000);
+            }
+        } else {
+            stall_cycles_left = 0;
+        }
+
+        /* Stall watch, right wheel */
+        if (applied_pwm_right > STALL_PWM_THRESHOLD && snapshot_right == 0) {
+            stall_cycles_right++;
+            if (stall_cycles_right == STALL_CYCLE_LIMIT) {
+                ESP_LOGW(TAG, "RIGHT encoder stall suspected: PWM=%.0f but 0 pulses for %ds",
+                         applied_pwm_right, STALL_CYCLE_LIMIT * CONTROL_PERIOD_MS / 1000);
+            }
+        } else {
+            stall_cycles_right = 0;
+        }
 
         ESP_LOGI(TAG, "RPM L=%.1f R=%.1f  PWM L=%.0f R=%.0f",
                  rpm_left_shared, rpm_right_shared, applied_pwm_left, applied_pwm_right);
