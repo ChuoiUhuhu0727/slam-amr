@@ -175,17 +175,23 @@ static float slew_limit(float applied, float target) {
  * stale. Running both halves in the same 20 Hz loop means PID always acts
  * on the reading from THIS cycle — zero cross-task staleness.
  *
- * Trade-off: 20 Hz (50 ms window) means coarser RPM resolution than the
- * old 1 Hz window (1 pulse = 60 RPM/step now, vs. 3 RPM/step before) —
- * faster feedback costs resolution with only 20 slots/rev. Accepted for now. */
-#define CONTROL_PERIOD_MS 50   /* 20 Hz */
+ * Trade-off: shorter window = coarser RPM resolution with only 20 slots/rev.
+ * Raised 50ms -> 200ms (2026-07-27): at 50ms, 1 pulse = 60 RPM/step, and
+ * TARGET_RPM=30 sits exactly BETWEEN two measurable levels (0, 60) - the
+ * controller could never read "at target", only ever +/-30 RPM error, a
+ * pure quantization limit cycle no amount of Kp/Ki tuning can remove
+ * (confirmed live: RPM alternating 0/60 every cycle while PWM hunted).
+ * At 200ms, 1 pulse = 15 RPM/step, so 30 RPM = exactly 2 pulses - target
+ * is now representable. Slower loop (5 Hz vs 20 Hz), acceptable at these
+ * low target speeds. */
+#define CONTROL_PERIOD_MS 200   /* 5 Hz */
 
 /* Silent-failure guard: if PWM is clearly high enough to move the wheel but
  * pulse count stays 0 for this many consecutive cycles, the encoder is
  * almost certainly dead (misaligned, unglued, wiring fault) rather than the
- * wheel legitimately being stopped. 20 cycles = 1s at 20Hz — one slot alone
- * only needs ~100ms at TARGET_RPM, so this has generous margin against
- * false positives from startup transients. */
+ * wheel legitimately being stopped. 20 cycles = 4s at 5Hz (was 1s at the old
+ * 20Hz) — one slot alone only needs ~100ms at TARGET_RPM, so this still has
+ * generous margin against false positives from startup transients. */
 #define STALL_PWM_THRESHOLD 30.0f
 #define STALL_CYCLE_LIMIT   20
 
