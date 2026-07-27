@@ -5,7 +5,7 @@ from ultralytics import YOLO
 
 def main():
     model = YOLO("yolov8n.pt")  # start from COCO-pretrained weights
-    model.train(data="duck_dataset/data.yaml", epochs=50, imgsz=640)
+    model.train(data="duck_dataset/data.yaml", epochs=25, imgsz=640)
 
 if __name__ == "__main__":
     main()
