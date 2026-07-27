@@ -138,12 +138,12 @@ static void encoder_gpio_init(void) {
 
 /* Floor, not just a "can't go negative" clamp: the powerbank feeding VM
  * auto-shuts-off when it sees low/no current draw (no-load detection meant
- * for phone charging, wrong assumption for a motor). Letting PWM sag toward
- * 0 whenever measured RPM looks >= target (including noise-inflated bogus
- * readings) was tripping that cutoff, which then caused the power brownout
- * / erratic-RPM spiral seen in testing. Value is a starting guess - raise
- * it if the powerbank still cuts out, lower it if the motor idles too fast. */
-#define MIN_SAFE_PWM 40.0f
+ * for phone charging, wrong assumption for a motor). Lowered 40 -> 20
+ * (2026-07-27, power confirmed stable since the hardware fix) because 40
+ * was clamping the right wheel's PWM even though its actual RPM sat well
+ * above TARGET_RPM=30 - PID couldn't slow it down further to reach target.
+ * Raise it again if the powerbank cuts out at this lower floor. */
+#define MIN_SAFE_PWM 20.0f
 
 /* error(t) = target - actual; u(t) = Kp * error(t); PWM = clamp(u(t), MIN_SAFE_PWM, MAX_SAFE_PWM). */
 static uint32_t pid_step(float target_rpm, float actual_rpm) {
