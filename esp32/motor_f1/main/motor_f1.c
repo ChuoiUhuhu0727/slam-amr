@@ -104,13 +104,21 @@ static void encoder_gpio_init(void) {
  * once real RPM tracking data says the controller needs more headroom. */
 #define MAX_SAFE_PWM 100.0f
 
-/* error(t) = target - actual; u(t) = Kp * error(t); PWM = clamp(u(t), 0, MAX_SAFE_PWM).
- * P-only for now — Ki/Kd are Week 2 stretch, not required to move to F4. */
+/* Floor, not just a "can't go negative" clamp: the powerbank feeding VM
+ * auto-shuts-off when it sees low/no current draw (no-load detection meant
+ * for phone charging, wrong assumption for a motor). Letting PWM sag toward
+ * 0 whenever measured RPM looks >= target (including noise-inflated bogus
+ * readings) was tripping that cutoff, which then caused the power brownout
+ * / erratic-RPM spiral seen in testing. Value is a starting guess - raise
+ * it if the powerbank still cuts out, lower it if the motor idles too fast. */
+#define MIN_SAFE_PWM 40.0f
+
+/* error(t) = target - actual; u(t) = Kp * error(t); PWM = clamp(u(t), MIN_SAFE_PWM, MAX_SAFE_PWM). */
 static uint32_t pid_step(float target_rpm, float actual_rpm) {
     float error = target_rpm - actual_rpm;
     float u = KP * error;
 
-    if (u < 0.0f)           u = 0.0f;           /* clamp: can't spin backward with AIN/BIN fixed forward */
+    if (u < MIN_SAFE_PWM)   u = MIN_SAFE_PWM;   /* clamp: floor keeps current draw above the powerbank's auto-shutoff threshold */
     if (u > MAX_SAFE_PWM)   u = MAX_SAFE_PWM;   /* clamp: temporary current-safety ceiling, not the LEDC max */
 
     return (uint32_t)u;
