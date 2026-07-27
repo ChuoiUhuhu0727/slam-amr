@@ -55,7 +55,15 @@
 #define SLOTS_PER_REV 20        /* LM393 disk: 20 slots = 1 full wheel revolution */
 
 /* --- F3: P-only velocity control (Ki/Kd come later, tune Kp first) --- */
-#define TARGET_RPM 30.0f   /* hardcoded target for now; /cmd_vel comes in F5 */
+/* Raised 30 -> 60 (2026-07-27): 30 forced PWM to sit at MIN_SAFE_PWM on the
+ * right wheel (its natural RPM at the floor already exceeded target), and
+ * even after fixing the earlier RPM-quantization bug, chasing 30 meant
+ * probing PWM near the motor's weak/deadzone end - no margin for heavier
+ * hardware later. 60 sits inside the PWM range (~20-40) both wheels already
+ * hit comfortably today, without floor-clamping either side. Still a test
+ * value for validating the control loop, NOT a calibrated real-world speed -
+ * that needs wheel diameter + a chosen cm/s target, deferred to F4 odometry. */
+#define TARGET_RPM 60.0f
 #define KP 3.0f            /* start small, increase until oscillation appears, back off */
 
 static const char *TAG = "control_task";
