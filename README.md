@@ -62,6 +62,8 @@ Separately, the Jetson's own supply (powerbank → PD Trigger → 12V barrel jac
 
 **✅ Fixed 2026-07-24:** motor VM now has its own wire straight from a powerbank output, bypassing the ESP32 entirely. Confirmed on real hardware — F3 (PID) ran continuously through the PWM ramp with no brownout/reset loop. The Jetson's own LiPo/buck-boost supply (above) is still open — lower priority, becomes urgent before Week 3 GPU workloads.
 
+**🔶 New issue found 2026-07-27, open:** the powerbank now dedicated to VM cuts its own output off mid-run during PID testing. Root cause not yet isolated (candidates: no-load auto-shutoff tripping when PWM sags low, or over-current protection tripping on motor inrush current when PID ramps PWM up quickly — these need different fixes, and which one it is wasn't confirmed before this session paused). A `MIN_SAFE_PWM` floor was added in `motor_f1.c` as a first attempt (ruling out the low-current theory) but did not resolve it. **Decided against sharing the Jetson's own Anker PD powerbank for VM too** — even a well-regulated multi-port bank shares one internal battery/BMS, so a motor inrush spike on one port risks sagging the other; this would reintroduce the exact ESP32-brownout failure mode from the 2026-07-22 bug above, but on the Jetson instead (much higher stakes). Plan: keep Jetson and motor VM on physically separate power sources (as today), find/verify a VM powerbank that doesn't exhibit this cutoff behavior under real motor load.
+
 ## Software Stack
 
 | Layer | Technology |
@@ -286,8 +288,14 @@ Two-person team. Split is drawn along one line: **does this task require physica
 ```
 slam-amr/
 ├── esp32/
-│   └── microros_hello/
-│       └── microros_hello.c   # Week 1: micro-ROS publisher with auto-reconnect
+│   ├── microros_hello/
+│   │   └── microros_hello.c        # Week 1: micro-ROS publisher with auto-reconnect
+│   └── motor_f1/
+│       └── main/motor_f1.c         # F1-F3: motor spin, encoder RPM, P-only PID
+├── jetson/
+│   ├── object_detection/           # first_test.py: CSI cam -> YOLO -> boxes -> record
+│   ├── dataset_collection/         # record video, extract frames, assemble YOLO dataset
+│   └── training/                   # fine-tune YOLOv8n on a custom class (train_duck.py)
 └── README.md
 ```
 
@@ -302,3 +310,5 @@ slam-amr/
 `nvgstcapture-1.0` crashed (`Elements could not link encoder & parser`, core dump) before capturing anything. Teammate's fix: skip that tool entirely and drive `gst-launch-1.0` directly — `nvarguscamerasrc ! nvvidconv ! autovideosink` connected fine (`CONSUMER: Producer has connected`), and a `nvjpegenc` still-capture pipeline completed cleanly. So the IMX219/Argus camera itself was never broken — the crash was isolated to `nvgstcapture-1.0`'s H.264 encoder-linking step, a stage the SLAM pipeline doesn't even need (OpenCV/visual_slam wants raw frames, not encoded video).
 
 **Lesson locked in:** when a tool throws an error, identify which pipeline stage it's actually about before assuming the loudest/earliest error names the root cause. A minimal, explicit `gst-launch-1.0` pipeline isolated the fault to one unnecessary stage instead of condemning the whole camera. Apply the same isolation habit to the next weird failure anywhere in the stack (capture / SLAM / serial / servo). For Week 2/3 capture code: use `gst-launch-1.0`-style raw pipelines (or OpenCV's GStreamer backend with an equivalent pipeline string) — never `nvgstcapture-1.0`.
+
+**Dataset collection (2026-07-27) — keep the camera stationary, move the object instead.** While recording a custom-object dataset (`jetson/dataset_collection/record_video.py`), physically picking up and orbiting the Jetson around the target object caused capture to fail mid-recording (`GStreamer warning: ... nvarguscamerasrc0 reported: INVALID_SETTINGS`). Isolated with a clean before/after test: Jetson stationary + object moved worked reliably every time; Jetson handheld failed. Leading theory is the CSI ribbon cable flexing under handling (consistent with this camera's known physical fragility). Rule going forward: camera/Jetson stays fixed in place for any capture session; only the target object moves — this achieves the same viewpoint diversity without touching the fragile part of the setup.
