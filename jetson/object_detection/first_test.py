@@ -19,7 +19,7 @@ CSI_PIPELINE = (
 )
 
 OUTPUT_PATH = "first_test_output.mp4"
-CONF_THRESHOLD = 0.5
+CONF_THRESHOLD = 0.1
 
 def main():
     cap = cv2.VideoCapture(CSI_PIPELINE, cv2.CAP_GSTREAMER)
