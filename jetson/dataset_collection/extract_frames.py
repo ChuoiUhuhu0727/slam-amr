@@ -6,7 +6,7 @@ import cv2
 
 VIDEO_PATH = "duck_raw.mp4"
 OUTPUT_DIR = "duck_frames"
-SAVE_EVERY_N_FRAMES = 15  # ~1 image every 0.5-0.75s at 20-30fps
+SAVE_EVERY_N_FRAMES = 45  # ~1 image every 1.5-2.25s at 20-30fps - thinned to cut manual labeling effort
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
