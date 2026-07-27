@@ -4,10 +4,15 @@ No live display (headless SSH) - runs for DURATION_SEC or until Ctrl+C,
 then review the saved video file.
 """
 import time
+from pathlib import Path
+
 import cv2
 from ultralytics import YOLO
 
 DURATION_SEC = 20
+
+# fine-tuned on ~164 hand-labeled frames, single "duck" class (see jetson/training/train_duck.py)
+WEIGHTS_PATH = Path(__file__).resolve().parent.parent / "training/runs/detect/train-4/weights/best.pt"
 
 CSI_PIPELINE = (
     "nvarguscamerasrc sensor-id=0 ! "
@@ -18,7 +23,7 @@ CSI_PIPELINE = (
     "video/x-raw, format=BGR ! appsink drop=1"
 )
 
-OUTPUT_PATH = "first_test_output.mp4"
+OUTPUT_PATH = "duck_test_output.mp4"
 CONF_THRESHOLD = 0.1
 
 def main():
@@ -26,7 +31,7 @@ def main():
     if not cap.isOpened():
         raise RuntimeError("Could not open CSI camera. Check the GStreamer pipeline / sensor-id.")
 
-    model = YOLO("yolov8n.pt")  # pretrained COCO weights, auto-downloads on first run
+    model = YOLO(str(WEIGHTS_PATH))
 
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = None
