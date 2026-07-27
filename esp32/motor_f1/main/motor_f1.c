@@ -79,9 +79,12 @@ static portMUX_TYPE encoder_mux = portMUX_INITIALIZER_UNLOCKED;
  * (confirmed 2026-07-27: hand-spinning gave clean 0-60 RPM, motor-running
  * gave RPM spiking as high as 6300). Reject edges that arrive faster than
  * any real slot transition physically could - at TARGET_RPM=30 the real
- * interval is ~100ms, and even a generous multiple of that is still >>3ms,
- * while EMI ringing typically settles within well under 1ms. */
-#define MIN_PULSE_INTERVAL_US 3000
+ * interval is ~100ms, so there's large margin to push this threshold up.
+ * 3ms wasn't enough (tested 2026-07-27: cut peak noise from RPM=6300 down
+ * to RPM=540, but R still noisy vs. L's clean 0/60) - PWM runs at 1kHz
+ * (1ms period), so switching noise can recur faster than a 3ms window
+ * rejects. Raised to 15ms, still >>3x below the real ~50ms interval. */
+#define MIN_PULSE_INTERVAL_US 15000
 
 static volatile int64_t last_edge_us_left = 0;
 static volatile int64_t last_edge_us_right = 0;
