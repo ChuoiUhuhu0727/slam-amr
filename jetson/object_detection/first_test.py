@@ -1,9 +1,13 @@
 """First smoke test: CSI camera -> YOLOv8n pretrained -> draw boxes -> record.
 Run on the Jetson (needs the CSI camera and `pip install ultralytics`).
-Press 'q' to stop.
+No live display (headless SSH) - runs for DURATION_SEC or until Ctrl+C,
+then review the saved video file.
 """
+import time
 import cv2
 from ultralytics import YOLO
+
+DURATION_SEC = 20
 
 CSI_PIPELINE = (
     "nvarguscamerasrc sensor-id=0 ! "
@@ -27,28 +31,27 @@ def main():
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = None
 
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            print("Frame grab failed, stopping.")
-            break
+    start = time.time()
+    try:
+        while time.time() - start < DURATION_SEC:
+            ok, frame = cap.read()
+            if not ok:
+                print("Frame grab failed, stopping.")
+                break
 
-        results = model(frame, conf=CONF_THRESHOLD, verbose=False)
-        annotated = results[0].plot()  # draws boxes + labels + confidence
+            results = model(frame, conf=CONF_THRESHOLD, verbose=False)
+            annotated = results[0].plot()  # draws boxes + labels + confidence
 
-        if writer is None:
-            h, w = annotated.shape[:2]
-            writer = cv2.VideoWriter(OUTPUT_PATH, fourcc, 20.0, (w, h))
-        writer.write(annotated)
-
-        cv2.imshow("YOLOv8n - CSI camera", annotated)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+            if writer is None:
+                h, w = annotated.shape[:2]
+                writer = cv2.VideoWriter(OUTPUT_PATH, fourcc, 20.0, (w, h))
+            writer.write(annotated)
+    except KeyboardInterrupt:
+        print("Stopped by user (Ctrl+C).")
 
     cap.release()
     if writer is not None:
         writer.release()
-    cv2.destroyAllWindows()
     print(f"Saved recording to {OUTPUT_PATH}")
 
 if __name__ == "__main__":
