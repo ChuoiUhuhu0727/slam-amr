@@ -33,6 +33,7 @@
 #include "freertos/task.h"
 #include "esp_err.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 
 /* --- Direction + enable pins: plain digital outputs (HIGH/LOW only) --- */
 #define AIN1_PIN  GPIO_NUM_18
@@ -72,12 +73,40 @@ static volatile float rpm_right_shared = 0.0f;
  * where a pulse arrives between reading the counter and zeroing it). */
 static portMUX_TYPE encoder_mux = portMUX_INITIALIZER_UNLOCKED;
 
-/* One ISR handles both pins; `arg` tells it which counter to bump.
+/* Debounce: while the motor is actually running (not hand-spun), PWM
+ * switching edges and DC-brush arcing couple electrical noise onto the
+ * encoder signal line, which the ISR was counting as real slot transitions
+ * (confirmed 2026-07-27: hand-spinning gave clean 0-60 RPM, motor-running
+ * gave RPM spiking as high as 6300). Reject edges that arrive faster than
+ * any real slot transition physically could - at TARGET_RPM=30 the real
+ * interval is ~100ms, and even a generous multiple of that is still >>3ms,
+ * while EMI ringing typically settles within well under 1ms. */
+#define MIN_PULSE_INTERVAL_US 3000
+
+static volatile int64_t last_edge_us_left = 0;
+static volatile int64_t last_edge_us_right = 0;
+
+typedef struct {
+    volatile uint32_t *counter;
+    volatile int64_t *last_edge_us;
+} encoder_isr_arg_t;
+
+static encoder_isr_arg_t enc_left_arg  = { &pulse_count_left,  &last_edge_us_left };
+static encoder_isr_arg_t enc_right_arg = { &pulse_count_right, &last_edge_us_right };
+
+/* One ISR handles both pins; `arg` tells it which counter/debounce-clock to use.
  * IRAM_ATTR: ISR code must live in IRAM so it still runs even while
- * flash cache is temporarily disabled (standard ESP-IDF requirement). */
+ * flash cache is temporarily disabled (standard ESP-IDF requirement).
+ * esp_timer_get_time() is documented safe to call from ISR context. */
 static void IRAM_ATTR encoder_isr_handler(void *arg) {
-    volatile uint32_t *counter = (volatile uint32_t *)arg;
-    (*counter)++;   /* ONLY this. No math, no logging, no delays in an ISR. */
+    encoder_isr_arg_t *a = (encoder_isr_arg_t *)arg;
+    int64_t now = esp_timer_get_time();
+
+    if (now - *(a->last_edge_us) < MIN_PULSE_INTERVAL_US) {
+        return;   /* too soon to be a real slot transition - noise, drop it */
+    }
+    *(a->last_edge_us) = now;
+    (*(a->counter))++;   /* only this otherwise. No math, no logging, no delays in an ISR. */
 }
 
 static void encoder_gpio_init(void) {
@@ -93,8 +122,8 @@ static void encoder_gpio_init(void) {
     ESP_ERROR_CHECK(gpio_config(&io_conf));
 
     gpio_install_isr_service(0);
-    gpio_isr_handler_add(ENC_L_PIN, encoder_isr_handler, (void *)&pulse_count_left);
-    gpio_isr_handler_add(ENC_R_PIN, encoder_isr_handler, (void *)&pulse_count_right);
+    gpio_isr_handler_add(ENC_L_PIN, encoder_isr_handler, (void *)&enc_left_arg);
+    gpio_isr_handler_add(ENC_R_PIN, encoder_isr_handler, (void *)&enc_right_arg);
 }
 
 /* VM now has its own wire from the powerbank (fixed 2026-07-24, see README
