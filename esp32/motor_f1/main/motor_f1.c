@@ -87,6 +87,22 @@
 #define MAX_I_CONTRIBUTION 40.0f
 #define MAX_INTEGRAL (MAX_I_CONTRIBUTION / KI)
 
+/* Wheel sync: per-wheel PID keeps each wheel near TARGET_RPM independently,
+ * but confirmed live (2026-07-27) that's not enough - robot pulls right,
+ * would circle if left running. Small per-cycle differences between the two
+ * (different motors, different overshoot/settling) add up over time into
+ * real position drift. This trims each wheel's target RPM based on TOTAL
+ * distance traveled so far (cumulative pulses, never reset), not just
+ * instantaneous RPM - a wheel that's fallen behind gets sped up until it
+ * actually catches up, not just "goes the same speed from now on".
+ * KSYNC=0.05 is a conservative starting guess, same philosophy as Kp/Ki.
+ * Scope note: this assumes both wheels WANT the same target (straight-line
+ * driving, which is all F3 tests) - once F5 wires real /cmd_vel with
+ * intentional L/R differential for turning, this logic needs to only apply
+ * when going straight. Out of scope for today. */
+#define KSYNC 0.05f
+#define MAX_SYNC_TRIM 15.0f   /* clamp: don't let sync fighting dominate over the base target */
+
 static const char *TAG = "control_task";
 
 /* Shared between ISR (writer) and control_task (reader) -> must be volatile
@@ -239,6 +255,7 @@ static void control_task(void *arg) {
     uint32_t snapshot_left, snapshot_right;
     float applied_pwm_left = 0.0f, applied_pwm_right = 0.0f;
     float integral_left = 0.0f, integral_right = 0.0f;
+    uint32_t total_pulses_left = 0, total_pulses_right = 0;
     uint32_t stall_cycles_left = 0, stall_cycles_right = 0;
     TickType_t last_wake = xTaskGetTickCount();
     const TickType_t period = pdMS_TO_TICKS(CONTROL_PERIOD_MS);
@@ -256,8 +273,20 @@ static void control_task(void *arg) {
         rpm_left_shared  = (snapshot_left  / (float)SLOTS_PER_REV) * (60000.0f / CONTROL_PERIOD_MS);
         rpm_right_shared = (snapshot_right / (float)SLOTS_PER_REV) * (60000.0f / CONTROL_PERIOD_MS);
 
-        float target_pwm_left  = (float)pid_step(TARGET_RPM, rpm_left_shared,  &integral_left);
-        float target_pwm_right = (float)pid_step(TARGET_RPM, rpm_right_shared, &integral_right);
+        total_pulses_left  += snapshot_left;
+        total_pulses_right += snapshot_right;
+
+        /* Positive diff = left has traveled further than right so far.
+         * Trim left's target down / right's target up to close that gap -
+         * see KSYNC comment above for why this uses cumulative distance,
+         * not just instantaneous RPM. */
+        float sync_diff = (float)total_pulses_left - (float)total_pulses_right;
+        float sync_trim = KSYNC * sync_diff;
+        if (sync_trim > MAX_SYNC_TRIM)  sync_trim = MAX_SYNC_TRIM;
+        if (sync_trim < -MAX_SYNC_TRIM) sync_trim = -MAX_SYNC_TRIM;
+
+        float target_pwm_left  = (float)pid_step(TARGET_RPM - sync_trim, rpm_left_shared,  &integral_left);
+        float target_pwm_right = (float)pid_step(TARGET_RPM + sync_trim, rpm_right_shared, &integral_right);
 
         applied_pwm_left  = slew_limit(applied_pwm_left,  target_pwm_left);
         applied_pwm_right = slew_limit(applied_pwm_right, target_pwm_right);
@@ -289,8 +318,9 @@ static void control_task(void *arg) {
             stall_cycles_right = 0;
         }
 
-        ESP_LOGI(TAG, "RPM L=%.1f R=%.1f  PWM L=%.0f R=%.0f",
-                 rpm_left_shared, rpm_right_shared, applied_pwm_left, applied_pwm_right);
+        ESP_LOGI(TAG, "RPM L=%.1f R=%.1f  PWM L=%.0f R=%.0f  sync_diff=%.0f trim=%.1f",
+                 rpm_left_shared, rpm_right_shared, applied_pwm_left, applied_pwm_right,
+                 sync_diff, sync_trim);
     }
 }
 
