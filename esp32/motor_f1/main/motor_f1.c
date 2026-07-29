@@ -27,6 +27,7 @@
  *   verified, uncomment and let both F1 (motor) and F2 (encoder) run together.
  */
 
+#include <math.h>
 #include "driver/gpio.h"
 #include "driver/ledc.h"
 #include "freertos/FreeRTOS.h"
@@ -122,6 +123,21 @@
  * when going straight. Out of scope for today. */
 #define KSYNC 0.05f
 #define MAX_SYNC_TRIM 15.0f   /* clamp: don't let sync fighting dominate over the base target */
+
+/* --- F4: odometry (measured 2026-07-27: wheel diameter 6cm, wheelbase 10cm) ---
+ * distance per pulse = wheel circumference / slots per rev - converts a raw
+ * pulse count directly into linear distance traveled by that wheel.
+ * Differential-drive kinematics: center-of-robot distance is the AVERAGE of
+ * the two wheels' distances (if both go the same distance, robot moves
+ * straight with no turn); heading change is the DIFFERENCE divided by the
+ * wheelbase (if right travels further than left, robot rotates toward the
+ * left/slower side - matches the direction convention already confirmed
+ * earlier today: faster right wheel -> drifts left). */
+#define WHEEL_DIAMETER_M 0.06f
+#define WHEELBASE_M 0.10f
+#define PI_F 3.14159265f   /* not relying on M_PI - not guaranteed defined by every libc without _USE_MATH_DEFINES */
+#define WHEEL_CIRCUMFERENCE_M (PI_F * WHEEL_DIAMETER_M)
+#define DISTANCE_PER_PULSE_M (WHEEL_CIRCUMFERENCE_M / SLOTS_PER_REV)
 
 static const char *TAG = "control_task";
 
@@ -296,6 +312,7 @@ static void control_task(void *arg) {
     float integral_left = 0.0f, integral_right = 0.0f;
     uint32_t total_pulses_left = 0, total_pulses_right = 0;
     uint32_t stall_cycles_left = 0, stall_cycles_right = 0;
+    float pose_x = 0.0f, pose_y = 0.0f, pose_theta = 0.0f;   /* F4: origin = wherever the robot is at boot/flash */
     TickType_t last_wake = xTaskGetTickCount();
     const TickType_t period = pdMS_TO_TICKS(CONTROL_PERIOD_MS);
 
@@ -328,6 +345,23 @@ static void control_task(void *arg) {
 
         total_pulses_left  += snapshot_left;
         total_pulses_right += snapshot_right;
+
+        /* F4 odometry: how far each wheel moved THIS cycle (not cumulative),
+         * then combine into how far the robot's center moved + how much it
+         * turned. Midpoint integration (average current and new heading,
+         * not just the old one) instead of plain Euler - at 200ms/cycle a
+         * turning robot's heading can shift enough mid-cycle that using only
+         * the pre-turn heading for the whole cycle's distance would visibly
+         * bias x/y, especially while turning sharply. */
+        float dist_left  = snapshot_left  * DISTANCE_PER_PULSE_M;
+        float dist_right = snapshot_right * DISTANCE_PER_PULSE_M;
+        float dist_center = (dist_left + dist_right) / 2.0f;
+        float dtheta = (dist_right - dist_left) / WHEELBASE_M;
+        float theta_mid = pose_theta + dtheta / 2.0f;
+
+        pose_x += dist_center * cosf(theta_mid);
+        pose_y += dist_center * sinf(theta_mid);
+        pose_theta += dtheta;
 
         /* Positive diff = left has traveled further than right so far.
          * Trim left's target down / right's target up to close that gap -
@@ -371,9 +405,10 @@ static void control_task(void *arg) {
             stall_cycles_right = 0;
         }
 
-        ESP_LOGI(TAG, "RPM L=%.1f R=%.1f  PWM L=%.0f R=%.0f  sync_diff=%.0f trim=%.1f",
+        ESP_LOGI(TAG, "RPM L=%.1f R=%.1f  PWM L=%.0f R=%.0f  sync_diff=%.0f trim=%.1f  "
+                      "pose x=%.3fm y=%.3fm theta=%.1fdeg",
                  rpm_left_shared, rpm_right_shared, applied_pwm_left, applied_pwm_right,
-                 sync_diff, sync_trim);
+                 sync_diff, sync_trim, pose_x, pose_y, pose_theta * 180.0f / PI_F);
     }
 }
 
