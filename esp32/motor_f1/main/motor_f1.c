@@ -187,8 +187,13 @@ static void encoder_gpio_init(void) {
  * (2026-07-27, power confirmed stable since the hardware fix) because 40
  * was clamping the right wheel's PWM even though its actual RPM sat well
  * above TARGET_RPM=30 - PID couldn't slow it down further to reach target.
- * Raise it again if the powerbank cuts out at this lower floor. */
-#define MIN_SAFE_PWM 20.0f
+ * Lowered again 20 -> 10 (same day, real ground test): right wheel still
+ * pinned at PWM=20 with RPM 150-195 (vs. left's ~45) while actually driving
+ * - the sync-trim fix couldn't help because PID still couldn't push PWM any
+ * lower. This is a diagnostic test as much as a fix: if RPM stays this high
+ * even at PWM=10, the cause isn't the floor anymore, it's a real mechanical/
+ * motor asymmetry - raise the floor back if the powerbank cuts out. */
+#define MIN_SAFE_PWM 10.0f
 
 /* error(t) = target - actual; u(t) = Kp*error(t) + Ki*integral(t);
  * PWM = clamp(u(t), MIN_SAFE_PWM, MAX_SAFE_PWM). `integral` is per-wheel
