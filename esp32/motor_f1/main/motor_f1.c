@@ -38,12 +38,14 @@
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 #include <rcl/rcl.h>
 #include <rcl/error_handling.h>
 #include <rclc/rclc.h>
 #include <rclc/executor.h>
 #include <geometry_msgs/msg/twist.h>
 #include <nav_msgs/msg/odometry.h>
+#include <std_msgs/msg/string.h>
 #include <rmw_microros/rmw_microros.h>
 #include "esp32_serial_transport.h"
 
@@ -495,6 +497,35 @@ static void control_task(void *arg) {
 /* rclc_executor callback for the /cmd_vel subscription - just latches the
  * values and timestamps them for the watchdog. Runs in uros_task's context
  * (not an ISR), so no special atomicity concerns beyond the usual volatile. */
+/* F5 diagnostics (2026-07-27): odometry was observed resetting toward 0
+ * repeatedly during a real driving test, and the agent log showed the
+ * micro-ROS client_key changing (new session) at the same time - strong
+ * evidence the ESP32 itself is rebooting mid-drive, not just losing the
+ * micro-ROS connection. Since console logging is muted (shares UART0 with
+ * the transport - see esp_log_level_set below), there's no way to see a
+ * reboot reason via idf.py monitor while /cmd_vel testing is happening.
+ * Instead: read esp_reset_reason() once at boot (before anything else
+ * runs) and publish it over the already-working micro-ROS link, so
+ * `ros2 topic echo /esp32_diag` answers "was that a brownout?" without
+ * needing the serial console at all. */
+static esp_reset_reason_t g_reset_reason;
+
+static const char *reset_reason_str(esp_reset_reason_t reason) {
+    switch (reason) {
+        case ESP_RST_POWERON:   return "POWERON";
+        case ESP_RST_EXT:       return "EXT_PIN";
+        case ESP_RST_SW:        return "SW_RESTART";
+        case ESP_RST_PANIC:     return "PANIC";
+        case ESP_RST_INT_WDT:   return "INT_WATCHDOG";
+        case ESP_RST_TASK_WDT:  return "TASK_WATCHDOG";
+        case ESP_RST_WDT:       return "OTHER_WATCHDOG";
+        case ESP_RST_DEEPSLEEP: return "DEEPSLEEP_WAKE";
+        case ESP_RST_BROWNOUT:  return "BROWNOUT";
+        case ESP_RST_SDIO:      return "SDIO";
+        default:                return "UNKNOWN";
+    }
+}
+
 static void cmd_vel_callback(const void *msgin) {
     const geometry_msgs__msg__Twist *msg = (const geometry_msgs__msg__Twist *)msgin;
     cmd_linear_x    = (float)msg->linear.x;
@@ -522,9 +553,12 @@ static void uros_task(void *arg) {
         rcl_node_t node;
         rcl_subscription_t cmd_vel_sub;
         rcl_publisher_t odom_pub;
+        rcl_publisher_t diag_pub;
         rclc_executor_t executor;
         geometry_msgs__msg__Twist cmd_vel_msg;
         nav_msgs__msg__Odometry odom_msg = {0};
+        std_msgs__msg__String diag_msg = {0};
+        char diag_text[64];
 
         if (rclc_support_init(&support, 0, NULL, &allocator) != RCL_RET_OK) {
             vTaskDelay(pdMS_TO_TICKS(1000)); continue;
@@ -546,10 +580,28 @@ static void uros_task(void *arg) {
             rclc_support_fini(&support);
             vTaskDelay(pdMS_TO_TICKS(1000)); continue;
         }
+        if (rclc_publisher_init_default(&diag_pub, &node,
+                ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String), "esp32_diag") != RCL_RET_OK) {
+            if (rcl_publisher_fini(&odom_pub, &node) != RCL_RET_OK) {}
+            if (rcl_subscription_fini(&cmd_vel_sub, &node) != RCL_RET_OK) {}
+            if (rcl_node_fini(&node) != RCL_RET_OK) {}
+            rclc_support_fini(&support);
+            vTaskDelay(pdMS_TO_TICKS(1000)); continue;
+        }
 
         rclc_executor_t *exec = &executor;
         rclc_executor_init(exec, &support.context, 1, &allocator);
         rclc_executor_add_subscription(exec, &cmd_vel_sub, &cmd_vel_msg, &cmd_vel_callback, ON_NEW_DATA);
+
+        /* Diagnostic string is static per-connection (reset reason only
+         * changes on an actual reboot, which re-runs this whole function
+         * from scratch anyway) - build once, republish periodically below
+         * so it's visible whenever someone starts echoing, not just at the
+         * exact moment of connection. */
+        snprintf(diag_text, sizeof(diag_text), "reset_reason=%s", reset_reason_str(g_reset_reason));
+        diag_msg.data.data = diag_text;
+        diag_msg.data.size = strlen(diag_text);
+        diag_msg.data.capacity = sizeof(diag_text);
 
         /* Set once - frame_id strings don't change per-message, only the
          * numeric fields below do. */
@@ -588,6 +640,9 @@ static void uros_task(void *arg) {
                 if (rcl_publish(&odom_pub, &odom_msg, NULL) != RCL_RET_OK) {
                     agent_ok = false;
                 }
+                if (rcl_publish(&diag_pub, &diag_msg, NULL) != RCL_RET_OK) {
+                    agent_ok = false;
+                }
             }
 
             /* BUG FOUND 2026-07-27 (F5 first connectivity test): timeout=0
@@ -604,6 +659,7 @@ static void uros_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(20));
         }
 
+        if (rcl_publisher_fini(&diag_pub, &node) != RCL_RET_OK) {}
         if (rcl_publisher_fini(&odom_pub, &node) != RCL_RET_OK) {}
         if (rcl_subscription_fini(&cmd_vel_sub, &node) != RCL_RET_OK) {}
         if (rclc_executor_fini(exec) != RCL_RET_OK) {}
@@ -664,6 +720,10 @@ static void setup_pwm(void) {
 static size_t uart_port = UART_NUM_0;
 
 void app_main(void) {
+    /* First thing, before anything else touches power/peripherals - see
+     * g_reset_reason comment above for why this matters. */
+    g_reset_reason = esp_reset_reason();
+
     setup_gpio();
     setup_pwm();
 
