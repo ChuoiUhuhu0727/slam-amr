@@ -134,13 +134,26 @@ static portMUX_TYPE encoder_mux = portMUX_INITIALIZER_UNLOCKED;
 static volatile int64_t last_edge_us_left = 0;
 static volatile int64_t last_edge_us_right = 0;
 
+/* 2026-07-27, after fixing a bad encoder solder joint: with clean pulses,
+ * RPM was still visibly jumping in fixed steps (0, 15, 30, 45...) with no
+ * in-between values. Root cause: counting whole pulses in a fixed 200ms
+ * window can only ever measure in units of "1 pulse / window" = 15 RPM -
+ * a motor spinning at, say, 22 RPM is invisible to that method. Fixed by
+ * also recording the time BETWEEN consecutive pulses (`last_interval_us`),
+ * so control_task can compute RPM from timing instead of counting - the
+ * standard "period measurement" tachometer technique, far finer resolution
+ * at low speed than "frequency measurement" (pulse-counting) gives. */
+static volatile int64_t last_interval_us_left = 0;
+static volatile int64_t last_interval_us_right = 0;
+
 typedef struct {
     volatile uint32_t *counter;
     volatile int64_t *last_edge_us;
+    volatile int64_t *last_interval_us;
 } encoder_isr_arg_t;
 
-static encoder_isr_arg_t enc_left_arg  = { &pulse_count_left,  &last_edge_us_left };
-static encoder_isr_arg_t enc_right_arg = { &pulse_count_right, &last_edge_us_right };
+static encoder_isr_arg_t enc_left_arg  = { &pulse_count_left,  &last_edge_us_left,  &last_interval_us_left };
+static encoder_isr_arg_t enc_right_arg = { &pulse_count_right, &last_edge_us_right, &last_interval_us_right };
 
 /* One ISR handles both pins; `arg` tells it which counter/debounce-clock to use.
  * IRAM_ATTR: ISR code must live in IRAM so it still runs even while
@@ -149,10 +162,12 @@ static encoder_isr_arg_t enc_right_arg = { &pulse_count_right, &last_edge_us_rig
 static void IRAM_ATTR encoder_isr_handler(void *arg) {
     encoder_isr_arg_t *a = (encoder_isr_arg_t *)arg;
     int64_t now = esp_timer_get_time();
+    int64_t since_last = now - *(a->last_edge_us);
 
-    if (now - *(a->last_edge_us) < MIN_PULSE_INTERVAL_US) {
+    if (since_last < MIN_PULSE_INTERVAL_US) {
         return;   /* too soon to be a real slot transition - noise, drop it */
     }
+    *(a->last_interval_us) = since_last;
     *(a->last_edge_us) = now;
     (*(a->counter))++;   /* only this otherwise. No math, no logging, no delays in an ISR. */
 }
@@ -242,8 +257,21 @@ static float slew_limit(float applied, float target) {
  * (confirmed live: RPM alternating 0/60 every cycle while PWM hunted).
  * At 200ms, 1 pulse = 15 RPM/step, so 30 RPM = exactly 2 pulses - target
  * is now representable. Slower loop (5 Hz vs 20 Hz), acceptable at these
- * low target speeds. */
+ * low target speeds.
+ * NOTE 2026-07-27: RPM itself no longer depends on this window at all (see
+ * last_interval_us / RPM_STALE_US below - period measurement replaced pulse
+ * counting for the actual RPM value). CONTROL_PERIOD_MS now only sets how
+ * often PID/sync/PWM update, not measurement resolution - could be sped
+ * back up if the loop ever needs to react faster, independent of this. */
 #define CONTROL_PERIOD_MS 200   /* 5 Hz */
+
+/* Companion to the period-measurement RPM calc above: period measurement
+ * alone can't distinguish "stopped" from "just hasn't ticked yet" - without
+ * a timeout it would keep reporting the last (increasingly stale) interval
+ * forever after the wheel actually stops. If no new pulse arrives within
+ * this long, treat RPM as 0 instead. ~500ms is generous margin (~10x) over
+ * the ~50ms/pulse interval expected near TARGET_RPM=60. */
+#define RPM_STALE_US 500000
 
 /* Silent-failure guard: if PWM is clearly high enough to move the wheel but
  * pulse count stays 0 for this many consecutive cycles, the encoder is
@@ -268,15 +296,29 @@ static void control_task(void *arg) {
     while (1) {
         vTaskDelayUntil(&last_wake, period);
 
+        int64_t now = esp_timer_get_time();
+        int64_t last_edge_left, last_edge_right, interval_left, interval_right;
+
         portENTER_CRITICAL(&encoder_mux);
         snapshot_left = pulse_count_left;
         pulse_count_left = 0;
         snapshot_right = pulse_count_right;
         pulse_count_right = 0;
+        /* int64_t isn't atomic on a 32-bit MCU (two word-writes) - read these
+         * inside the same critical section as the pulse counts to avoid a
+         * torn read racing the ISR mid-update. */
+        last_edge_left   = last_edge_us_left;
+        last_edge_right  = last_edge_us_right;
+        interval_left    = last_interval_us_left;
+        interval_right   = last_interval_us_right;
         portEXIT_CRITICAL(&encoder_mux);
 
-        rpm_left_shared  = (snapshot_left  / (float)SLOTS_PER_REV) * (60000.0f / CONTROL_PERIOD_MS);
-        rpm_right_shared = (snapshot_right / (float)SLOTS_PER_REV) * (60000.0f / CONTROL_PERIOD_MS);
+        /* RPM from time between pulses, not pulses-per-window - see
+         * last_interval_us / RPM_STALE_US comments above for why. */
+        rpm_left_shared = (interval_left == 0 || (now - last_edge_left) > RPM_STALE_US)
+                              ? 0.0f : 60000000.0f / (SLOTS_PER_REV * (float)interval_left);
+        rpm_right_shared = (interval_right == 0 || (now - last_edge_right) > RPM_STALE_US)
+                              ? 0.0f : 60000000.0f / (SLOTS_PER_REV * (float)interval_right);
 
         total_pulses_left  += snapshot_left;
         total_pulses_right += snapshot_right;
