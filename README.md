@@ -231,11 +231,73 @@ idf.py -p /dev/ttyUSB0 monitor | tee "test_f2_$(date +%Y%m%d_%H%M).log"
    at low RPM, check whether it's real oscillation or just this quantization
    before assuming the gains are wrong.
 
-**TODO before F3 (not done yet, don't build early):** write a small Python
-script to parse a `test_f2_*.log` and plot RPM vs. time. Not worth it for F2
-(the numbers were readable by eye), but PID tuning in F3 needs to see
-step-response curves (overshoot, settling time) that aren't readable from
-scrolling terminal output.
+**TODO (still not done, still worth doing):** write a small Python script to
+parse a saved monitor log and plot RPM/PWM/pose vs. time. F3 debugging today
+confirmed the need (see "F3 PID debugging chain" and "F5" below) — reading
+scrolling terminal numbers by eye was the actual bottleneck more than once.
+Workaround used instead: `idf.py monitor`'s built-in `Ctrl+T Ctrl+L` log-to-file
+(reliable over SSH, unlike piping through `tee` — see Lessons Learned), then
+`scp` the file back for offline analysis. A real parser/plotter is still the
+better fix, just not built yet.
+
+### F3 — PID Velocity Control (`esp32/motor_f1`, merged with F1/F2)
+
+**Status: done, 2026-07-27.** P+I control per wheel (Kd deliberately skipped —
+see "F3 PID debugging chain" in Lessons Learned for why), anti-windup, a
+cumulative-distance wheel-sync trim, and a real compile-breaking bug fix
+(macro used before its `#define` — see Lessons Learned) all landed the same
+day. Full blow-by-blow of the 4 stacked bugs found before any of this worked
+is in Lessons Learned; short version: encoder ISR noise, RPM measurement
+quantization (twice — once from the sampling window, once from pulse-counting
+vs. period-measurement), a safety PWM floor fighting the controller, and a
+target value with no torque margin. None of them were "the gains are wrong."
+
+### F4 — Odometry (`esp32/motor_f1`)
+
+**Status: done, 2026-07-27.** Computes `x`, `y`, `theta` from wheel pulses
+each control cycle — per-wheel distance from pulse count × wheel
+circumference, robot-center distance = average of the two wheels, heading
+change = difference ÷ wheelbase. Uses midpoint integration (average of old
+and new heading for the position update, not just the old heading) since a
+turning robot's heading can shift enough within one 200ms cycle to visibly
+bias x/y otherwise. Measured constants: wheel diameter 6cm, wheelbase 10cm.
+Test procedure: push the robot ~1m in a straight line, confirm the logged
+`x` reads close to 1.0 (and `y`/`theta` stay near 0).
+
+### F5 — micro-ROS: `/cmd_vel` in, `/odom` out (`esp32/motor_f1`)
+
+**Status: code written 2026-07-27, NOT YET BUILT/TESTED** — needs the
+micro-ROS component brought into this project first (see below), which
+hasn't happened yet. `uros_task` mirrors the proven `esp32/microros_hello.c`
+connect/retry pattern (Week 1): subscribes `geometry_msgs/Twist` on
+`/cmd_vel`, converts `linear.x`/`angular.z` into per-wheel target RPM via
+differential-drive inverse kinematics (replacing the old hardcoded
+`TARGET_RPM` test value), and publishes `nav_msgs/Odometry` on `/odom` at
+10Hz using F4's pose. Two safety/correctness details worth knowing:
+
+- **Watchdog:** if no `/cmd_vel` message has arrived within 1s (agent crash,
+  USB unplugged, Jetson down), commanded velocity is forced to 0 — a lost
+  connection must mean "stop", never "keep driving on the last command."
+- **Wheel-sync gating:** the F3 sync-trim logic (see above) is now gated to
+  only run when `|angular.z| < 0.05` (straight-line motion) — an intentional
+  turn deliberately makes the two wheels travel different distances, and
+  without this gate sync would fight every turn command.
+
+**Known interface conflict:** micro-ROS's custom transport and the normal
+debug console (`idf.py monitor` / `ESP_LOGI`) both use UART0 — once
+`uros_task`'s transport is active, the familiar `RPM L=... R=...` log lines
+stop being readable there. Debugging F5 shifts to the Jetson side instead:
+`ros2 topic echo /odom` and `ros2 topic pub /cmd_vel`, per the ROS2 Topic
+Interface contract below.
+
+**Setup still needed before this builds** (not done yet — next session):
+copy the already-working `micro_ros_espidf_component` from
+`~/esp/microros_hello/components/` into `~/slam-amr/esp32/motor_f1/components/`,
+delete its `micro_ros_dev`/`micro_ros_src` caches (they're tied to build
+paths, must rebuild for the new project location), then `idf.py build`. If
+the build hits `#error micro-ROS transports misconfigured`, reapply the
+known `config.h` copy fix documented in the micro-ROS transport lessons
+above.
 
 ## Roadmap
 
@@ -291,7 +353,7 @@ slam-amr/
 │   ├── microros_hello/
 │   │   └── microros_hello.c        # Week 1: micro-ROS publisher with auto-reconnect
 │   └── motor_f1/
-│       └── main/motor_f1.c         # F1-F3: motor spin, encoder RPM, P-only PID
+│       └── main/motor_f1.c         # F1-F5: motor spin, encoder RPM, PI control, odometry, micro-ROS
 ├── jetson/
 │   ├── object_detection/           # first_test.py: CSI cam -> YOLO -> boxes -> record
 │   ├── dataset_collection/         # record video, extract frames, assemble YOLO dataset
@@ -327,3 +389,11 @@ slam-amr/
 **F3 completed same day — Ki added (PI control), Kd deliberately skipped.** With bugs 1–4 above fixed, clean P-only data showed the right wheel settling consistently ~15 RPM below `TARGET_RPM` (30–60 RPM band vs. target 60) — a textbook P-only steady-state error, and trustworthy this time since RPM resolution is now 15 RPM/step. Added `KI=0.2` (same "start small" approach as Kp) with an anti-windup clamp on the integral term specifically — without it, the integral would have grown unbounded during the left-wheel stall seen the same session (PWM pinned at max, RPM=0, for 10+ seconds), then caused a large overshoot once the wheel freed up. Kd was deliberately left out: RPM is still a coarse step signal at 5Hz, and differentiating a stair-step signal amplifies jitter rather than smoothing anything ("derivative kick") — PI is the standard choice for velocity/RPM loops, Kd matters more for position control. Revisit only if PI alone proves insufficient once retested.
 
 One unresolved side note from the same session, deliberately not chased further: the left encoder briefly reported a sustained 0 RPM (firmware's own stall-detection log fired) while the wheel was visually confirmed still spinning by hand — encoder LED checked immediately after and looked normal. Left as an open possibility of an intermittent connection (not re-confirmed) rather than a proven fault; revisit only if it recurs.
+
+**Root cause of the right-encoder weirdness, found later the same day: a bad solder joint — not floor tuning, not motor asymmetry.** Chased the "right wheel runs away even at the lowest safe PWM" symptom through two rounds of floor-lowering (40→20→10) with no improvement, plus a wheel-sync trim that made the circling *worse*, before the actual signal came from a direct contradiction: the encoder reported RPM 90–210 while the wheel was visually confirmed barely turning. That mismatch (sensor says fast, eyes say slow/weak) is what pointed at a bad connection rather than a real mechanical/control problem — re-soldering fixed it, confirmed by both wheels running evenly afterward. **Lesson:** when a sensor reading and a direct physical observation disagree, trust the physical observation and go looking for a wiring fault — don't keep re-tuning software parameters (floor, gains, sync) against a signal that might be lying. This project has now hit the "loose connector under vibration" failure mode three separate times (CSI cable, encoder VCC, this one) — always the first hypothesis to test when something behaves fine at rest/lifted but not under real load/motion.
+
+**RPM quantization, round 2: pulse-counting vs. period measurement.** After the solder fix, RPM was still visibly jumping in fixed 15 RPM steps (0, 15, 30, 45...) with no in-between values — counting whole pulses in a fixed 200ms window can only ever resolve `1 pulse/window` = 15 RPM, so anything between steps is invisible to that method. Fixed by timing the interval *between* consecutive pulses instead (reusing the microsecond timestamps already captured for ISR debouncing) and computing RPM from that — the standard "period measurement" tachometer technique, far finer resolution at low speed than "frequency measurement" (pulse-counting). Added a 500ms staleness timeout so a stopped wheel correctly reads 0 instead of reporting the last (increasingly stale) interval forever. `CONTROL_PERIOD_MS` (still 200ms) now only paces the control loop, not RPM resolution — could be sped back up independently if ever needed.
+
+**Real bug, not style: a `#define` used before it was defined, silently invalidated a chunk of same-day testing.** `pid_step()` used `CONTROL_PERIOD_MS` for its integral `dt`, but that constant's `#define` lived much further down the file (near `control_task`) — a genuine C compile error (`'CONTROL_PERIOD_MS' undeclared`), not just an ordering nitpick. Found only when a teammate (Alex, working the physical setup for the first time) hit the error directly and pasted the *actual compiler output* rather than the build-invocation noise around it. Because the flash workflow builds with `idf.py build` then flashes `build/*.bin` as a separate manual step (the `--no-stub` esptool workaround for this board's crystal quirk), a failed build doesn't block the flash step from re-uploading whatever `.bin` was already sitting in `build/` from the last *successful* build — so several "live test" results after the Ki commit (wheel-sync trim, floor 20→10) may have silently been re-running old, pre-Ki/pre-sync firmware rather than the code being discussed. **Lesson:** after any `idf.py build`, actually check it printed success before trusting the next flash+test cycle — a stale binary fails silently and looks exactly like "the code change had no effect," which cost real debugging time here. Fixed by moving the `#define` up near `SLOTS_PER_REV`, before any function that uses it.
+
+**F5 (micro-ROS `/cmd_vel` + `/odom`) written same day, not yet built/tested** — see the F5 section above for what it does and the remaining project-setup step (copying the micro-ROS component into this project) still needed before it compiles.
