@@ -28,13 +28,24 @@
  */
 
 #include <math.h>
+#include <stdbool.h>
+#include <string.h>
 #include "driver/gpio.h"
 #include "driver/ledc.h"
+#include "driver/uart.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
+#include <rcl/rcl.h>
+#include <rcl/error_handling.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+#include <geometry_msgs/msg/twist.h>
+#include <nav_msgs/msg/odometry.h>
+#include <rmw_microros/rmw_microros.h>
+#include "esp32_serial_transport.h"
 
 /* --- Direction + enable pins: plain digital outputs (HIGH/LOW only) --- */
 #define AIN1_PIN  GPIO_NUM_18
@@ -76,15 +87,11 @@
 #define CONTROL_PERIOD_MS 200   /* 5 Hz */
 
 /* --- F3: PI velocity control (Kd deliberately skipped, see KI comment below) --- */
-/* Raised 30 -> 60 (2026-07-27): 30 forced PWM to sit at MIN_SAFE_PWM on the
- * right wheel (its natural RPM at the floor already exceeded target), and
- * even after fixing the earlier RPM-quantization bug, chasing 30 meant
- * probing PWM near the motor's weak/deadzone end - no margin for heavier
- * hardware later. 60 sits inside the PWM range (~20-40) both wheels already
- * hit comfortably today, without floor-clamping either side. Still a test
- * value for validating the control loop, NOT a calibrated real-world speed -
- * that needs wheel diameter + a chosen cm/s target, deferred to F4 odometry. */
-#define TARGET_RPM 60.0f
+/* TARGET_RPM (hardcoded 30, then 60) retired 2026-07-27 now that F5 wires
+ * real /cmd_vel - per-wheel targets are computed live from linear.x/angular.z
+ * instead (see the F5 section below). Kept using it through F1-F4 was the
+ * right call (needed *some* number to validate the control loop before the
+ * real command source existed) - it's just no longer the source of truth. */
 #define KP 3.0f            /* start small, increase until oscillation appears, back off */
 
 /* Added 2026-07-27: P-only data showed the right wheel settling ~15 RPM
@@ -117,10 +124,11 @@
  * instantaneous RPM - a wheel that's fallen behind gets sped up until it
  * actually catches up, not just "goes the same speed from now on".
  * KSYNC=0.05 is a conservative starting guess, same philosophy as Kp/Ki.
- * Scope note: this assumes both wheels WANT the same target (straight-line
- * driving, which is all F3 tests) - once F5 wires real /cmd_vel with
- * intentional L/R differential for turning, this logic needs to only apply
- * when going straight. Out of scope for today. */
+ * Gated 2026-07-27 (F5): only active while /cmd_vel's angular.z is near
+ * zero (straight-line driving) - an intentional turn deliberately makes the
+ * two wheels travel different distances, and without this gate the sync
+ * logic would fight every turn command, trying to "correct" a difference
+ * that was never a mistake. See STRAIGHT_ANGULAR_THRESHOLD below. */
 #define KSYNC 0.05f
 #define MAX_SYNC_TRIM 15.0f   /* clamp: don't let sync fighting dominate over the base target */
 
@@ -139,6 +147,22 @@
 #define WHEEL_CIRCUMFERENCE_M (PI_F * WHEEL_DIAMETER_M)
 #define DISTANCE_PER_PULSE_M (WHEEL_CIRCUMFERENCE_M / SLOTS_PER_REV)
 
+/* --- F5: /cmd_vel in, /odom out (2026-07-27) ---
+ * Safety default: if no /cmd_vel received within this long (agent crash,
+ * USB unplugged, Jetson down), treat commanded velocity as 0 rather than
+ * keep driving on the last command received - a lost connection must mean
+ * "stop", never "keep going blind". Applies both before the first command
+ * ever arrives AND if a live connection drops mid-drive. */
+#define CMD_VEL_TIMEOUT_US 1000000   /* 1s */
+
+/* Below this |angular.z|, treat the commanded motion as "going straight" for
+ * wheel-sync purposes (see KSYNC comment above) - not exactly 0 because a
+ * genuinely-straight command from ros2/Nav2 may carry tiny floating-point
+ * noise rather than a clean 0.0. */
+#define STRAIGHT_ANGULAR_THRESHOLD 0.05f   /* rad/s */
+
+#define ODOM_PUBLISH_PERIOD_MS 100   /* 10 Hz */
+
 static const char *TAG = "control_task";
 
 /* Shared between ISR (writer) and control_task (reader) -> must be volatile
@@ -149,6 +173,23 @@ static volatile uint32_t pulse_count_right = 0;
 /* Latest computed RPM, exposed for uros_task (F5) to read later. */
 static volatile float rpm_left_shared = 0.0f;
 static volatile float rpm_right_shared = 0.0f;
+
+/* F5: /cmd_vel, written by uros_task's subscription callback, read by
+ * control_task. last_cmd_vel_us is the watchdog clock - see
+ * CMD_VEL_TIMEOUT_US comment above. */
+static volatile float cmd_linear_x = 0.0f;
+static volatile float cmd_angular_z = 0.0f;
+static volatile int64_t last_cmd_vel_us = 0;
+
+/* F5: pose + velocity, written by control_task (F4 odometry math), read by
+ * uros_task to publish /odom. Plain floats (not the mutex-protected pulse
+ * counters) - a torn read here would be a stale/slightly-off reading, not a
+ * silently-corrupted control decision, so it's not worth the locking. */
+static volatile float pose_x_shared = 0.0f;
+static volatile float pose_y_shared = 0.0f;
+static volatile float pose_theta_shared = 0.0f;
+static volatile float linear_vel_shared = 0.0f;
+static volatile float angular_vel_shared = 0.0f;
 
 /* Spinlock used to make "read + reset" atomic (avoids the lost-pulse race
  * where a pulse arrives between reading the counter and zeroing it). */
@@ -312,7 +353,9 @@ static void control_task(void *arg) {
     float integral_left = 0.0f, integral_right = 0.0f;
     uint32_t total_pulses_left = 0, total_pulses_right = 0;
     uint32_t stall_cycles_left = 0, stall_cycles_right = 0;
-    float pose_x = 0.0f, pose_y = 0.0f, pose_theta = 0.0f;   /* F4: origin = wherever the robot is at boot/flash */
+    /* F4 pose lives in pose_x_shared/pose_y_shared/pose_theta_shared now
+     * (F5 needs uros_task to read it) - origin = wherever the robot is at
+     * boot/flash, all initialized 0 at file scope. */
     TickType_t last_wake = xTaskGetTickCount();
     const TickType_t period = pdMS_TO_TICKS(CONTROL_PERIOD_MS);
 
@@ -343,9 +386,6 @@ static void control_task(void *arg) {
         rpm_right_shared = (interval_right == 0 || (now - last_edge_right) > RPM_STALE_US)
                               ? 0.0f : 60000000.0f / (SLOTS_PER_REV * (float)interval_right);
 
-        total_pulses_left  += snapshot_left;
-        total_pulses_right += snapshot_right;
-
         /* F4 odometry: how far each wheel moved THIS cycle (not cumulative),
          * then combine into how far the robot's center moved + how much it
          * turned. Midpoint integration (average current and new heading,
@@ -357,23 +397,43 @@ static void control_task(void *arg) {
         float dist_right = snapshot_right * DISTANCE_PER_PULSE_M;
         float dist_center = (dist_left + dist_right) / 2.0f;
         float dtheta = (dist_right - dist_left) / WHEELBASE_M;
-        float theta_mid = pose_theta + dtheta / 2.0f;
+        float theta_mid = pose_theta_shared + dtheta / 2.0f;
+        float dt = CONTROL_PERIOD_MS / 1000.0f;
 
-        pose_x += dist_center * cosf(theta_mid);
-        pose_y += dist_center * sinf(theta_mid);
-        pose_theta += dtheta;
+        pose_x_shared += dist_center * cosf(theta_mid);
+        pose_y_shared += dist_center * sinf(theta_mid);
+        pose_theta_shared += dtheta;
+        linear_vel_shared  = dist_center / dt;
+        angular_vel_shared = dtheta / dt;
 
-        /* Positive diff = left has traveled further than right so far.
-         * Trim left's target down / right's target up to close that gap -
-         * see KSYNC comment above for why this uses cumulative distance,
-         * not just instantaneous RPM. */
+        /* F5: /cmd_vel -> per-wheel target RPM. Watchdog: stale command (or
+         * none ever received) means 0, not "keep driving" - see
+         * CMD_VEL_TIMEOUT_US comment above. */
+        bool cmd_vel_fresh = (now - last_cmd_vel_us) <= CMD_VEL_TIMEOUT_US;
+        float linear_x  = cmd_vel_fresh ? cmd_linear_x  : 0.0f;
+        float angular_z = cmd_vel_fresh ? cmd_angular_z : 0.0f;
+
+        float v_left_mps  = linear_x - angular_z * WHEELBASE_M / 2.0f;
+        float v_right_mps = linear_x + angular_z * WHEELBASE_M / 2.0f;
+        float target_rpm_left  = v_left_mps  / WHEEL_CIRCUMFERENCE_M * 60.0f;
+        float target_rpm_right = v_right_mps / WHEEL_CIRCUMFERENCE_M * 60.0f;
+
+        /* Wheel sync, gated to straight-line motion only - see KSYNC and
+         * STRAIGHT_ANGULAR_THRESHOLD comments above. Positive diff = left
+         * has traveled further than right so far; trim left's target down /
+         * right's target up to close that gap. */
+        bool going_straight = fabsf(angular_z) < STRAIGHT_ANGULAR_THRESHOLD;
+        if (going_straight) {
+            total_pulses_left  += snapshot_left;
+            total_pulses_right += snapshot_right;
+        }
         float sync_diff = (float)total_pulses_left - (float)total_pulses_right;
-        float sync_trim = KSYNC * sync_diff;
+        float sync_trim = going_straight ? KSYNC * sync_diff : 0.0f;
         if (sync_trim > MAX_SYNC_TRIM)  sync_trim = MAX_SYNC_TRIM;
         if (sync_trim < -MAX_SYNC_TRIM) sync_trim = -MAX_SYNC_TRIM;
 
-        float target_pwm_left  = (float)pid_step(TARGET_RPM - sync_trim, rpm_left_shared,  &integral_left);
-        float target_pwm_right = (float)pid_step(TARGET_RPM + sync_trim, rpm_right_shared, &integral_right);
+        float target_pwm_left  = (float)pid_step(target_rpm_left  - sync_trim, rpm_left_shared,  &integral_left);
+        float target_pwm_right = (float)pid_step(target_rpm_right + sync_trim, rpm_right_shared, &integral_right);
 
         applied_pwm_left  = slew_limit(applied_pwm_left,  target_pwm_left);
         applied_pwm_right = slew_limit(applied_pwm_right, target_pwm_right);
@@ -405,10 +465,127 @@ static void control_task(void *arg) {
             stall_cycles_right = 0;
         }
 
+        /* NOTE (F5): once uros_task's custom transport claims UART0, this
+         * won't show up on idf.py monitor anymore - debug via `ros2 topic
+         * echo /odom` / `ros2 topic pub /cmd_vel` on the Jetson instead.
+         * Left in place since it's harmless and still useful for standalone
+         * bring-up before uros_task's transport takes over. */
         ESP_LOGI(TAG, "RPM L=%.1f R=%.1f  PWM L=%.0f R=%.0f  sync_diff=%.0f trim=%.1f  "
                       "pose x=%.3fm y=%.3fm theta=%.1fdeg",
                  rpm_left_shared, rpm_right_shared, applied_pwm_left, applied_pwm_right,
-                 sync_diff, sync_trim, pose_x, pose_y, pose_theta * 180.0f / PI_F);
+                 sync_diff, sync_trim, pose_x_shared, pose_y_shared, pose_theta_shared * 180.0f / PI_F);
+    }
+}
+
+/* rclc_executor callback for the /cmd_vel subscription - just latches the
+ * values and timestamps them for the watchdog. Runs in uros_task's context
+ * (not an ISR), so no special atomicity concerns beyond the usual volatile. */
+static void cmd_vel_callback(const void *msgin) {
+    const geometry_msgs__msg__Twist *msg = (const geometry_msgs__msg__Twist *)msgin;
+    cmd_linear_x    = (float)msg->linear.x;
+    cmd_angular_z   = (float)msg->angular.z;
+    last_cmd_vel_us = esp_timer_get_time();
+}
+
+/* F5: connects to the micro-ROS agent, subscribes /cmd_vel, publishes /odom.
+ * Structured the same way as the proven esp32/microros_hello.c pattern
+ * (Week 1) - outer loop pings the agent and (re)creates everything on
+ * connect, inner loop runs while the agent stays reachable, and everything
+ * gets torn down and retried if the agent disappears. */
+static void uros_task(void *arg) {
+    while (1) {
+        printf("Waiting for micro-ROS agent...\n");
+        while (rmw_uros_ping_agent(1000, 1) != RMW_RET_OK) {
+            vTaskDelay(pdMS_TO_TICKS(500));
+        }
+        printf("Agent found, initializing...\n");
+
+        rcl_allocator_t allocator = rcl_get_default_allocator();
+        rclc_support_t support;
+        rcl_node_t node;
+        rcl_subscription_t cmd_vel_sub;
+        rcl_publisher_t odom_pub;
+        rclc_executor_t executor;
+        geometry_msgs__msg__Twist cmd_vel_msg;
+        nav_msgs__msg__Odometry odom_msg = {0};
+
+        if (rclc_support_init(&support, 0, NULL, &allocator) != RCL_RET_OK) {
+            vTaskDelay(pdMS_TO_TICKS(1000)); continue;
+        }
+        if (rclc_node_init_default(&node, "esp32_motor_node", "", &support) != RCL_RET_OK) {
+            rclc_support_fini(&support);
+            vTaskDelay(pdMS_TO_TICKS(1000)); continue;
+        }
+        if (rclc_subscription_init_default(&cmd_vel_sub, &node,
+                ROSIDL_GET_MSG_TYPE_SUPPORT(geometry_msgs, msg, Twist), "cmd_vel") != RCL_RET_OK) {
+            if (rcl_node_fini(&node) != RCL_RET_OK) {}
+            rclc_support_fini(&support);
+            vTaskDelay(pdMS_TO_TICKS(1000)); continue;
+        }
+        if (rclc_publisher_init_default(&odom_pub, &node,
+                ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry), "odom") != RCL_RET_OK) {
+            if (rcl_subscription_fini(&cmd_vel_sub, &node) != RCL_RET_OK) {}
+            if (rcl_node_fini(&node) != RCL_RET_OK) {}
+            rclc_support_fini(&support);
+            vTaskDelay(pdMS_TO_TICKS(1000)); continue;
+        }
+
+        rclc_executor_t *exec = &executor;
+        rclc_executor_init(exec, &support.context, 1, &allocator);
+        rclc_executor_add_subscription(exec, &cmd_vel_sub, &cmd_vel_msg, &cmd_vel_callback, ON_NEW_DATA);
+
+        /* Set once - frame_id strings don't change per-message, only the
+         * numeric fields below do. */
+        odom_msg.header.frame_id.data = "odom";
+        odom_msg.header.frame_id.size = strlen("odom");
+        odom_msg.header.frame_id.capacity = odom_msg.header.frame_id.size + 1;
+        odom_msg.child_frame_id.data = "base_link";
+        odom_msg.child_frame_id.size = strlen("base_link");
+        odom_msg.child_frame_id.capacity = odom_msg.child_frame_id.size + 1;
+
+        TickType_t last_publish = xTaskGetTickCount();
+        const TickType_t publish_period = pdMS_TO_TICKS(ODOM_PUBLISH_PERIOD_MS);
+        bool agent_ok = true;
+
+        while (agent_ok) {
+            rclc_executor_spin_some(exec, RCL_MS_TO_NS(20));
+
+            if (xTaskGetTickCount() - last_publish >= publish_period) {
+                last_publish = xTaskGetTickCount();
+
+                odom_msg.pose.pose.position.x = pose_x_shared;
+                odom_msg.pose.pose.position.y = pose_y_shared;
+                odom_msg.pose.pose.position.z = 0.0;
+
+                /* Orientation as a quaternion, rotation about Z only (2D
+                 * robot) - qz=sin(theta/2), qw=cos(theta/2), qx=qy=0. */
+                float half_theta = pose_theta_shared / 2.0f;
+                odom_msg.pose.pose.orientation.x = 0.0;
+                odom_msg.pose.pose.orientation.y = 0.0;
+                odom_msg.pose.pose.orientation.z = sinf(half_theta);
+                odom_msg.pose.pose.orientation.w = cosf(half_theta);
+
+                odom_msg.twist.twist.linear.x  = linear_vel_shared;
+                odom_msg.twist.twist.angular.z = angular_vel_shared;
+
+                if (rcl_publish(&odom_pub, &odom_msg, NULL) != RCL_RET_OK) {
+                    agent_ok = false;
+                }
+            }
+
+            if (rmw_uros_ping_agent(0, 1) != RMW_RET_OK) {
+                agent_ok = false;
+            }
+            vTaskDelay(pdMS_TO_TICKS(20));
+        }
+
+        printf("Agent lost, retrying...\n");
+        if (rcl_publisher_fini(&odom_pub, &node) != RCL_RET_OK) {}
+        if (rcl_subscription_fini(&cmd_vel_sub, &node) != RCL_RET_OK) {}
+        if (rclc_executor_fini(exec) != RCL_RET_OK) {}
+        if (rcl_node_fini(&node) != RCL_RET_OK) {}
+        rclc_support_fini(&support);
+        vTaskDelay(pdMS_TO_TICKS(1000));
     }
 }
 
@@ -457,22 +634,31 @@ static void setup_pwm(void) {
     ESP_ERROR_CHECK(ledc_channel_config(&ch_b));
 }
 
+/* UART0 is the same physical wire idf.py monitor uses for the console - see
+ * the F5 note on ESP_LOGI above. Reused from the proven esp32/microros_hello
+ * pin/transport setup (Week 1), not a new choice. */
+static size_t uart_port = UART_NUM_0;
+
 void app_main(void) {
     setup_gpio();
     setup_pwm();
 
+    /* Direction pins are wired for forward, but F5 now drives actual speed
+     * (including reverse/turn) through /cmd_vel via control_task - these
+     * just set the electrical default; PWM=0 from a stale/absent /cmd_vel
+     * (the safety default) means the motors don't move regardless. */
     gpio_set_level(STBY_PIN, 1);   /* wake the TB6612FNG out of standby */
-
-    /* Motor A forward: AIN1 = HIGH, AIN2 = LOW */
     gpio_set_level(AIN1_PIN, 1);
     gpio_set_level(AIN2_PIN, 0);
-
-    /* Motor B forward: BIN1 = HIGH, BIN2 = LOW */
     gpio_set_level(BIN1_PIN, 1);
     gpio_set_level(BIN2_PIN, 0);
 
-    xTaskCreate(control_task, "control_task", 4096, NULL, 5, NULL);
+    rmw_uros_set_custom_transport(true, (void *)&uart_port,
+        esp32_serial_open, esp32_serial_close,
+        esp32_serial_write, esp32_serial_read);
 
-    /* app_main returns here; the GPIO levels, LEDC PWM, and control_task
-     * keep running. */
+    xTaskCreate(control_task, "control_task", 4096, NULL, 5, NULL);
+    xTaskCreate(uros_task, "uros_task", 16000, NULL, 5, NULL);
+
+    /* app_main returns here; both tasks keep running. */
 }
