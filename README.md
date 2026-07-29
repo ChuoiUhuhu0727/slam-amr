@@ -266,18 +266,20 @@ Test procedure: push the robot ~1m in a straight line, confirm the logged
 
 ### F5 — micro-ROS: `/cmd_vel` in, `/odom` out (`esp32/motor_f1`)
 
-**Status: code written 2026-07-27, NOT YET BUILT/TESTED** — needs the
-micro-ROS component brought into this project first (see below), which
-hasn't happened yet. `uros_task` mirrors the proven `esp32/microros_hello.c`
-connect/retry pattern (Week 1): subscribes `geometry_msgs/Twist` on
-`/cmd_vel`, converts `linear.x`/`angular.z` into per-wheel target RPM via
-differential-drive inverse kinematics (replacing the old hardcoded
-`TARGET_RPM` test value), and publishes `nav_msgs/Odometry` on `/odom` at
-10Hz using F4's pose. Two safety/correctness details worth knowing:
+**Status: builds, connects, and the core `/cmd_vel` → drive → `/odom` pipeline is CONFIRMED working (2026-07-27) — but one real issue is still open (see below), don't call this fully done yet.**
+
+`uros_task` mirrors the proven `esp32/microros_hello.c` connect/retry pattern
+(Week 1): subscribes `geometry_msgs/Twist` on `/cmd_vel`, converts
+`linear.x`/`angular.z` into per-wheel target RPM via differential-drive
+inverse kinematics (replacing the old hardcoded `TARGET_RPM` test value),
+and publishes `nav_msgs/Odometry` on `/odom` at 10Hz using F4's pose. Two
+safety/correctness details worth knowing:
 
 - **Watchdog:** if no `/cmd_vel` message has arrived within 1s (agent crash,
   USB unplugged, Jetson down), commanded velocity is forced to 0 — a lost
   connection must mean "stop", never "keep driving on the last command."
+  A related real bug (`MIN_SAFE_PWM` overriding this and never letting the
+  robot actually stop) was found and fixed live — see Lessons Learned.
 - **Wheel-sync gating:** the F3 sync-trim logic (see above) is now gated to
   only run when `|angular.z| < 0.05` (straight-line motion) — an intentional
   turn deliberately makes the two wheels travel different distances, and
@@ -286,18 +288,50 @@ differential-drive inverse kinematics (replacing the old hardcoded
 **Known interface conflict:** micro-ROS's custom transport and the normal
 debug console (`idf.py monitor` / `ESP_LOGI`) both use UART0 — once
 `uros_task`'s transport is active, the familiar `RPM L=... R=...` log lines
-stop being readable there. Debugging F5 shifts to the Jetson side instead:
-`ros2 topic echo /odom` and `ros2 topic pub /cmd_vel`, per the ROS2 Topic
-Interface contract below.
+stop being readable there (confirmed live: sharing the wire actively
+corrupts both streams, not just makes one unreadable). All console logging
+is muted via `esp_log_level_set` once the transport is set. Debugging F5 is
+via the Jetson side instead: `ros2 topic echo /odom`, `ros2 topic pub
+/cmd_vel`, and a new `/esp32_diag` topic (see open issue below) — per the
+ROS2 Topic Interface contract further down.
 
-**Setup still needed before this builds** (not done yet — next session):
-copy the already-working `micro_ros_espidf_component` from
-`~/esp/microros_hello/components/` into `~/slam-amr/esp32/motor_f1/components/`,
-delete its `micro_ros_dev`/`micro_ros_src` caches (they're tied to build
-paths, must rebuild for the new project location), then `idf.py build`. If
-the build hits `#error micro-ROS transports misconfigured`, reapply the
-known `config.h` copy fix documented in the micro-ROS transport lessons
-above.
+**Confirmed working end-to-end (2026-07-27):** `ros2 topic pub /cmd_vel` from
+the Jetson made the robot actually drive, and `ros2 topic echo /odom` showed
+real position/heading tracking the motion (e.g. x=0.097m, y=0.189m, ~38°
+turn after a short drive). This is the core F5 deliverable and it works.
+
+**OPEN ISSUE, not yet resolved — resume here next session:** during a
+longer, real drive test (both wheels actually running, not just the earlier
+stationary connectivity check), `/odom`'s position was observed climbing
+then resetting back toward ~0 repeatedly, and the agent log showed the
+micro-ROS `client_key` change (i.e. a new session) at least once during
+testing — strong evidence the ESP32 itself is rebooting mid-drive, not just
+dropping the micro-ROS link. A `/esp32_diag` topic was added (publishes
+`esp_reset_reason()` read at boot, since normal console logging is muted)
+specifically to answer "was that a brownout?" without needing the serial
+monitor - **but the diagnostic test to actually check this hasn't been
+completed cleanly yet** (two different physical disturbances - an
+accidental cable unplug, and closing the agent terminal by mistake -
+interrupted data collection both times). Also seen once: one wheel
+spinning while the other stayed stopped, then swapping - possibly related,
+possibly a separate symptom of the same underlying power issue.
+**Next session: rerun the drive test with `/esp32_diag` open in a terminal
+the whole time, nobody touching any cables, and watch whether it flips to
+`BROWNOUT` at the same moment `/odom` resets.** If confirmed, the real fix
+is almost certainly a power-delivery problem under combined 2-motor current
+draw (see "Power Architecture" section above for the project's known power
+topology) - not a firmware bug to keep patching blind.
+
+**Setup needed to build this project fresh on a new checkout** (already done
+on the current Jetson working copy, but not automatic - the micro-ROS
+library itself is a large local build cache, intentionally NOT committed to
+git): copy `micro_ros_espidf_component` from an already-working micro-ROS
+project (e.g. `~/esp/microros_hello/components/`) into
+`esp32/motor_f1/components/`, then `idf.py build`. Everything this project
+specifically needs on top of that (the custom transport `.c`/`.h`, a minimal
+`Kconfig.projbuild`, `main/CMakeLists.txt`'s `SRCS` list) is already
+committed - see Lessons Learned for the exact chain of build errors this
+took to work out, in case a future fresh setup hits the same ones.
 
 ## Roadmap
 
@@ -396,4 +430,17 @@ One unresolved side note from the same session, deliberately not chased further:
 
 **Real bug, not style: a `#define` used before it was defined, silently invalidated a chunk of same-day testing.** `pid_step()` used `CONTROL_PERIOD_MS` for its integral `dt`, but that constant's `#define` lived much further down the file (near `control_task`) — a genuine C compile error (`'CONTROL_PERIOD_MS' undeclared`), not just an ordering nitpick. Found only when a teammate (Alex, working the physical setup for the first time) hit the error directly and pasted the *actual compiler output* rather than the build-invocation noise around it. Because the flash workflow builds with `idf.py build` then flashes `build/*.bin` as a separate manual step (the `--no-stub` esptool workaround for this board's crystal quirk), a failed build doesn't block the flash step from re-uploading whatever `.bin` was already sitting in `build/` from the last *successful* build — so several "live test" results after the Ki commit (wheel-sync trim, floor 20→10) may have silently been re-running old, pre-Ki/pre-sync firmware rather than the code being discussed. **Lesson:** after any `idf.py build`, actually check it printed success before trusting the next flash+test cycle — a stale binary fails silently and looks exactly like "the code change had no effect," which cost real debugging time here. Fixed by moving the `#define` up near `SLOTS_PER_REV`, before any function that uses it.
 
-**F5 (micro-ROS `/cmd_vel` + `/odom`) written same day, not yet built/tested** — see the F5 section above for what it does and the remaining project-setup step (copying the micro-ROS component into this project) still needed before it compiles.
+**F5 build chain (2026-07-27) — six real, separate build/runtime errors in a row before it worked, each a different layer.** Worth recording the full sequence so a future fresh setup (or another teammate) doesn't have to rediscover each one from scratch:
+
+1. **Deleting and re-cloning the micro-ROS library cache exposed upstream dependency drift.** First fix attempt was a full clean rebuild (`rm -rf micro_ros_dev micro_ros_src`) after an unrelated bug turned out to be in our own C code, not the build - the clean rebuild was unnecessary and cost real time. The component's build re-`git clone`s many ROS2 core packages fresh from their default branches (not pinned commits), so a clean rebuild is not reproducible - it can pull whatever changed upstream since the last successful build. Hit a `ModuleNotFoundError: No module named 'importlib.resources.abc'` (a freshly-cloned `ament_package` assuming Python 3.11+, this venv is 3.10) - patched with a `try/except` import fallback - then immediately hit a *different* error (`ament_cmake` package config not found) one layer deeper. **Recovery, not another patch:** copied the already-built `micro_ros_dev`/`micro_ros_src` directories wholesale from the known-working `~/esp/microros_hello` project instead of re-cloning - sidesteps the whole moving-target problem. **Lesson: don't delete a working micro-ROS build cache "to be safe" unless the bug is actually inside it** - confirm that first, because rebuilding from scratch is not a reliable, repeatable operation with this component.
+2. **Missing `esp32_serial_transport.c`/`.h`.** `motor_f1.c` included the header but nothing had copied the actual transport source into this project - it exists only inside the component's `examples/int32_publisher_custom_transport/main/` folder, not on the main include path by default. Copied both files into `motor_f1/main/`.
+3. **New source file silently not compiled.** Copying a `.c` file into `main/` isn't enough - this project's `main/CMakeLists.txt` lists `SRCS` explicitly (`"motor_f1.c"` only), so the new file linked with `undefined reference` errors until added to that list by name.
+4. **Missing `Kconfig.projbuild`.** The transport code reads `CONFIG_MICROROS_UART_TXD/RXD/RTS/CTS`, Kconfig options declared in a `Kconfig.projbuild` that also needed copying from the example - except the specific example folder used didn't declare those options at all (only app-stack/priority settings), a dead end.
+5. **Resolved by hardcoding instead of chasing Kconfig.** Given the project's UART0 pins are fixed and already known (TXD=GPIO1, RXD=GPIO3, no flow control), replaced the four `CONFIG_MICROROS_UART_*` macro references with hardcoded values directly in `esp32_serial_transport.c` - simpler and more correct than hunting for the right Kconfig source for a board that was never going to need runtime-configurable pins anyway.
+6. **`rmw_uros_ping_agent(0, 1)` - a zero-millisecond timeout.** After all of the above finally produced a working build+flash, the micro-ROS agent showed full session setup (participant/subscriber/publisher/datawriter all created) followed by an immediate teardown, repeating every ~2s. A 0ms ping timeout gives the response no time to arrive over the UART round-trip, so it read as agent-lost almost every cycle even with a healthy connection. Raised to 100ms - session then stayed established, confirmed no drops over 60+ seconds idle.
+
+None of these six were logic bugs in the robot-control code itself (PID/odometry/kinematics all built correctly the first time) - they were entirely in getting an unfamiliar, fragile third-party build system to compile at all. **Lesson for next time a new component gets added to this project: budget real time for build-system archaeology separately from the actual feature logic**, and prefer copying a known-working reference setup wholesale over re-deriving one from partial documentation.
+
+**F5 core pipeline (`/cmd_vel` → drive → `/odom`) confirmed working live same day** - see F5 section above. One correctness bug found in the same test: `MIN_SAFE_PWM` (the anti-brownout PWM floor from F3) was overriding the F5 safety watchdog's "stop on stale `/cmd_vel`" - the robot never actually reached PWM=0 even when commanded to stop, and drove ~2m unattended with no command ever sent. Fixed by making `pid_step()` bypass the floor entirely and return exactly 0 when `target_rpm==0`.
+
+**Open issue, not resolved same day:** during sustained two-motor driving, `/odom` position was seen climbing then resetting toward 0 repeatedly, and the agent log showed the micro-ROS session's `client_key` change at least once mid-test - strong circumstantial evidence of the ESP32 rebooting under load, not just a dropped link. Added a `/esp32_diag` topic publishing `esp_reset_reason()` (read at boot) specifically to test the leading hypothesis (brownout under combined 2-motor current draw) without needing the serial console, which is unusable during active `/cmd_vel` testing (see UART0 conflict note above). **The actual diagnostic run wasn't completed cleanly** - two unrelated physical disturbances (an accidental cable unplug, and the agent terminal being closed by mistake) interrupted data collection both attempts. Picking this up cleanly (nobody touching cables, `/esp32_diag` open the whole time) is the top item for the next session.
