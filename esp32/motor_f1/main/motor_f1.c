@@ -54,7 +54,7 @@
 #define ENC_R_PIN GPIO_NUM_35   /* right encoder signal */
 #define SLOTS_PER_REV 20        /* LM393 disk: 20 slots = 1 full wheel revolution */
 
-/* --- F3: P-only velocity control (Ki/Kd come later, tune Kp first) --- */
+/* --- F3: PI velocity control (Kd deliberately skipped, see KI comment below) --- */
 /* Raised 30 -> 60 (2026-07-27): 30 forced PWM to sit at MIN_SAFE_PWM on the
  * right wheel (its natural RPM at the floor already exceeded target), and
  * even after fixing the earlier RPM-quantization bug, chasing 30 meant
@@ -65,6 +65,27 @@
  * that needs wheel diameter + a chosen cm/s target, deferred to F4 odometry. */
 #define TARGET_RPM 60.0f
 #define KP 3.0f            /* start small, increase until oscillation appears, back off */
+
+/* Added 2026-07-27: P-only data showed the right wheel settling ~15 RPM
+ * below TARGET_RPM consistently (30-60 RPM band, target 60) - a textbook
+ * P-only steady-state error, not noise (resolution is now 15 RPM/step,
+ * fine enough to trust this as real). KI=0.2 is a conservative starting
+ * guess, same "start small" approach as KP.
+ * Kd deliberately NOT added: RPM is still a coarse step signal (15 RPM/step
+ * @ 5Hz) - differentiating a stair-step amplifies jitter into PWM swings
+ * ("derivative kick") rather than smoothing anything. PI is the standard
+ * choice for velocity/RPM loops anyway; Kd matters more for position
+ * control. Revisit only if PI alone proves insufficient. */
+#define KI 0.2f
+
+/* Anti-windup: without this, the integral term grows unbounded whenever
+ * output is pinned at MIN/MAX_SAFE_PWM - exactly what happened during
+ * today's left-wheel stall (PWM=100, RPM=0, for 10+ seconds straight).
+ * An unclamped integral would have kept accumulating that whole time, then
+ * caused a huge overshoot the moment the wheel freed up. Caps the integral
+ * term's own contribution to output, independent of Kp's contribution. */
+#define MAX_I_CONTRIBUTION 40.0f
+#define MAX_INTEGRAL (MAX_I_CONTRIBUTION / KI)
 
 static const char *TAG = "control_task";
 
@@ -153,10 +174,19 @@ static void encoder_gpio_init(void) {
  * Raise it again if the powerbank cuts out at this lower floor. */
 #define MIN_SAFE_PWM 20.0f
 
-/* error(t) = target - actual; u(t) = Kp * error(t); PWM = clamp(u(t), MIN_SAFE_PWM, MAX_SAFE_PWM). */
-static uint32_t pid_step(float target_rpm, float actual_rpm) {
+/* error(t) = target - actual; u(t) = Kp*error(t) + Ki*integral(t);
+ * PWM = clamp(u(t), MIN_SAFE_PWM, MAX_SAFE_PWM). `integral` is per-wheel
+ * state owned by the caller (control_task) since left/right run independent
+ * loops - it persists across calls, unlike everything else in here. */
+static uint32_t pid_step(float target_rpm, float actual_rpm, float *integral) {
     float error = target_rpm - actual_rpm;
-    float u = KP * error;
+    float dt = CONTROL_PERIOD_MS / 1000.0f;
+
+    *integral += error * dt;
+    if (*integral > MAX_INTEGRAL)  *integral = MAX_INTEGRAL;   /* anti-windup clamp, see MAX_INTEGRAL comment */
+    if (*integral < -MAX_INTEGRAL) *integral = -MAX_INTEGRAL;
+
+    float u = KP * error + KI * (*integral);
 
     if (u < MIN_SAFE_PWM)   u = MIN_SAFE_PWM;   /* clamp: floor keeps current draw above the powerbank's auto-shutoff threshold */
     if (u > MAX_SAFE_PWM)   u = MAX_SAFE_PWM;   /* clamp: temporary current-safety ceiling, not the LEDC max */
@@ -208,6 +238,7 @@ static void control_task(void *arg) {
 
     uint32_t snapshot_left, snapshot_right;
     float applied_pwm_left = 0.0f, applied_pwm_right = 0.0f;
+    float integral_left = 0.0f, integral_right = 0.0f;
     uint32_t stall_cycles_left = 0, stall_cycles_right = 0;
     TickType_t last_wake = xTaskGetTickCount();
     const TickType_t period = pdMS_TO_TICKS(CONTROL_PERIOD_MS);
@@ -225,8 +256,8 @@ static void control_task(void *arg) {
         rpm_left_shared  = (snapshot_left  / (float)SLOTS_PER_REV) * (60000.0f / CONTROL_PERIOD_MS);
         rpm_right_shared = (snapshot_right / (float)SLOTS_PER_REV) * (60000.0f / CONTROL_PERIOD_MS);
 
-        float target_pwm_left  = (float)pid_step(TARGET_RPM, rpm_left_shared);
-        float target_pwm_right = (float)pid_step(TARGET_RPM, rpm_right_shared);
+        float target_pwm_left  = (float)pid_step(TARGET_RPM, rpm_left_shared,  &integral_left);
+        float target_pwm_right = (float)pid_step(TARGET_RPM, rpm_right_shared, &integral_right);
 
         applied_pwm_left  = slew_limit(applied_pwm_left,  target_pwm_left);
         applied_pwm_right = slew_limit(applied_pwm_right, target_pwm_right);
