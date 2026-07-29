@@ -590,7 +590,15 @@ static void uros_task(void *arg) {
                 }
             }
 
-            if (rmw_uros_ping_agent(0, 1) != RMW_RET_OK) {
+            /* BUG FOUND 2026-07-27 (F5 first connectivity test): timeout=0
+             * gives the ping response no time to actually arrive over the
+             * UART round-trip, so it reported "failed" almost every cycle
+             * even with the agent alive and working - confirmed live as a
+             * connect/create-everything/disconnect loop every ~1-2s, right
+             * after all the ROS entities were successfully created. 100ms
+             * is generous for a serial round-trip without blocking the
+             * executor/publish loop for long. */
+            if (rmw_uros_ping_agent(100, 1) != RMW_RET_OK) {
                 agent_ok = false;
             }
             vTaskDelay(pdMS_TO_TICKS(20));
