@@ -290,8 +290,23 @@ static void encoder_gpio_init(void) {
 /* error(t) = target - actual; u(t) = Kp*error(t) + Ki*integral(t);
  * PWM = clamp(u(t), MIN_SAFE_PWM, MAX_SAFE_PWM). `integral` is per-wheel
  * state owned by the caller (control_task) since left/right run independent
- * loops - it persists across calls, unlike everything else in here. */
+ * loops - it persists across calls, unlike everything else in here.
+ *
+ * BUG FOUND 2026-07-27 (F5 first test): MIN_SAFE_PWM was clamping the
+ * output even when target_rpm==0 - the F5 safety watchdog forces target
+ * to 0 on a stale/missing /cmd_vel, but the floor was overriding that,
+ * so the robot never actually stopped (kept driving on no command at all,
+ * confirmed live - x drifted past 2m unattended). Explicit target==0
+ * bypass added below: a commanded stop means PWM=0, full stop, no floor -
+ * the floor only makes sense while the robot is supposed to be moving.
+ * Also resets the integral so a long stop doesn't leave stale windup to
+ * bias the next real command. */
 static uint32_t pid_step(float target_rpm, float actual_rpm, float *integral) {
+    if (target_rpm == 0.0f) {
+        *integral = 0.0f;
+        return 0;
+    }
+
     float error = target_rpm - actual_rpm;
     float dt = CONTROL_PERIOD_MS / 1000.0f;
 
@@ -491,14 +506,16 @@ static void cmd_vel_callback(const void *msgin) {
  * Structured the same way as the proven esp32/microros_hello.c pattern
  * (Week 1) - outer loop pings the agent and (re)creates everything on
  * connect, inner loop runs while the agent stays reachable, and everything
- * gets torn down and retried if the agent disappears. */
+ * gets torn down and retried if the agent disappears.
+ * No printf()/ESP_LOG calls anywhere in this function or its callers from
+ * here on - confirmed live (2026-07-27) that ANY console write to UART0
+ * corrupts the micro-ROS binary stream sharing the same wire, including
+ * during the ping-agent phase. Silence is required, not just tidiness. */
 static void uros_task(void *arg) {
     while (1) {
-        printf("Waiting for micro-ROS agent...\n");
         while (rmw_uros_ping_agent(1000, 1) != RMW_RET_OK) {
             vTaskDelay(pdMS_TO_TICKS(500));
         }
-        printf("Agent found, initializing...\n");
 
         rcl_allocator_t allocator = rcl_get_default_allocator();
         rclc_support_t support;
@@ -579,7 +596,6 @@ static void uros_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(20));
         }
 
-        printf("Agent lost, retrying...\n");
         if (rcl_publisher_fini(&odom_pub, &node) != RCL_RET_OK) {}
         if (rcl_subscription_fini(&cmd_vel_sub, &node) != RCL_RET_OK) {}
         if (rclc_executor_fini(exec) != RCL_RET_OK) {}
@@ -656,6 +672,16 @@ void app_main(void) {
     rmw_uros_set_custom_transport(true, (void *)&uart_port,
         esp32_serial_open, esp32_serial_close,
         esp32_serial_write, esp32_serial_read);
+
+    /* BUG FOUND 2026-07-27 (F5 first test): ESP_LOGI/ESP_LOGW in control_task
+     * and the micro-ROS transport above both write to UART0 at the same
+     * time - confirmed live as a burst of garbled characters in the monitor
+     * output, at the same moment the micro-ROS agent never saw a valid
+     * session-establish packet. The two streams were corrupting each other.
+     * Once the transport is set, all console log output must stop - from
+     * here on, debugging is via `ros2 topic echo` on the Jetson, not
+     * idf.py monitor (see README F5 section). */
+    esp_log_level_set("*", ESP_LOG_NONE);
 
     xTaskCreate(control_task, "control_task", 4096, NULL, 5, NULL);
     xTaskCreate(uros_task, "uros_task", 16000, NULL, 5, NULL);
