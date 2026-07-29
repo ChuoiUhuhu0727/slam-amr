@@ -54,6 +54,26 @@
 #define ENC_R_PIN GPIO_NUM_35   /* right encoder signal */
 #define SLOTS_PER_REV 20        /* LM393 disk: 20 slots = 1 full wheel revolution */
 
+/* Moved up from near control_task() (2026-07-27): pid_step() needs this for
+ * its dt calculation, but #define order matters in C - the compiler had
+ * never actually seen this macro yet at the point pid_step() used it,
+ * since the old location was much further down in the file. That was a
+ * silent build failure (`'CONTROL_PERIOD_MS' undeclared`), not a subtle
+ * bug - every build since Ki was added failed here, meaning any test
+ * result since then that "worked" was very likely re-flashing a stale,
+ * older binary rather than the code we thought we were testing.
+ *
+ * Original context for the value itself: shorter window = coarser RPM
+ * resolution with only 20 slots/rev. Raised 50ms -> 200ms (2026-07-27):
+ * at 50ms, 1 pulse = 60 RPM/step, and a since-changed 30 RPM test target
+ * sat exactly BETWEEN two measurable levels - the controller could never
+ * read "at target". At 200ms, 1 pulse = 15 RPM/step - finer, though RPM
+ * itself no longer depends on this window at all now (see last_interval_us
+ * / RPM_STALE_US further down - period measurement replaced pulse
+ * counting for the actual RPM value). This constant now only sets how
+ * often PID/sync/PWM update, not measurement resolution. */
+#define CONTROL_PERIOD_MS 200   /* 5 Hz */
+
 /* --- F3: PI velocity control (Kd deliberately skipped, see KI comment below) --- */
 /* Raised 30 -> 60 (2026-07-27): 30 forced PWM to sit at MIN_SAFE_PWM on the
  * right wheel (its natural RPM at the floor already exceeded target), and
@@ -248,22 +268,8 @@ static float slew_limit(float applied, float target) {
  * recomputed 100x/sec against an RPM value that was up to 1 full second
  * stale. Running both halves in the same 20 Hz loop means PID always acts
  * on the reading from THIS cycle — zero cross-task staleness.
- *
- * Trade-off: shorter window = coarser RPM resolution with only 20 slots/rev.
- * Raised 50ms -> 200ms (2026-07-27): at 50ms, 1 pulse = 60 RPM/step, and
- * TARGET_RPM=30 sits exactly BETWEEN two measurable levels (0, 60) - the
- * controller could never read "at target", only ever +/-30 RPM error, a
- * pure quantization limit cycle no amount of Kp/Ki tuning can remove
- * (confirmed live: RPM alternating 0/60 every cycle while PWM hunted).
- * At 200ms, 1 pulse = 15 RPM/step, so 30 RPM = exactly 2 pulses - target
- * is now representable. Slower loop (5 Hz vs 20 Hz), acceptable at these
- * low target speeds.
- * NOTE 2026-07-27: RPM itself no longer depends on this window at all (see
- * last_interval_us / RPM_STALE_US below - period measurement replaced pulse
- * counting for the actual RPM value). CONTROL_PERIOD_MS now only sets how
- * often PID/sync/PWM update, not measurement resolution - could be sped
- * back up if the loop ever needs to react faster, independent of this. */
-#define CONTROL_PERIOD_MS 200   /* 5 Hz */
+ * (CONTROL_PERIOD_MS itself now lives up near SLOTS_PER_REV - pid_step()
+ * needs it too, and #define order matters in C.) */
 
 /* Companion to the period-measurement RPM calc above: period measurement
  * alone can't distinguish "stopped" from "just hasn't ticked yet" - without
