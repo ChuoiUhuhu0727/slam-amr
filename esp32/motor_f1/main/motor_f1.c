@@ -193,6 +193,13 @@ static volatile float pose_theta_shared = 0.0f;
 static volatile float linear_vel_shared = 0.0f;
 static volatile float angular_vel_shared = 0.0f;
 
+/* Added for hardware debugging (Alex, one-wheel-not-spinning investigation):
+ * applied_pwm_left/right were previously local-only to control_task, so
+ * uros_task had no way to report them. Mirrors the rpm_*_shared pattern
+ * above. */
+static volatile float pwm_left_shared = 0.0f;
+static volatile float pwm_right_shared = 0.0f;
+
 /* Spinlock used to make "read + reset" atomic (avoids the lost-pulse race
  * where a pulse arrives between reading the counter and zeroing it). */
 static portMUX_TYPE encoder_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -454,6 +461,8 @@ static void control_task(void *arg) {
 
         applied_pwm_left  = slew_limit(applied_pwm_left,  target_pwm_left);
         applied_pwm_right = slew_limit(applied_pwm_right, target_pwm_right);
+        pwm_left_shared  = applied_pwm_left;
+        pwm_right_shared = applied_pwm_right;
 
         ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0, (uint32_t)applied_pwm_left);
         ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0);
@@ -558,7 +567,7 @@ static void uros_task(void *arg) {
         geometry_msgs__msg__Twist cmd_vel_msg;
         nav_msgs__msg__Odometry odom_msg = {0};
         std_msgs__msg__String diag_msg = {0};
-        char diag_text[64];
+        char diag_text[96];
 
         if (rclc_support_init(&support, 0, NULL, &allocator) != RCL_RET_OK) {
             vTaskDelay(pdMS_TO_TICKS(1000)); continue;
@@ -593,14 +602,12 @@ static void uros_task(void *arg) {
         rclc_executor_init(exec, &support.context, 1, &allocator);
         rclc_executor_add_subscription(exec, &cmd_vel_sub, &cmd_vel_msg, &cmd_vel_callback, ON_NEW_DATA);
 
-        /* Diagnostic string is static per-connection (reset reason only
-         * changes on an actual reboot, which re-runs this whole function
-         * from scratch anyway) - build once, republish periodically below
-         * so it's visible whenever someone starts echoing, not just at the
-         * exact moment of connection. */
-        snprintf(diag_text, sizeof(diag_text), "reset_reason=%s", reset_reason_str(g_reset_reason));
+        /* diag_text's CONTENT is now rebuilt every publish cycle (see the
+         * publish block below) so /esp32_diag carries live per-wheel
+         * RPM/PWM, not just the reset reason from connection time. The
+         * buffer pointer/capacity themselves don't change per-message, so
+         * only need to be set once here. */
         diag_msg.data.data = diag_text;
-        diag_msg.data.size = strlen(diag_text);
         diag_msg.data.capacity = sizeof(diag_text);
 
         /* Set once - frame_id strings don't change per-message, only the
@@ -640,6 +647,18 @@ static void uros_task(void *arg) {
                 if (rcl_publish(&odom_pub, &odom_msg, NULL) != RCL_RET_OK) {
                     agent_ok = false;
                 }
+
+                /* Rebuilt every cycle now (see comment above) - live
+                 * per-wheel RPM/PWM for hardware debugging, since
+                 * idf.py monitor is unusable once this transport owns
+                 * UART0 (see note above cmd_vel_callback). */
+                snprintf(diag_text, sizeof(diag_text),
+                         "reset=%s RPM L=%.1f R=%.1f PWM L=%.0f R=%.0f",
+                         reset_reason_str(g_reset_reason),
+                         rpm_left_shared, rpm_right_shared,
+                         pwm_left_shared, pwm_right_shared);
+                diag_msg.data.size = strlen(diag_text);
+
                 if (rcl_publish(&diag_pub, &diag_msg, NULL) != RCL_RET_OK) {
                     agent_ok = false;
                 }
