@@ -95,6 +95,10 @@ def generate_launch_description():
         parameters=[{
             'num_cameras': 2,
             'rectified_images': False,
+            # default 5ms assumes hardware-fsync'd stereo (e.g. Hawk module). Our 2
+            # independent ArgusMonoNode instances have no fsync line between them,
+            # so left/right frames can legitimately differ by tens of ms.
+            'sync_matching_threshold_ms': 50.0,
             'base_frame': 'left_camera_optical_frame',
             'camera_optical_frames': [
                 'left_camera_optical_frame',
