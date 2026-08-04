@@ -24,7 +24,7 @@ from launch import LaunchDescription
 from launch_ros.actions import ComposableNodeContainer, Node
 from launch_ros.descriptions import ComposableNode
 
-CALIB_PATH = "/home/chuoichiuchiu/slam-amr/stereo_calibration.npz"
+CALIB_PATH = "/workspaces/isaac_ros-dev/stereo_calibration.npz"
 LEFT_CAMERA_INFO_URL = "file:///workspaces/isaac_ros-dev/camera_info/left.yaml"
 RIGHT_CAMERA_INFO_URL = "file:///workspaces/isaac_ros-dev/camera_info/right.yaml"
 
