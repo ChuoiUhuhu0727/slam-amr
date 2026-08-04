@@ -106,6 +106,11 @@ def generate_launch_description():
             # independent ArgusMonoNode instances have no fsync line between them,
             # so left/right frames can legitimately differ by tens of ms.
             'sync_matching_threshold_ms': 50.0,
+            # default 34ms assumes a smooth 30fps+ feed. Our current pipeline only
+            # sustains ~9-10fps with real jitter (measured up to ~300ms gaps via
+            # `ros2 topic hz`) -- raised generously so real frames aren't rejected.
+            # Revisit once camera throughput itself is improved.
+            'image_jitter_threshold_ms': 300.0,
             'base_frame': 'left_camera_optical_frame',
             'camera_optical_frames': [
                 'left_camera_optical_frame',
