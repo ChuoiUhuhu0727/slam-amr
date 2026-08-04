@@ -17,6 +17,7 @@ better time-synced pairs than sequential capture ever did.
 import os
 import shutil
 import subprocess
+import time
 
 SHOT_PLAN = [
     (5, "shots 0-4: CLOSE, ~20-30cm from the board"),
@@ -38,18 +39,28 @@ def gst_cmd(sensor_id, path):
     )
 
 
+STAGGER_SEC = 0.5  # small human-like gap between starting each camera process
+
+
+def _valid(path):
+    return os.path.exists(path) and os.path.getsize(path) > 0
+
+
 def capture_pair(left_path, right_path):
     proc_l = subprocess.Popen(gst_cmd(0, left_path), shell=True,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    time.sleep(STAGGER_SEC)
     proc_r = subprocess.Popen(gst_cmd(1, right_path), shell=True,
                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
 
     out_l, _ = proc_l.communicate(timeout=15)
     out_r, _ = proc_r.communicate(timeout=15)
 
-    if proc_l.returncode != 0 or not os.path.exists(left_path):
+    # gst-launch can exit non-zero on a benign teardown-time Argus error even after
+    # the frame was captured fine (EOS already reached) -- trust the file, not the exit code.
+    if not _valid(left_path):
         raise RuntimeError(f"Left (sensor-id=0) capture failed:\n{out_l[-500:]}")
-    if proc_r.returncode != 0 or not os.path.exists(right_path):
+    if not _valid(right_path):
         raise RuntimeError(f"Right (sensor-id=1) capture failed:\n{out_r[-500:]}")
 
 
