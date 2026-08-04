@@ -69,6 +69,12 @@ def generate_launch_description():
         parameters=[{
             'camera_id': 0,
             'module_id': -1,
+            # mode 0 (default) is full sensor res 3280x2464. Our calibration was done at
+            # 1280x720, which is mode 4 in this sensor's mode list (same enumeration order
+            # GStreamer's nvarguscamerasrc reports: 0=3280x2464, 1=3280x1848, 2=1920x1080,
+            # 3=1640x1232, 4=1280x720). Must match camera_info's resolution or visual_slam
+            # rejects every frame ("dimensions do not correspond to camera resolution").
+            'mode': 4,
             'camera_info_url': LEFT_CAMERA_INFO_URL,
         }],
     )
@@ -84,6 +90,7 @@ def generate_launch_description():
         parameters=[{
             'camera_id': 1,
             'module_id': -1,
+            'mode': 4,
             'camera_info_url': RIGHT_CAMERA_INFO_URL,
         }],
     )
