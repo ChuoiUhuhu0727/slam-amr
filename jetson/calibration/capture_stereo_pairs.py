@@ -1,9 +1,21 @@
 """Capture synchronized stereo image pairs of the checkerboard for calibration.
 Run on the Jetson over SSH (headless, no live preview).
 Move the checkerboard to a new position/angle, press Enter to save that pair, repeat.
-Aim for TARGET_PAIRS shots: vary distance, angle/tilt, and position (corners too, not just center).
+
+IMPORTANT: the two cameras must stay physically fixed for the ENTIRE session (all
+TARGET_PAIRS shots). If the rig gets bumped/repositioned partway through, the whole
+batch is invalid and must be re-shot from scratch — only the checkerboard moves.
 """
 import cv2
+
+# Guided shot plan: (shot index cutoff, instruction). Printed as a reminder at each cutoff.
+SHOT_PLAN = [
+    (5, "shots 0-4: CLOSE, ~20-30cm from the board"),
+    (10, "shots 5-9: NORMAL distance, ~50-80cm"),
+    (15, "shots 10-14: FAR, ~1.5-2m"),
+    (20, "shots 15-19: mixed distance, but push the board to the EDGES/CORNERS of frame"),
+    (26, "shots 20-25: mixed distance + heavy tilt angles (not facing straight-on)"),
+]
 
 CSI_PIPELINE_LEFT = (
     "nvarguscamerasrc sensor-id=0 ! "
@@ -23,11 +35,13 @@ CSI_PIPELINE_RIGHT = (
 )
 
 OUTPUT_DIR = "stereo_pairs"
-TARGET_PAIRS = 20
+TARGET_PAIRS = 26
 
 def main():
-    import os
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    import os, shutil
+    if os.path.isdir(OUTPUT_DIR):
+        shutil.rmtree(OUTPUT_DIR)  # wipe any previous (now-invalid) batch
+    os.makedirs(OUTPUT_DIR)
 
     cap_left = cv2.VideoCapture(CSI_PIPELINE_LEFT, cv2.CAP_GSTREAMER)
     cap_right = cv2.VideoCapture(CSI_PIPELINE_RIGHT, cv2.CAP_GSTREAMER)
@@ -35,9 +49,13 @@ def main():
         raise RuntimeError("Could not open one or both CSI cameras. Check sensor-id / pipeline.")
 
     count = 0
-    print(f"Target: {TARGET_PAIRS} pairs. Move the checkerboard, then press Enter to capture (or 'q' + Enter to stop).")
+    print(f"Target: {TARGET_PAIRS} pairs. Cameras must NOT move for the whole session — only the board moves.")
     try:
         while count < TARGET_PAIRS:
+            for cutoff, note in SHOT_PLAN:
+                if count < cutoff:
+                    print(f"  >> {note}")
+                    break
             cmd = input(f"[{count}/{TARGET_PAIRS}] Enter to capture, q to quit: ")
             if cmd.strip().lower() == "q":
                 break
