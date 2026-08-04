@@ -13,6 +13,7 @@ Enter, so a ~1-2s open/close gap between the two grabs doesn't hurt sync.
 """
 import os
 import shutil
+import time
 
 import cv2
 
@@ -28,6 +29,7 @@ SHOT_PLAN = [
 OUTPUT_DIR = "stereo_pairs"
 TARGET_PAIRS = 26
 WARMUP_FRAMES = 3  # first frame(s) after opening nvarguscamerasrc are often stale
+SETTLE_SEC = 2.0   # Argus needs a moment to release a session's buffers before the next opens
 
 
 def pipeline_for(sensor_id):
@@ -52,6 +54,7 @@ def grab_one(sensor_id):
             cap.release()
             raise RuntimeError(f"Frame grab failed for sensor-id={sensor_id}")
     cap.release()
+    time.sleep(SETTLE_SEC)
     return frame
 
 
