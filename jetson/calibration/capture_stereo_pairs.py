@@ -32,7 +32,7 @@ TARGET_PAIRS = 26
 def capture_jpeg(sensor_id, path):
     cmd = (
         f"gst-launch-1.0 -e nvarguscamerasrc sensor-id={sensor_id} num-buffers=1 ! "
-        "video/x-raw(memory:NVMM),width=1280,height=720 ! "
+        "'video/x-raw(memory:NVMM),width=1280,height=720' ! "
         f"nvjpegenc ! filesink location={path}"
     )
     result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
