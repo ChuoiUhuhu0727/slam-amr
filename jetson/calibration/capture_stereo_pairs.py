@@ -6,18 +6,17 @@ IMPORTANT: the two cameras must stay physically fixed for the ENTIRE session (al
 TARGET_PAIRS shots). If the rig gets bumped/repositioned partway through, the whole
 batch is invalid and must be re-shot from scratch — only the checkerboard moves.
 
-Each shot opens, grabs, and closes ONE camera pipeline at a time (never both open at
-once) — running two live nvarguscamerasrc sessions concurrently in one process was
-crashing with an Argus dmabuf/segfault error. The board is held still while pressing
-Enter, so a ~1-2s open/close gap between the two grabs doesn't hurt sync.
+Each shot runs `gst-launch-1.0` as a fresh OS subprocess per camera (same recipe that
+already worked cleanly for the earlier single-camera verification test). Holding a
+live Argus session open inside this long-running Python process (via cv2.VideoCapture,
+even opened/closed sequentially with delays) reliably broke the second camera with a
+dmabuf error and eventually wedged the whole nvargus-daemon. A subprocess exits and
+releases Argus completely each time, so there's nothing left to leak or race.
 """
 import os
 import shutil
-import time
+import subprocess
 
-import cv2
-
-# Guided shot plan: (shot index cutoff, instruction). Printed as a reminder at each cutoff.
 SHOT_PLAN = [
     (5, "shots 0-4: CLOSE, ~20-30cm from the board"),
     (10, "shots 5-9: NORMAL distance, ~50-80cm"),
@@ -28,34 +27,17 @@ SHOT_PLAN = [
 
 OUTPUT_DIR = "stereo_pairs"
 TARGET_PAIRS = 26
-WARMUP_FRAMES = 3  # first frame(s) after opening nvarguscamerasrc are often stale
-SETTLE_SEC = 2.0   # Argus needs a moment to release a session's buffers before the next opens
 
 
-def pipeline_for(sensor_id):
-    return (
-        f"nvarguscamerasrc sensor-id={sensor_id} ! "
-        "video/x-raw(memory:NVMM), width=1280, height=720, framerate=30/1 ! "
-        "nvvidconv ! "
-        "video/x-raw, format=BGRx ! "
-        "videoconvert ! "
-        "video/x-raw, format=BGR ! appsink drop=1"
+def capture_jpeg(sensor_id, path):
+    cmd = (
+        f"gst-launch-1.0 -e nvarguscamerasrc sensor-id={sensor_id} num-buffers=1 ! "
+        "video/x-raw(memory:NVMM),width=1280,height=720 ! "
+        f"nvjpegenc ! filesink location={path}"
     )
-
-
-def grab_one(sensor_id):
-    cap = cv2.VideoCapture(pipeline_for(sensor_id), cv2.CAP_GSTREAMER)
-    if not cap.isOpened():
-        raise RuntimeError(f"Could not open camera sensor-id={sensor_id}")
-    frame = None
-    for _ in range(WARMUP_FRAMES):
-        ok, frame = cap.read()
-        if not ok:
-            cap.release()
-            raise RuntimeError(f"Frame grab failed for sensor-id={sensor_id}")
-    cap.release()
-    time.sleep(SETTLE_SEC)
-    return frame
+    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
+    if result.returncode != 0 or not os.path.exists(path):
+        raise RuntimeError(f"Capture failed for sensor-id={sensor_id}: {result.stderr[-500:]}")
 
 
 def main():
@@ -75,15 +57,15 @@ def main():
             if cmd.strip().lower() == "q":
                 break
 
+            left_path = f"{OUTPUT_DIR}/left_{count:02d}.jpg"
+            right_path = f"{OUTPUT_DIR}/right_{count:02d}.jpg"
             try:
-                frame_l = grab_one(0)
-                frame_r = grab_one(1)
+                capture_jpeg(0, left_path)
+                capture_jpeg(1, right_path)
             except RuntimeError as e:
                 print(f"{e}, try again.")
                 continue
 
-            cv2.imwrite(f"{OUTPUT_DIR}/left_{count:02d}.jpg", frame_l)
-            cv2.imwrite(f"{OUTPUT_DIR}/right_{count:02d}.jpg", frame_r)
             print(f"Saved pair {count}")
             count += 1
     except KeyboardInterrupt:
