@@ -6,12 +6,13 @@ IMPORTANT: the two cameras must stay physically fixed for the ENTIRE session (al
 TARGET_PAIRS shots). If the rig gets bumped/repositioned partway through, the whole
 batch is invalid and must be re-shot from scratch — only the checkerboard moves.
 
-Each shot runs `gst-launch-1.0` as a fresh OS subprocess per camera (same recipe that
-already worked cleanly for the earlier single-camera verification test). Holding a
-live Argus session open inside this long-running Python process (via cv2.VideoCapture,
-even opened/closed sequentially with delays) reliably broke the second camera with a
-dmabuf error and eventually wedged the whole nvargus-daemon. A subprocess exits and
-releases Argus completely each time, so there's nothing left to leak or race.
+Each shot launches both cameras' gst-launch-1.0 processes CONCURRENTLY (Popen for
+both, then wait on both) rather than one after another. Sequential single-camera
+sessions (whether via cv2.VideoCapture or via subprocess, with or without a settle
+delay) reliably broke on the second session with an Argus "Correctable Error Status".
+Simultaneous dual-camera capture was already independently verified working on this
+Jetson earlier — this matches that proven-working pattern, and as a bonus gives
+better time-synced pairs than sequential capture ever did.
 """
 import os
 import shutil
@@ -29,15 +30,27 @@ OUTPUT_DIR = "stereo_pairs"
 TARGET_PAIRS = 26
 
 
-def capture_jpeg(sensor_id, path):
-    cmd = (
+def gst_cmd(sensor_id, path):
+    return (
         f"gst-launch-1.0 -e nvarguscamerasrc sensor-id={sensor_id} num-buffers=1 ! "
         "'video/x-raw(memory:NVMM),width=1280,height=720' ! "
         f"nvjpegenc ! filesink location={path}"
     )
-    result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=15)
-    if result.returncode != 0 or not os.path.exists(path):
-        raise RuntimeError(f"Capture failed for sensor-id={sensor_id}: {result.stderr[-500:]}")
+
+
+def capture_pair(left_path, right_path):
+    proc_l = subprocess.Popen(gst_cmd(0, left_path), shell=True,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    proc_r = subprocess.Popen(gst_cmd(1, right_path), shell=True,
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+
+    out_l, _ = proc_l.communicate(timeout=15)
+    out_r, _ = proc_r.communicate(timeout=15)
+
+    if proc_l.returncode != 0 or not os.path.exists(left_path):
+        raise RuntimeError(f"Left (sensor-id=0) capture failed:\n{out_l[-500:]}")
+    if proc_r.returncode != 0 or not os.path.exists(right_path):
+        raise RuntimeError(f"Right (sensor-id=1) capture failed:\n{out_r[-500:]}")
 
 
 def main():
@@ -60,10 +73,9 @@ def main():
             left_path = f"{OUTPUT_DIR}/left_{count:02d}.jpg"
             right_path = f"{OUTPUT_DIR}/right_{count:02d}.jpg"
             try:
-                capture_jpeg(0, left_path)
-                capture_jpeg(1, right_path)
+                capture_pair(left_path, right_path)
             except RuntimeError as e:
-                print(f"{e}, try again.")
+                print(f"{e}\ntry again.")
                 continue
 
             print(f"Saved pair {count}")
