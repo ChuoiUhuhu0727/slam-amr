@@ -1,0 +1,150 @@
+# Nav2 params -- Week 3 "click goal, robot drives there" MVP.
+#
+# Deliberately NOT running map_server/amcl: this robot has no map yet (vo_pose
+# scale bug is unresolved and deliberately deferred, see project memory), so
+# there's nothing to localize against. global_frame is set to "odom" instead
+# of "map" everywhere below.
+#
+# Known limitation, accepted on purpose (not a bug to fix this week): odom
+# drifts unbounded over time with no correction, so the planner's idea of
+# "global" silently drifts from the real world the longer the robot runs.
+# Fine for a short single-goal test drive; would need real localization
+# (map + AMCL, or a fixed vo_pose) before trusting this over long runs.
+#
+# No obstacle layer either -- semantic/obstacle detection is Week 4 scope.
+# This config drives straight toward the goal, it does not avoid anything.
+# Only an inflation layer is configured, so the planner still respects the
+# robot's own footprint against costmap bounds.
+#
+# Robot physical constants (from esp32/motor_f1/main/motor_f1.c):
+#   wheel diameter 0.06m, wheelbase 0.10m -> robot_radius below is a
+#   conservative estimate (not yet measured off the real chassis).
+
+controller_server:
+  ros__parameters:
+    controller_frequency: 10.0
+    min_x_velocity_threshold: 0.001
+    min_theta_velocity_threshold: 0.001
+    failure_tolerance: 0.3
+    progress_checker_plugin: "progress_checker"
+    goal_checker_plugins: ["goal_checker"]
+    controller_plugins: ["FollowPath"]
+
+    progress_checker:
+      plugin: "nav2_controller::SimpleProgressChecker"
+      required_movement_radius: 0.05
+      movement_time_allowance: 10.0
+
+    goal_checker:
+      plugin: "nav2_controller::SimpleGoalChecker"
+      xy_goal_tolerance: 0.1
+      yaw_goal_tolerance: 0.15
+      stateful: true
+
+    # Regulated Pure Pursuit: fewer knobs than DWB, good default for a small
+    # diff-drive robot's first close-loop test. Speeds kept well under the
+    # 0.3 m/s already proven safe on real hardware during the vo_pose
+    # /cmd_vel trials (see project memory) -- start conservative, raise once
+    # this MVP is proven end-to-end.
+    FollowPath:
+      plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
+      desired_linear_vel: 0.15
+      lookahead_dist: 0.4
+      min_lookahead_dist: 0.2
+      max_lookahead_dist: 0.6
+      use_velocity_scaled_lookahead_dist: false
+      use_rotate_to_heading: true
+      rotate_to_heading_angular_vel: 1.0
+      max_angular_accel: 3.2
+      min_turning_radius: 0.0
+      use_regulated_linear_velocity_scaling: true
+      use_cost_regulated_linear_velocity_scaling: false
+      regulated_linear_scaling_min_radius: 0.6
+      regulated_linear_scaling_min_speed: 0.05
+
+planner_server:
+  ros__parameters:
+    expected_planner_frequency: 5.0
+    planner_plugins: ["GridBased"]
+    GridBased:
+      plugin: "nav2_navfn_planner::NavfnPlanner"
+      use_astar: false
+      allow_unknown: true
+      tolerance: 0.2
+
+behavior_server:
+  ros__parameters:
+    local_costmap_topic: local_costmap/costmap_raw
+    global_costmap_topic: global_costmap/costmap_raw
+    local_footprint_topic: local_costmap/published_footprint
+    global_footprint_topic: global_costmap/published_footprint
+    cycle_frequency: 10.0
+    behavior_plugins: ["spin", "backup", "wait"]
+    spin:
+      plugin: "nav2_behaviors::Spin"
+    backup:
+      plugin: "nav2_behaviors::BackUp"
+    wait:
+      plugin: "nav2_behaviors::Wait"
+    global_frame: odom
+    robot_base_frame: base_link
+
+bt_navigator:
+  ros__parameters:
+    global_frame: odom
+    robot_base_frame: base_link
+    odom_topic: /odom
+    # default_nav_to_pose_bt_xml intentionally omitted -> nav2_bt_navigator
+    # falls back to its own default tree
+    # (navigate_to_pose_w_replanning_and_recovery.xml), which is fine here:
+    # its recoveries (spin/backup/wait) don't depend on obstacle data.
+
+local_costmap:
+  local_costmap:
+    ros__parameters:
+      update_frequency: 5.0
+      publish_frequency: 5.0
+      global_frame: odom
+      robot_base_frame: base_link
+      rolling_window: true
+      width: 3
+      height: 3
+      resolution: 0.05
+      robot_radius: 0.10
+      plugins: ["inflation_layer"]
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.2
+      always_send_full_costmap: true
+
+global_costmap:
+  global_costmap:
+    ros__parameters:
+      update_frequency: 2.0
+      publish_frequency: 2.0
+      global_frame: odom
+      robot_base_frame: base_link
+      # No static map to size the global costmap against, so it rolls with
+      # the robot too -- width/height just needs to comfortably cover
+      # start-to-goal distance for a single test drive (a few meters).
+      rolling_window: true
+      width: 10
+      height: 10
+      resolution: 0.05
+      robot_radius: 0.10
+      plugins: ["inflation_layer"]
+      inflation_layer:
+        plugin: "nav2_costmap_2d::InflationLayer"
+        cost_scaling_factor: 3.0
+        inflation_radius: 0.2
+      always_send_full_costmap: true
+
+lifecycle_manager_navigation:
+  ros__parameters:
+    autostart: true
+    node_names:
+      - controller_server
+      - planner_server
+      - behavior_server
+      - bt_navigator
