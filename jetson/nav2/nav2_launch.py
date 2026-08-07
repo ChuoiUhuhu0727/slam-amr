@@ -9,6 +9,11 @@ Runs natively on the Jetson's ROS2 Humble install (ros-humble-navigation2 +
 ros-humble-nav2-bringup), NOT inside the Isaac ROS docker container -- Nav2 only
 needs /odom (already published natively by the ESP32/micro-ROS side), so this is
 fully decoupled from the Isaac ROS environment.
+
+Note for future debugging: `--ros-args --log-level <node>:=debug` produces no extra
+output on these apt-installed nav2 packages -- DEBUG-level log calls appear to be
+compiled out of the binaries. Don't waste time on that path again; instead inspect
+behavior via topics (/plan, /local_plan, /cmd_vel, costmap) or params.
 """
 import os
 import sys
@@ -40,12 +45,6 @@ def generate_launch_description():
             name='controller_server',
             output='screen',
             parameters=[PARAMS_FILE],
-            # DEBUG temporarily: goal test sends "Passing new path to controller" every
-            # cycle but /cmd_vel never publishes a single message (confirmed live via
-            # `ros2 topic echo /cmd_vel`, silent for 60s+) -- INFO level doesn't show why
-            # computeVelocityCommands() isn't producing/publishing output. Drop back to
-            # default (remove this arguments line) once the cause is found.
-            arguments=['--ros-args', '--log-level', 'controller_server:=debug'],
         ),
         Node(
             package='nav2_planner',

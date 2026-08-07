@@ -61,6 +61,14 @@ controller_server:
       use_cost_regulated_linear_velocity_scaling: false
       regulated_linear_scaling_min_radius: 0.6
       regulated_linear_scaling_min_speed: 0.05
+      # No obstacle layer exists yet (see file header -- this MVP has no obstacle
+      # avoidance), so the costmap has nothing marking cells "free": everything is
+      # likely NO_INFORMATION. Suspected cause of a live bug -- robot accepted goals
+      # and computed a valid global /plan, but controller_server never produced a
+      # /local_plan or any /cmd_vel at all, no error logged. If RPP's collision check
+      # treats unknown cells as unsafe, that would silently block every cycle. Revisit
+      # once a real obstacle layer exists.
+      use_collision_detection: false
 
 planner_server:
   ros__parameters:
