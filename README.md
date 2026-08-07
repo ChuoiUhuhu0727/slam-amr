@@ -41,7 +41,8 @@ Target users: Vietnamese manufacturers, logistics companies, and robotics startu
 | TB6612FNG motor driver | Dual H-bridge PWM control |
 | LM393 encoders x2 | Wheel velocity feedback |
 | TT DC motors x2 | Differential drive |
-| Powerbank 20000mAh | 5V 3A USB output — main power source |
+| Powerbank 20000mAh (PD) | Jetson power via PD Trigger → 12V barrel jack — see [Power Architecture](#power-architecture--known-issue--planned-fix-2026-07-22), LiPo+buck-boost upgrade still pending |
+| 1x 3.7V Li-ion cell + boost converter | Motor VM (TB6612FNG) — replaced the dedicated powerbank after its mid-run cutoff bug, confirmed running cleanly under real PID load. **TODO: record cell capacity + boost converter model/rating here.** |
 
 ### Power Architecture — Known Issue + Planned Fix (2026-07-22)
 
@@ -62,7 +63,9 @@ Separately, the Jetson's own supply (powerbank → PD Trigger → 12V barrel jac
 
 **✅ Fixed 2026-07-24:** motor VM now has its own wire straight from a powerbank output, bypassing the ESP32 entirely. Confirmed on real hardware — F3 (PID) ran continuously through the PWM ramp with no brownout/reset loop. The Jetson's own LiPo/buck-boost supply (above) is still open — lower priority, becomes urgent before Week 3 GPU workloads.
 
-**🔶 New issue found 2026-07-27, open:** the powerbank now dedicated to VM cuts its own output off mid-run during PID testing. Root cause not yet isolated (candidates: no-load auto-shutoff tripping when PWM sags low, or over-current protection tripping on motor inrush current when PID ramps PWM up quickly — these need different fixes, and which one it is wasn't confirmed before this session paused). A `MIN_SAFE_PWM` floor was added in `motor_f1.c` as a first attempt (ruling out the low-current theory) but did not resolve it. **Decided against sharing the Jetson's own Anker PD powerbank for VM too** — even a well-regulated multi-port bank shares one internal battery/BMS, so a motor inrush spike on one port risks sagging the other; this would reintroduce the exact ESP32-brownout failure mode from the 2026-07-22 bug above, but on the Jetson instead (much higher stakes). Plan: keep Jetson and motor VM on physically separate power sources (as today), find/verify a VM powerbank that doesn't exhibit this cutoff behavior under real motor load.
+**🔶 Issue found 2026-07-27, RESOLVED by switching power source (not by isolating the original root cause):** the powerbank then dedicated to VM cut its own output off mid-run during PID testing. Root cause was never conclusively isolated (candidates: no-load auto-shutoff tripping when PWM sags low, or over-current protection tripping on motor inrush current — a `MIN_SAFE_PWM` floor added as a first attempt ruled out the low-current theory but didn't resolve it). **Decided against sharing the Jetson's own Anker PD powerbank for VM too** — even a well-regulated multi-port bank shares one internal battery/BMS, so a motor inrush spike on one port risks sagging the other, reintroducing the exact ESP32-brownout failure mode from the 2026-07-22 bug but on the Jetson instead (much higher stakes).
+
+**✅ Current fix:** motor VM now runs off a dedicated **1x 3.7V Li-ion cell + boost converter** instead of any powerbank. Confirmed running cleanly under real motor/PID load, no mid-run cutoff — Jetson and motor VM remain on physically separate power sources, as planned. The Jetson's own supply (powerbank → PD Trigger → barrel jack) is unchanged and still the lower-priority open item below.
 
 ## Software Stack
 
@@ -97,7 +100,7 @@ Motor driver path is wired and verified in `esp32/motor_f1` (F1 milestone). Enco
 | GPIO26 | SDA | MPU6050 IMU | I2C data line | 🔌 wired, not read in firmware yet |
 | GPIO25 | SCL | MPU6050 IMU | I2C clock line | 🔌 wired, not read in firmware yet |
 | 3V3 | VCC | TB6612FNG, both encoders, IMU | Logic power | ✅ wired |
-| Powerbank (direct) | VM | TB6612FNG | Motor power | ✅ wired — direct from powerbank, no longer via ESP32 5V (fixed 2026-07-24) |
+| Li-ion cell (3.7V) → boost converter (direct) | VM | TB6612FNG | Motor power | ✅ wired — no longer via ESP32 5V (fixed 2026-07-24), no longer a powerbank either (switched off the cutoff-prone VM powerbank, see Power Architecture) |
 | GND | GND | All above + powerbank | Common ground | ✅ wired |
 
 **Downstream of TB6612FNG:** AO1/AO2 → Motor L (red/black) · BO1/BO2 → Motor R (red/black)
@@ -106,10 +109,10 @@ Motor driver path is wired and verified in `esp32/motor_f1` (F1 milestone). Enco
 
 ```mermaid
 flowchart TD
-    A["RViz2 — click goal (x, y)"] --> B["Nav2\nPath Planner + Costmap"]
+    A["RViz2 — click goal (x, y)\nFixed Frame: odom"] --> B["Nav2\nPath Planner + Costmap\n(global_frame: odom, no map)"]
     C["IMX219 CSI Camera"] --> D["isaac_ros_visual_slam\nGPU-accelerated on Jetson"]
-    D -->|"/visual_slam/tracking/odometry"| B
-    D -->|"/map"| B
+    D -.->|"/visual_slam/tracking/odometry\n(planned, blocked on vo_pose bug)"| B
+    D -.->|"/map\n(planned, no mapping pipeline yet)"| B
     B -->|"/cmd_vel\ngeometry_msgs/Twist"| F["micro-ROS Agent\nJetson"]
     F <-->|"UART 115200 baud"| G["ESP32 — FreeRTOS\n4 tasks"]
     G -->|"PWM + DIR"| H["TB6612FNG\nMotor Driver"]
@@ -118,7 +121,9 @@ flowchart TD
     J -->|"pulse count → RPM"| G
     G -->|"/odom nav_msgs/Odometry"| F
     G -->|"/imu sensor_msgs/Imu\nMPU6050 @ 200 Hz"| D
-    F -->|"/odom + /imu"| B
+    F -->|"/odom"| K["odom_to_tf.py\n(jetson/nav2/)"]
+    K -->|"TF odom→base_link"| B
+    F -->|"/odom"| B
 ```
 
 ## ESP32 Firmware (FreeRTOS)
@@ -146,9 +151,9 @@ path works. Fixed 50% PWM, both motors forward. No encoder, no PID yet (those ar
 | GPIO22 | BIN2 | Motor B direction |
 | GPIO23 | STBY | Enable (HIGH = run) |
 | 3V3 | VCC | Logic power |
-| GND | GND | Common ground (shared with powerbank) |
+| GND | GND | Common ground (shared with motor power source) |
 
-> Motor power (VM) no longer connects to the ESP32 — wired directly from the powerbank as of 2026-07-24. See [Power Architecture](#power-architecture--known-issue--planned-fix-2026-07-22) for the fix history.
+> Motor power (VM) no longer connects to the ESP32 — wired directly to its own supply as of 2026-07-24, now a dedicated Li-ion cell + boost converter (see [Power Architecture](#power-architecture--known-issue--planned-fix-2026-07-22) for the full fix history, including the powerbank that was tried and replaced in between).
 
 Motor L: red → AO1, black → AO2 · Motor R: red → BO1, black → BO2
 
@@ -333,36 +338,62 @@ specifically needs on top of that (the custom transport `.c`/`.h`, a minimal
 committed - see Lessons Learned for the exact chain of build errors this
 took to work out, in case a future fresh setup hits the same ones.
 
+## Nav2 — Closed-Loop MVP (`jetson/nav2/`)
+
+**Status: code written and merged (PR #32), not yet tested end-to-end on real hardware.** Goal: click a goal pose in RViz2, robot drives there via `/cmd_vel`. Runs **natively on the Jetson's ROS2 Humble** (`ros-humble-navigation2`), fully outside the Isaac ROS Docker container — Nav2 only depends on `/odom`, which is already published natively by the ESP32/micro-ROS side, so this whole stage is decoupled from the fragile Isaac ROS environment.
+
+**Deliberate scope decisions for this MVP (see also the ROS2 Topic Interface status column above):**
+- **`global_frame: odom`, no map, no AMCL.** There's no map to localize against (the `vo_pose`/cuVSLAM scale bug below is deliberately deferred, not fixed) and no lidar on this robot for AMCL's `LaserScan` input anyway, even if a map existed. **Known, accepted limitation:** odom drift is unbounded over time with nothing correcting it, so the longer the robot runs, the more the planner's idea of "where things are" silently diverges from reality. Fine for a short single-goal test drive; not for long/repeated runs without real localization.
+- **No obstacle costmap layer** — only an inflation layer around the robot's own footprint. Semantic/obstacle detection is later-roadmap scope. **This MVP does not avoid obstacles.**
+- **`odom_to_tf.py` bridge node, added because of a real gap found during design:** the ESP32 firmware (`esp32/motor_f1/main/motor_f1.c`) publishes `/odom` as a plain `nav_msgs/Odometry` topic only — it never broadcasts the `odom → base_link` TF. Nav2's costmaps and controller read robot pose from TF, not from the topic directly, so without this bridge Nav2 fails immediately on any goal with "Could not get robot pose." This is a small, separate Jetson-side ROS2 node (not a colcon package — run by file path like everything else in `jetson/`), deliberately not added to the ESP32 firmware itself to keep the firmware hardware-facing-only.
+
+**Files:**
+- `nav2_params.yaml` — `controller_server` (Regulated Pure Pursuit), `planner_server` (NavFn), `behavior_server` (spin/backup/wait recoveries), `bt_navigator`, local + global costmap (both rolling-window, `global_frame: odom`), `lifecycle_manager`. Speeds kept conservative (`desired_linear_vel: 0.15` m/s) relative to the ~0.3 m/s already proven safe on real hardware during the `vo_pose` `/cmd_vel` trials — raise once this MVP is proven end-to-end. `robot_radius: 0.10` is a conservative estimate from the measured wheel diameter/wheelbase (6cm / 10cm), not yet measured off the real chassis.
+- `nav2_launch.py` — launches `odom_to_tf.py` + the 4 Nav2 lifecycle nodes together.
+- `odom_to_tf.py` — the TF bridge described above.
+
+**To run (not yet verified on hardware, expect at least one bring-up bug on first try):**
+```bash
+sudo apt install ros-humble-navigation2 ros-humble-nav2-bringup   # if not already present
+# bring up micro-ROS agent + ESP32 first so /odom is live
+ros2 launch jetson/nav2/nav2_launch.py
+```
+Then in RViz2: set Fixed Frame to `odom`, add a TF display, use the "2D Goal Pose" tool to send a goal, confirm the robot drives toward it via `/cmd_vel`.
+
+**Handoff note for whoever picks this up next (see Team & Work Split below):** the original work split assigned "Nav2 stack: YAML config, planner selection, costmap layers" to Alex for Week 5. This MVP was built ahead of that, directly against the `/odom` contract, to unblock a closed-loop demo sooner given the project's compressed timeline. Coordinate before extending it (e.g. adding the obstacle layer, tuning the controller) to avoid duplicate work.
+
 ## Roadmap
 
 | Week | Deliverable |
 |------|-------------|
 | 1 ✅ | micro-ROS hello world — ESP32 publishes ROS2 topic on Jetson |
 | 2 ✅ | Motor driver + encoder wiring, ESP32 publishes `/odom` |
-| 3 🔄 | IMX219 → isaac_ros_visual_slam → trajectory in RViz2 — pipeline runs end-to-end, trajectory publishes; **open bug: `vo_pose` scale is wrong** (see Lessons Learned 2026-08-04) |
+| 3 🔄 | IMX219 → isaac_ros_visual_slam → trajectory in RViz2 — pipeline runs end-to-end, trajectory publishes; **open bug: `vo_pose` scale is wrong, deliberately deferred** (see Lessons Learned 2026-08-04/06-07) |
 | 4 ✅* | PID velocity control, `/cmd_vel` → accurate robot movement — done ahead of schedule alongside Week 2's F3/F5 |
-| 5 | Nav2 + full end-to-end: camera → SLAM → Nav2 → motors autonomous |
+| 5 🔄* | Nav2 closed loop — **MVP built ahead of schedule** (see [Nav2 — Closed-Loop MVP](#nav2--closed-loop-mvp-jetsonnav2) above), routed on `/odom` instead of SLAM since Week 3's bug is unresolved; not yet hardware-tested, no obstacle avoidance yet |
 | 6 | Semantic navigation: TensorRT object detection → navigate to target |
 | 7 | Stress test, metrics, GitHub, demo video |
 | 8 | Buffer / stretch goals (waypoint patrol, return-to-dock, multi-session map) |
 
-\* Week 4's PID/`/cmd_vel` work landed early because motor control needed to be solid before odometry (F4/F5) could be tested — see Week 2 sections above.
+\* Week 4's PID/`/cmd_vel` work landed early because motor control needed to be solid before odometry (F4/F5) could be tested — see Week 2 sections above. Week 5's Nav2 MVP landed early too, routed on `/odom` instead of waiting on the Week 3 SLAM bug — see the Nav2 section above for scope/limitations.
 
 ## ROS2 Topic Interface (contract between ESP32 stack and Jetson stack)
 
 This is the boundary the two halves of the team build against. Either side can develop independently as long as message type and topic name match — the ESP32 side doesn't need to know how `/cmd_vel` was computed, and the Jetson side doesn't need to know how `/odom` was computed.
 
-| Topic | Message Type | Publisher | Subscriber |
-|-------|-------------|-----------|------------|
-| `/camera/image_raw` | `sensor_msgs/Image` | argus_camera (Jetson) | visual_slam (Jetson) |
-| `/camera/camera_info` | `sensor_msgs/CameraInfo` | argus_camera (Jetson) | visual_slam (Jetson) |
-| `/imu` | `sensor_msgs/Imu` | ESP32 (micro-ROS) | visual_slam (Jetson) |
-| `/odom` | `nav_msgs/Odometry` | ESP32 (micro-ROS) | Nav2 (Jetson) |
-| `/visual_slam/tracking/odometry` | `nav_msgs/Odometry` | visual_slam (Jetson) | Nav2 (Jetson) |
-| `/map` | `nav_msgs/OccupancyGrid` | visual_slam (Jetson) | Nav2 costmap (Jetson) |
-| `/cmd_vel` | `geometry_msgs/Twist` | Nav2 (Jetson) | ESP32 (micro-ROS) |
-| `/tf` | `tf2_msgs/TFMessage` | visual_slam + Nav2 (Jetson) | All nodes |
-| `/goal_pose` | `geometry_msgs/PoseStamped` | RViz2 / mission (Jetson) | Nav2 (Jetson) |
+**Status column reflects what's actually wired today, not the original design intent** — the Nav2 MVP (`jetson/nav2/`) currently runs on `/odom` alone, not `/visual_slam/tracking/odometry` + `/map`, because there's no map source yet (the `vo_pose` scale bug, see Lessons Learned, is deliberately deferred) and no lidar for AMCL. The visual_slam→Nav2 rows below are the future/planned path once that's resolved, kept in the contract table so it's clear where they'll plug back in.
+
+| Topic | Message Type | Publisher | Subscriber | Status |
+|-------|-------------|-----------|------------|--------|
+| `/camera/image_raw` | `sensor_msgs/Image` | argus_camera (Jetson) | visual_slam (Jetson) | ✅ live |
+| `/camera/camera_info` | `sensor_msgs/CameraInfo` | argus_camera (Jetson) | visual_slam (Jetson) | ✅ live |
+| `/imu` | `sensor_msgs/Imu` | ESP32 (micro-ROS) | visual_slam (Jetson) | 🔌 wired, not read in firmware yet |
+| `/odom` | `nav_msgs/Odometry` | ESP32 (micro-ROS) | `odom_to_tf.py` → TF, and Nav2 costmaps (Jetson) | ✅ live, this is what Nav2 actually navigates on today |
+| `/tf` (`odom`→`base_link`) | `tf2_msgs/TFMessage` | `jetson/nav2/odom_to_tf.py` (Jetson) | Nav2 costmaps + controller (Jetson) | ✅ live (added with the Nav2 MVP — ESP32 only ever published the `/odom` topic, never TF) |
+| `/cmd_vel` | `geometry_msgs/Twist` | Nav2 (Jetson) | ESP32 (micro-ROS) | ✅ live |
+| `/goal_pose` | `geometry_msgs/PoseStamped` | RViz2 "2D Goal Pose" (Jetson) | Nav2 `bt_navigator` (Jetson) | ✅ live |
+| `/visual_slam/tracking/odometry` | `nav_msgs/Odometry` | visual_slam (Jetson) | Nav2 (Jetson) | ⏳ planned — blocked on the `vo_pose` scale bug |
+| `/map` | `nav_msgs/OccupancyGrid` | visual_slam (Jetson) | Nav2 costmap (Jetson) | ⏳ planned — no map-building pipeline running yet |
 
 ## Team & Work Split
 
@@ -375,7 +406,7 @@ Two-person team. Split is drawn along one line: **does this task require physica
 
 **Alex (remote) — owns the software/config stack, buildable without the physical robot:**
 - Isaac ROS Docker setup + `visual_slam` launch/config (Week 3) — can be built and dry-run against a sample rosbag or public IMX219 dataset before the real camera feed is ready
-- Nav2 stack: YAML config, planner selection, costmap layers (Week 5) — develop against simulated `/odom` + `/map` data, tune for real once camera/SLAM (vịt's side) is live
+- Nav2 stack: YAML config, planner selection, costmap layers (Week 5) — **an MVP (`jetson/nav2/`) was built ahead of schedule to unblock a closed-loop demo, see [Nav2 — Closed-Loop MVP](#nav2--closed-loop-mvp-jetsonnav2) above; check there before starting new Nav2 work to avoid duplicating it.** Remaining open work: real hardware test/tuning, obstacle costmap layer, eventually swapping `/odom` for `/visual_slam/tracking/odometry` + a real map once the Week 3 SLAM bug is fixed
 - Semantic navigation: train/export detection model, write TensorRT inference node (Week 6) — training and most integration work doesn't need the physical robot, only final on-device deployment does
 - Tooling: evaluation/metrics scripts (Week 7), RViz2 dashboard config, repo docs
 
@@ -391,6 +422,24 @@ slam-amr/
 │   └── motor_f1/
 │       └── main/motor_f1.c         # F1-F5: motor spin, encoder RPM, PI control, odometry, micro-ROS
 ├── jetson/
+│   ├── calibration/                 # stereo calibration: capture pairs, calibrate, npz -> camera_info YAML
+│   │   ├── capture_stereo_pairs.py
+│   │   ├── stereo_calibrate.py             # pinhole model (the one in use)
+│   │   ├── stereo_calibrate_fisheye.py     # tried, not used -- pinhole error was already good
+│   │   ├── npz_to_camera_info_yaml.py            # raw mode (Tx=0, baseline carried by TF)
+│   │   ├── npz_to_camera_info_yaml_rectified.py  # rectified mode (real cv2.stereoRectify P)
+│   │   └── visualize_corners.py
+│   ├── slam/                        # Isaac ROS visual_slam launch files -- run INSIDE the
+│   │   │                            # isaac_ros-dev Docker container (~/workspaces/isaac_ros-dev
+│   │   │                            # on the Jetson, not vendored into this repo -- copy these
+│   │   │                            # launch files + stereo_calibration.npz in after every pull)
+│   │   ├── visual_slam_argus.launch.py            # raw mode, the known-working baseline
+│   │   └── visual_slam_argus_rectified.launch.py  # rectified mode, currently produces frozen pose (open bug)
+│   ├── nav2/                        # Nav2 closed-loop MVP (Week 3) -- runs NATIVE on the
+│   │   │                            # Jetson's ROS2 Humble, outside the Isaac ROS container
+│   │   ├── nav2_params.yaml         # controller/planner/behavior/bt_navigator + costmaps, global_frame=odom
+│   │   ├── nav2_launch.py           # launches the 4 lifecycle nodes + odom_to_tf bridge
+│   │   └── odom_to_tf.py            # bridges ESP32's /odom topic into the odom->base_link TF Nav2 needs
 │   ├── object_detection/           # first_test.py: CSI cam -> YOLO -> boxes -> record
 │   ├── dataset_collection/         # record video, extract frames, assemble YOLO dataset
 │   └── training/                   # fine-tune YOLOv8n on a custom class (train_duck.py)
