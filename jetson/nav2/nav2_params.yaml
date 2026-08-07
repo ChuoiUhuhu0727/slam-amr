@@ -41,34 +41,52 @@ controller_server:
       yaw_goal_tolerance: 0.15
       stateful: true
 
-    # Regulated Pure Pursuit: fewer knobs than DWB, good default for a small
-    # diff-drive robot's first close-loop test. Speeds kept well under the
-    # 0.3 m/s already proven safe on real hardware during the vo_pose
-    # /cmd_vel trials (see project memory) -- start conservative, raise once
-    # this MVP is proven end-to-end.
+    # DIAGNOSTIC SWAP (temporary): RegulatedPurePursuitController accepted goals and
+    # received a valid global /plan every cycle, but never produced a /local_plan or
+    # any /cmd_vel at all -- no exception, no error logged, robot never moved, even
+    # after disabling use_collision_detection. Swapping to DWB as a differential test:
+    # if DWB ALSO stays silent, the fault is in shared Nav2/costmap infrastructure, not
+    # RPP specifically; if DWB works, keep it and stop chasing RPP. See project history
+    # for the full debug trail (nav2_params.yaml commit history / conversation log).
     FollowPath:
-      plugin: "nav2_regulated_pure_pursuit_controller::RegulatedPurePursuitController"
-      desired_linear_vel: 0.15
-      lookahead_dist: 0.4
-      min_lookahead_dist: 0.2
-      max_lookahead_dist: 0.6
-      use_velocity_scaled_lookahead_dist: false
-      use_rotate_to_heading: true
-      rotate_to_heading_angular_vel: 1.0
-      max_angular_accel: 3.2
-      min_turning_radius: 0.0
-      use_regulated_linear_velocity_scaling: true
-      use_cost_regulated_linear_velocity_scaling: false
-      regulated_linear_scaling_min_radius: 0.6
-      regulated_linear_scaling_min_speed: 0.05
-      # No obstacle layer exists yet (see file header -- this MVP has no obstacle
-      # avoidance), so the costmap has nothing marking cells "free": everything is
-      # likely NO_INFORMATION. Suspected cause of a live bug -- robot accepted goals
-      # and computed a valid global /plan, but controller_server never produced a
-      # /local_plan or any /cmd_vel at all, no error logged. If RPP's collision check
-      # treats unknown cells as unsafe, that would silently block every cycle. Revisit
-      # once a real obstacle layer exists.
-      use_collision_detection: false
+      plugin: "dwb_core::DWBLocalPlanner"
+      debug_trajectory_details: true
+      min_vel_x: 0.0
+      min_vel_y: 0.0
+      max_vel_x: 0.15
+      max_vel_y: 0.0
+      max_vel_theta: 1.0
+      min_speed_xy: 0.0
+      max_speed_xy: 0.15
+      min_speed_theta: 0.0
+      acc_lim_x: 2.5
+      acc_lim_y: 0.0
+      acc_lim_theta: 3.2
+      decel_lim_x: -2.5
+      decel_lim_y: 0.0
+      decel_lim_theta: -3.2
+      vx_samples: 20
+      vy_samples: 1
+      vtheta_samples: 20
+      sim_time: 1.7
+      linear_granularity: 0.05
+      angular_granularity: 0.025
+      transform_tolerance: 0.3
+      xy_goal_tolerance: 0.1
+      trans_stopped_velocity: 0.1
+      short_circuit_trajectory_evaluation: true
+      stateful: true
+      critics: ["RotateToGoal", "Oscillation", "BaseObstacle", "GoalAlign", "PathAlign", "PathDist", "GoalDist"]
+      BaseObstacle.scale: 0.02
+      PathAlign.scale: 32.0
+      PathAlign.forward_point_distance: 0.1
+      GoalAlign.scale: 24.0
+      GoalAlign.forward_point_distance: 0.1
+      PathDist.scale: 32.0
+      GoalDist.scale: 24.0
+      RotateToGoal.scale: 32.0
+      RotateToGoal.slowing_factor: 5.0
+      RotateToGoal.lookahead_time: -1.0
 
 planner_server:
   ros__parameters:
