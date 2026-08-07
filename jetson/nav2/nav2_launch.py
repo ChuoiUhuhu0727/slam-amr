@@ -40,6 +40,12 @@ def generate_launch_description():
             name='controller_server',
             output='screen',
             parameters=[PARAMS_FILE],
+            # DEBUG temporarily: goal test sends "Passing new path to controller" every
+            # cycle but /cmd_vel never publishes a single message (confirmed live via
+            # `ros2 topic echo /cmd_vel`, silent for 60s+) -- INFO level doesn't show why
+            # computeVelocityCommands() isn't producing/publishing output. Drop back to
+            # default (remove this arguments line) once the cause is found.
+            arguments=['--ros-args', '--log-level', 'controller_server:=debug'],
         ),
         Node(
             package='nav2_planner',
