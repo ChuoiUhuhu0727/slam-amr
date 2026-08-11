@@ -1,4 +1,8 @@
-# Nav2 params -- Week 3 "click goal, robot drives there" MVP.
+# Nav2 params -- Week 3 "click goal, robot drives there" MVP,
+# + Week 6 Phase B obstacle_layer added on top (see jetson/slam/stereo_depth_argus.launch.py
+# for the PointCloud2 source this layer consumes -- /stereo/points2, published in
+# left_camera_optical_frame, requires that launch file's base_link->camera static TF
+# to be correct before obstacle positions in the costmap are spatially trustworthy).
 #
 # Deliberately NOT running map_server/amcl: this robot has no map yet (vo_pose
 # scale bug is unresolved and deliberately deferred, see project memory), so
@@ -11,10 +15,12 @@
 # Fine for a short single-goal test drive; would need real localization
 # (map + AMCL, or a fixed vo_pose) before trusting this over long runs.
 #
-# No obstacle layer either -- semantic/obstacle detection is Week 4 scope.
-# This config drives straight toward the goal, it does not avoid anything.
-# Only an inflation layer is configured, so the planner still respects the
-# robot's own footprint against costmap bounds.
+# obstacle_layer added 2026-08-11, NOT YET TESTED on hardware -- first thing to
+# verify once /stereo/points2 is live: does the costmap actually clear to free
+# space where there's genuinely nothing (clearing:true), or does camera/disparity
+# noise leave phantom obstacle cells that never clear? min_obstacle_height is set
+# to filter the floor plane out of the point cloud based on height alone --
+# untested assumption, revisit if the floor itself shows up as "obstacle".
 #
 # Robot physical constants (from esp32/motor_f1/main/motor_f1.c):
 #   wheel diameter 0.06m, wheelbase 0.10m -> robot_radius below is a
@@ -137,7 +143,23 @@ local_costmap:
       height: 3
       resolution: 0.05
       robot_radius: 0.10
-      plugins: ["inflation_layer"]
+      plugins: ["obstacle_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: stereo_points
+        stereo_points:
+          topic: /stereo/points2
+          sensor_frame: ""
+          data_type: "PointCloud2"
+          marking: True
+          clearing: True
+          min_obstacle_height: 0.05
+          max_obstacle_height: 1.0
+          obstacle_max_range: 3.0
+          obstacle_min_range: 0.0
+          raytrace_max_range: 3.5
+          raytrace_min_range: 0.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
@@ -159,7 +181,23 @@ global_costmap:
       height: 10
       resolution: 0.05
       robot_radius: 0.10
-      plugins: ["inflation_layer"]
+      plugins: ["obstacle_layer", "inflation_layer"]
+      obstacle_layer:
+        plugin: "nav2_costmap_2d::ObstacleLayer"
+        enabled: True
+        observation_sources: stereo_points
+        stereo_points:
+          topic: /stereo/points2
+          sensor_frame: ""
+          data_type: "PointCloud2"
+          marking: True
+          clearing: True
+          min_obstacle_height: 0.05
+          max_obstacle_height: 1.0
+          obstacle_max_range: 3.0
+          obstacle_min_range: 0.0
+          raytrace_max_range: 3.5
+          raytrace_min_range: 0.0
       inflation_layer:
         plugin: "nav2_costmap_2d::InflationLayer"
         cost_scaling_factor: 3.0
