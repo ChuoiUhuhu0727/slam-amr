@@ -34,11 +34,19 @@ reading, same discipline as the wheelbase/wheel-diameter constants in
 motor_f1.c. Measure once, hardcode here (matches this project's existing
 convention -- no live calibration step for static mechanical offsets).
 
-Nothing in this file has been run yet -- first-pass implementation from reading
-image_pipeline's documented topic/remap conventions, not from a live test on
-this workspace. Expect at least one plugin-name or param-name mismatch on first
-launch; check `ros2 component types stereo_image_proc` for the exact registered
-plugin names on this ROS distro if DisparityNode/PointCloudNode fail to load.
+CONFIRMED WORKING on real hardware 2026-08-11: /stereo/points2 publishes at
+~1-1.5Hz (much slower than disparity's ~10Hz -- point cloud generation is the
+expensive step on CPU; revisit GPU version per the note above only if this
+rate turns out to be a real bottleneck for Nav2, not preemptively). Getting
+here took a real debugging chain worth remembering: all 4 raw inputs checked
+individually first (`ros2 topic hz`, all fine) before suspecting the node
+itself; visual_slam's container silently dying mid-session (closed by
+accident) looked identical to a real bug until re-launching it fixed nothing
+by itself; approximate_sync was a reasonable, correctly-reasoned guess that
+turned out NOT to be the actual cause; the real fix only came from `ros2 node
+info <node>` showing the ACTUAL live topic names instead of trusting this
+file's own remap dict -- a silently-wrong remap doesn't error in ROS2, it just
+does nothing.
 """
 from launch import LaunchDescription
 from launch_ros.actions import ComposableNodeContainer, Node
@@ -87,23 +95,26 @@ def generate_launch_description():
             ('left/camera_info', 'visual_slam/camera_info_0'),
             ('right/image_rect', 'visual_slam/image_1'),
             ('right/camera_info', 'visual_slam/camera_info_1'),
-            # explicit, so this literally matches point_cloud_node's input below
-            # instead of relying on both nodes defaulting to the same name
-            ('left/disparity', 'stereo/disparity'),
+            # NOT remapped, deliberately: confirmed live 2026-08-11 via
+            # `ros2 node info /disparity_node` that this node's real internal
+            # output topic is plain `disparity`, not `left/disparity` -- the
+            # remap that used to be here (`left/disparity` -> `stereo/
+            # disparity`) was a silent no-op (ROS2 doesn't error when you
+            # remap a topic name the node doesn't actually have) and cost
+            # real debugging time chasing sync/QoS/encoding theories before
+            # `ros2 node info` gave the real answer. point_cloud_node below
+            # has the identical situation and also defaults to plain
+            # `/disparity`, so the two nodes end up correctly wired to each
+            # other anyway -- left unremapped on purpose, not "fixed", to
+            # avoid reintroducing the same silent-no-op risk.
         ],
         parameters=[{
-            # Added 2026-08-11: /stereo/points2 never published, no error --
-            # confirmed all 4 inputs (image_0/1, camera_info_0/1) were flowing
-            # fine individually (20-30Hz each via `ros2 topic hz`), so the gap
-            # is downstream, inside this node's own left/right time sync.
-            # Default exact-time sync needs matching timestamps, but these two
-            # ArgusMonoNode streams have real inter-camera jitter -- the SAME
-            # jitter visual_slam_node itself already needed
-            # sync_matching_threshold_ms=50.0 to tolerate (see
-            # visual_slam_argus_rectified.launch.py). approximate_sync lets
-            # this node's own (separate) synchronizer tolerate it too.
-            # NOT YET CONFIRMED this fixes it -- next thing to check if
-            # /stereo/disparity still doesn't publish after this.
+            # Tried first as the fix for the no-output investigation above;
+            # turned out NOT to be the actual cause (the dead remap was).
+            # Left in place anyway -- still the technically correct setting
+            # given the real inter-camera jitter between the two ArgusMonoNode
+            # streams (the same jitter visual_slam_node needed
+            # sync_matching_threshold_ms=50.0 to tolerate).
             'approximate_sync': True,
             'queue_size': 10,
         }],
@@ -117,7 +128,8 @@ def generate_launch_description():
             ('left/image_rect_color', 'visual_slam/image_0'),
             ('left/camera_info', 'visual_slam/camera_info_0'),
             ('right/camera_info', 'visual_slam/camera_info_1'),
-            ('left/disparity', 'stereo/disparity'),
+            # NOT remapped -- see disparity_node's comment above, identical
+            # situation, both default to plain `disparity` which matches.
             ('points2', 'stereo/points2'),
         ],
         parameters=[{
