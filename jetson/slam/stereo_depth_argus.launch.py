@@ -44,11 +44,13 @@ from launch import LaunchDescription
 from launch_ros.actions import ComposableNodeContainer, Node
 from launch_ros.descriptions import ComposableNode
 
-# TODO(vịt): measure real camera mount offset from base_link (chassis center,
-# ground-projected) to the left camera's optical center, in meters. Left as
-# 0.0 so the pipeline is at least runnable end-to-end before the number is
-# right -- costmap obstacle placement will be inaccurate until this is fixed.
-BASE_TO_LEFT_CAM_XYZ = (0.0, 0.0, 0.0)
+# Measured 2026-08-11 (tape measure, after the forward-direction flip in
+# motor_f1.c -- camera now roughly faces the same way as base_link's forward
+# axis, which is why this is a small/near-zero offset instead of needing a
+# 180-degree rotation): x ~0 (camera sits almost directly over the wheel
+# axle), y=0 (camera roughly centered left-right on the chassis), z=0.14m
+# (14cm up from the ground to the lens).
+BASE_TO_LEFT_CAM_XYZ = (0.0, 0.0, 0.14)
 
 # Placeholder: camera looks straight forward, no tilt/roll in the mount.
 # qx,qy,qz,qw for "no rotation" is (0,0,0,1). If the camera is physically
