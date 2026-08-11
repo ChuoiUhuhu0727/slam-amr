@@ -7,7 +7,10 @@
  * F2: count LM393 encoder pulses via ISR, compute RPM every 1s.
  * Merged into one project because F3 (PID) needs both together anyway.
  *
- * Pin map (ESP32 38-pin DevKit  ->  TB6612FNG):
+ * Raw hardware wiring (ESP32 38-pin DevKit  ->  TB6612FNG), UNCHANGED since
+ * original solder-down — this describes the physical wires, not which
+ * software label (AIN1_PIN etc.) currently points at each one (see 2026-08-11
+ * note below the #defines for why those two now differ):
  *   GPIO16 -> PWMA      GPIO17 -> PWMB     (speed  — driven by LEDC)
  *   GPIO18 -> AIN1      GPIO21 -> BIN1     (direction)
  *   GPIO19 -> AIN2      GPIO22 -> BIN2     (direction)
@@ -16,9 +19,9 @@
  *   VM     <- powerbank (direct, bypasses ESP32 — fixed 2026-07-24)
  *   GND    -> GND   (must be common with the powerbank ground)
  *
- * Pin map (ESP32 -> LM393 encoders):
- *   GPIO34 -> left encoder OUT   (input-only pin, no internal pull-up needed —
- *   GPIO35 -> right encoder OUT   LM393 module has its own onboard pull-up)
+ * Raw hardware wiring (ESP32 -> LM393 encoders), also unchanged:
+ *   GPIO34 -> encoder OUT on the TB6612 "A" side (same physical wheel as AIN1/AIN2/PWMA)
+ *   GPIO35 -> encoder OUT on the TB6612 "B" side (same physical wheel as BIN1/BIN2/PWMB)
  *
  * F2 test procedure (do this BEFORE trusting F3/PID):
  *   Comment out the "wake the TB6612FNG" + direction lines in app_main so
@@ -49,23 +52,55 @@
 #include <rmw_microros/rmw_microros.h>
 #include "esp32_serial_transport.h"
 
-/* --- Direction + enable pins: plain digital outputs (HIGH/LOW only) --- */
-#define AIN1_PIN  GPIO_NUM_18
-#define AIN2_PIN  GPIO_NUM_19
-#define BIN1_PIN  GPIO_NUM_21
-#define BIN2_PIN  GPIO_NUM_22
+/* --- Direction + enable pins: plain digital outputs (HIGH/LOW only) ---
+ *
+ * SWAPPED 2026-08-11 (was AIN1=18,AIN2=19 / BIN1=21,BIN2=22): the stereo
+ * camera is mounted facing the chassis's ORIGINAL reverse direction, and
+ * rather than re-route the CSI ribbon cable to spin the camera around
+ * (this project's single biggest recurring hardware failure mode — CSI
+ * cable, encoder VCC, encoder solder joint, left-motor GPIO have all
+ * worked loose from handling before, see project memory), the robot's own
+ * notion of "forward" was redefined in software instead so the camera's
+ * facing direction becomes the new forward.
+ *
+ * A 180-degree redefinition of "forward" is a rigid rotation about the
+ * vertical axis — it flips BOTH front/back AND left/right together, it is
+ * not possible to flip just one (same principle already worked out for the
+ * IMU mount orientation, see project memory 2026-07-18). This #define swap
+ * is the left/right half of that: software's "channel A" (LEDC_CHANNEL_0,
+ * used for target_pwm_left/ENC_L_PIN everywhere else in this file) now
+ * points at the physical GPIOs that used to be TB6612 channel B, so the
+ * math in control_task() — which was already correct and is NOT touched by
+ * this change — now drives the wheel that is physically on the robot's new
+ * left side. The front/back half of the flip is the AIN1/AIN2/BIN1/BIN2
+ * polarity flip in app_main() below (0,1 instead of the original 1,0) —
+ * both halves are required together, neither alone gives the right result
+ * (worked through with vịt before making this change, see conversation).
+ *
+ * Physical wiring itself has NOT changed — only which label points at which
+ * already-wired GPIO. Cross-check against the raw wiring table above if
+ * this ever needs re-deriving. */
+#define AIN1_PIN  GPIO_NUM_21
+#define AIN2_PIN  GPIO_NUM_22
+#define BIN1_PIN  GPIO_NUM_18
+#define BIN2_PIN  GPIO_NUM_19
 #define STBY_PIN  GPIO_NUM_23
 
-/* --- Speed pins: driven by the LEDC PWM peripheral, not set by hand --- */
-#define PWMA_PIN  GPIO_NUM_16
-#define PWMB_PIN  GPIO_NUM_17
+/* --- Speed pins: driven by the LEDC PWM peripheral, not set by hand ---
+ * Swapped together with AIN/BIN above, same reason. */
+#define PWMA_PIN  GPIO_NUM_17
+#define PWMB_PIN  GPIO_NUM_16
 
 #define PWM_FREQ_HZ  1000   /* 1 kHz PWM carrier */
 #define PWM_DUTY_50  128    /* 128 / 255 = 50% duty (8-bit resolution) */
 
-/* --- F2: encoder pins + RPM constants --- */
-#define ENC_L_PIN GPIO_NUM_34   /* left encoder signal */
-#define ENC_R_PIN GPIO_NUM_35   /* right encoder signal */
+/* --- F2: encoder pins + RPM constants ---
+ * Swapped together with AIN/BIN/PWMA/PWMB above, same reason: ENC_L_PIN
+ * must read the same physical wheel that LEDC_CHANNEL_0/target_pwm_left
+ * now drives, or RPM feedback would be reporting the wrong wheel to its
+ * own PID loop. */
+#define ENC_L_PIN GPIO_NUM_35   /* left encoder signal (was 34) */
+#define ENC_R_PIN GPIO_NUM_34   /* right encoder signal (was 35) */
 #define SLOTS_PER_REV 20        /* LM393 disk: 20 slots = 1 full wheel revolution */
 
 /* Moved up from near control_task() (2026-07-27): pid_step() needs this for
@@ -749,12 +784,20 @@ void app_main(void) {
     /* Direction pins are wired for forward, but F5 now drives actual speed
      * (including reverse/turn) through /cmd_vel via control_task - these
      * just set the electrical default; PWM=0 from a stale/absent /cmd_vel
-     * (the safety default) means the motors don't move regardless. */
+     * (the safety default) means the motors don't move regardless.
+     *
+     * FLIPPED 2026-08-11 (was AIN1=1,AIN2=0 / BIN1=1,BIN2=0): the front/back
+     * half of the forward-direction redefinition — see the AIN1_PIN #define
+     * comment above for the full reasoning. This reverses each wheel's
+     * physical spin direction for the same PWM value, which combined with
+     * the pin-routing swap above is what makes the robot's "forward" match
+     * the camera's facing direction instead of the original mount
+     * direction. */
     gpio_set_level(STBY_PIN, 1);   /* wake the TB6612FNG out of standby */
-    gpio_set_level(AIN1_PIN, 1);
-    gpio_set_level(AIN2_PIN, 0);
-    gpio_set_level(BIN1_PIN, 1);
-    gpio_set_level(BIN2_PIN, 0);
+    gpio_set_level(AIN1_PIN, 0);
+    gpio_set_level(AIN2_PIN, 1);
+    gpio_set_level(BIN1_PIN, 0);
+    gpio_set_level(BIN2_PIN, 1);
 
     rmw_uros_set_custom_transport(true, (void *)&uart_port,
         esp32_serial_open, esp32_serial_close,
