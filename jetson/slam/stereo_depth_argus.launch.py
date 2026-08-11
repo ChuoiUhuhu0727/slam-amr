@@ -91,6 +91,22 @@ def generate_launch_description():
             # instead of relying on both nodes defaulting to the same name
             ('left/disparity', 'stereo/disparity'),
         ],
+        parameters=[{
+            # Added 2026-08-11: /stereo/points2 never published, no error --
+            # confirmed all 4 inputs (image_0/1, camera_info_0/1) were flowing
+            # fine individually (20-30Hz each via `ros2 topic hz`), so the gap
+            # is downstream, inside this node's own left/right time sync.
+            # Default exact-time sync needs matching timestamps, but these two
+            # ArgusMonoNode streams have real inter-camera jitter -- the SAME
+            # jitter visual_slam_node itself already needed
+            # sync_matching_threshold_ms=50.0 to tolerate (see
+            # visual_slam_argus_rectified.launch.py). approximate_sync lets
+            # this node's own (separate) synchronizer tolerate it too.
+            # NOT YET CONFIRMED this fixes it -- next thing to check if
+            # /stereo/disparity still doesn't publish after this.
+            'approximate_sync': True,
+            'queue_size': 10,
+        }],
     )
 
     point_cloud_node = ComposableNode(
@@ -104,6 +120,10 @@ def generate_launch_description():
             ('left/disparity', 'stereo/disparity'),
             ('points2', 'stereo/points2'),
         ],
+        parameters=[{
+            'approximate_sync': True,
+            'queue_size': 10,
+        }],
     )
 
     container = ComposableNodeContainer(
