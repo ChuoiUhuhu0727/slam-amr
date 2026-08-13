@@ -60,12 +60,20 @@ from launch_ros.descriptions import ComposableNode
 # (14cm up from the ground to the lens).
 BASE_TO_LEFT_CAM_XYZ = (0.0, 0.0, 0.14)
 
-# Placeholder: camera looks straight forward, no tilt/roll in the mount.
-# qx,qy,qz,qw for "no rotation" is (0,0,0,1). If the camera is physically
-# tilted (e.g. angled down to see the floor sooner), this needs the real
-# rotation too, not just translation -- flag this to vịt if obstacles end up
-# spatially wrong even after the translation is fixed.
-BASE_TO_LEFT_CAM_QUAT = (0.0, 0.0, 0.0, 1.0)
+# Fixed 2026-08-13: this was (0,0,0,1) i.e. no rotation, which is wrong even
+# with zero tilt/roll -- base_link (REP103: x-forward, y-left, z-up) and
+# left_camera_optical_frame (REP103 optical convention: x-right, y-down,
+# z-forward-into-scene) are different axis conventions, not just possibly
+# offset by mount tilt. Symptom that exposed this: /stereo/points2 had real,
+# non-NaN points (confirmed via a direct rclpy read, ~11932/921600) but
+# nothing rendered in RViz2 even after ruling out Color Transformer/point
+# size/view framing -- because points 1-3m in front of the camera (large Z
+# in the optical frame) were being placed 1-3m in the air (mapped straight
+# to base_link's Z) instead of in front (base_link's X), well outside the
+# default ground-level view. This is the standard fixed rotation for a
+# forward-facing, untilted optical-frame camera -- if the mount is later
+# found to have real tilt/roll, that would compose with this, not replace it.
+BASE_TO_LEFT_CAM_QUAT = (-0.5, 0.5, -0.5, 0.5)
 
 
 def generate_launch_description():
@@ -82,7 +90,16 @@ def generate_launch_description():
             '--qz', str(BASE_TO_LEFT_CAM_QUAT[2]),
             '--qw', str(BASE_TO_LEFT_CAM_QUAT[3]),
             '--frame-id', 'base_link',
-            '--child-frame-id', 'left_camera_optical_frame',
+            # NOT 'left_camera_optical_frame' -- confirmed live 2026-08-13 via a tf2
+            # MessageFilter warning on /stereo/points2 ("discarding message because the
+            # queue is full" for frame "camera_optical") that ArgusMonoNode stamps its
+            # published images/camera_info with frame_id "camera_optical" by default,
+            # not the name used elsewhere in this repo's launch files/TF tree. Renamed
+            # this TF's child frame to match reality instead of chasing ArgusMonoNode's
+            # own default (visual_slam_node doesn't care about this string -- it uses
+            # separate base_frame/camera_optical_frames params for its own pose output,
+            # unrelated to what's stamped on the raw image/camera_info messages).
+            '--child-frame-id', 'camera_optical',
         ],
     )
 
