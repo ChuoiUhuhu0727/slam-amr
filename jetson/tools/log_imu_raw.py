@@ -1,12 +1,17 @@
 #!/usr/bin/env python3
-"""Subscribe to /esp32_diag and log every message to CSV.
+"""Subscribe to /imu_raw and log every message to CSV.
 
 Ctrl+C to stop — each row is flushed to disk immediately on arrival,
 so nothing is lost when the process is interrupted.
 
+Raw int16 values only (no unit conversion) — MPU6050 wakes into its
+power-on-reset default full-scale range: accel +/-2g (16384 LSB/g),
+gyro +/-250 deg/s (131 LSB/(deg/s)). Divide by those to get physical
+units during processing.
+
 Usage:
-    python3 log_esp32_diag.py [output.csv]
-    (default output: esp32_diag_<timestamp>.csv in the current dir)
+    python3 log_imu_raw.py [output.csv]
+    (default output: imu_raw_<timestamp>.csv in the current dir)
 """
 import csv
 import re
@@ -17,34 +22,35 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import String
 
-DIAG_RE = re.compile(
-    r"reset=(?P<reset>\S+) RPM L=(?P<rpm_l>-?\d+\.?\d*) R=(?P<rpm_r>-?\d+\.?\d*) "
-    r"PWM L=(?P<pwm_l>-?\d+\.?\d*) R=(?P<pwm_r>-?\d+\.?\d*)"
+IMU_RE = re.compile(
+    r"ax=(?P<ax>-?\d+) ay=(?P<ay>-?\d+) az=(?P<az>-?\d+) "
+    r"gx=(?P<gx>-?\d+) gy=(?P<gy>-?\d+) gz=(?P<gz>-?\d+)"
 )
 
 
-class DiagLogger(Node):
+class ImuLogger(Node):
     def __init__(self, csv_path):
-        super().__init__('esp32_diag_logger')
+        super().__init__('imu_raw_logger')
         self.csv_file = open(csv_path, 'w', newline='')
         self.writer = csv.writer(self.csv_file)
         self.writer.writerow(
-            ['t_sec', 'reset_reason', 'rpm_l', 'rpm_r', 'pwm_l', 'pwm_r', 'raw'])
+            ['t_sec', 'ax_raw', 'ay_raw', 'az_raw',
+             'gx_raw', 'gy_raw', 'gz_raw', 'raw'])
         self.csv_file.flush()
         self.t0 = self.get_clock().now()
         self.row_count = 0
         self.csv_path = csv_path
-        self.create_subscription(String, '/esp32_diag', self.on_msg, 10)
-        self.get_logger().info(f'Logging /esp32_diag -> {csv_path} (Ctrl+C to stop)')
+        self.create_subscription(String, '/imu_raw', self.on_msg, 10)
+        self.get_logger().info(f'Logging /imu_raw -> {csv_path} (Ctrl+C to stop)')
 
     def on_msg(self, msg):
         t = (self.get_clock().now() - self.t0).nanoseconds / 1e9
-        m = DIAG_RE.search(msg.data)
+        m = IMU_RE.search(msg.data)
         if m:
-            row = [f'{t:.3f}', m['reset'], m['rpm_l'], m['rpm_r'],
-                   m['pwm_l'], m['pwm_r'], msg.data]
+            row = [f'{t:.3f}', m['ax'], m['ay'], m['az'],
+                   m['gx'], m['gy'], m['gz'], msg.data]
         else:
-            row = [f'{t:.3f}', '', '', '', '', '', msg.data]
+            row = [f'{t:.3f}', '', '', '', '', '', '', msg.data]
         self.writer.writerow(row)
         self.csv_file.flush()
         self.row_count += 1
@@ -55,9 +61,9 @@ class DiagLogger(Node):
 
 def main():
     csv_path = sys.argv[1] if len(sys.argv) > 1 else \
-        datetime.now().strftime('esp32_diag_%Y%m%d_%H%M%S.csv')
+        datetime.now().strftime('imu_raw_%Y%m%d_%H%M%S.csv')
     rclpy.init()
-    node = DiagLogger(csv_path)
+    node = ImuLogger(csv_path)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
