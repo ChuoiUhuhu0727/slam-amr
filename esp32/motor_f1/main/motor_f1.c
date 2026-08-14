@@ -837,6 +837,14 @@ static i2c_master_dev_handle_t imu_dev = NULL;
  * already-proven motor/encoder/odom path down with it. imu_dev stays NULL
  * on any failure; imu_read_raw() checks that and no-ops. */
 static void setup_imu(void) {
+    /* MPU6050 needs some tens of ms after power-up before it reliably
+     * answers on I2C (datasheet power-on-reset timing). setup_gpio()/
+     * setup_pwm() above already burn a little time, but not reliably
+     * enough to depend on - without this, a cold boot could race the
+     * sensor and permanently disable IMU reads for that whole session
+     * (see imu_dev = NULL below) even though nothing is actually wrong. */
+    vTaskDelay(pdMS_TO_TICKS(50));
+
     i2c_master_bus_config_t bus_cfg = {
         .clk_source = I2C_CLK_SRC_DEFAULT,
         .i2c_port = I2C_NUM_0,
@@ -872,17 +880,31 @@ static void setup_imu(void) {
  * and discarded - the sensor only supports reading this block contiguously,
  * there's no cheaper way to skip over temp mid-burst). Big-endian per
  * MPU6050's register layout (MSB byte first for every axis). */
+#define IMU_MAX_CONSECUTIVE_FAILURES 5
+
+/* Guards uros_task's control loop from a flaky/loose IMU wire: bounds each
+ * stall tightly (a healthy MPU6050 answers in well under 1ms at 400kHz -
+ * 5ms is already generous) AND gives up retrying after repeated failures
+ * instead of eating that stall every single 100ms cycle forever. Matches
+ * the same "don't let IMU trouble touch the proven motor/odom path"
+ * philosophy as setup_imu()'s soft-fail. */
 static bool imu_read_raw(int16_t *ax, int16_t *ay, int16_t *az,
                           int16_t *gx, int16_t *gy, int16_t *gz) {
+    static uint8_t consecutive_failures = 0;
+
     if (imu_dev == NULL) {
         return false;
     }
     uint8_t reg = MPU6050_REG_ACCEL_XOUT_H;
     uint8_t data[IMU_READ_LEN];
     if (i2c_master_transmit_receive(imu_dev, &reg, 1, data, sizeof(data),
-                                     pdMS_TO_TICKS(50)) != ESP_OK) {
+                                     pdMS_TO_TICKS(5)) != ESP_OK) {
+        if (++consecutive_failures >= IMU_MAX_CONSECUTIVE_FAILURES) {
+            imu_dev = NULL;  /* bus likely wedged - stop paying the stall */
+        }
         return false;
     }
+    consecutive_failures = 0;
     *ax = (int16_t)((data[0]  << 8) | data[1]);
     *ay = (int16_t)((data[2]  << 8) | data[3]);
     *az = (int16_t)((data[4]  << 8) | data[5]);
