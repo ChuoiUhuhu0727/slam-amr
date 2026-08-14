@@ -34,6 +34,7 @@
 #include <stdbool.h>
 #include <string.h>
 #include "driver/gpio.h"
+#include "driver/i2c_master.h"
 #include "driver/ledc.h"
 #include "driver/uart.h"
 #include "freertos/FreeRTOS.h"
@@ -102,6 +103,26 @@
 #define ENC_L_PIN GPIO_NUM_35   /* left encoder signal (was 34) */
 #define ENC_R_PIN GPIO_NUM_34   /* right encoder signal (was 35) */
 #define SLOTS_PER_REV 20        /* LM393 disk: 20 slots = 1 full wheel revolution */
+
+/* --- IMU (MPU6050) sanity-check read, added 2026-08-14 ---
+ * Soldered pins (2026-07-29), never read from firmware until now - this is
+ * the first empirical data point for the still-unverified axis-mapping
+ * hypothesis in project memory (2026-07-18/20 entries). Raw int16 values
+ * only - deliberately NOT converted to g/deg-per-s on-device (vịt's call):
+ * keeps this firmware change tiny/additive, and the axis-mapping math is
+ * easier to iterate on in Python on a real machine than to re-flash for.
+ * Conversion factors for whoever processes this later: MPU6050 wakes into
+ * its power-on-reset default full-scale range (ACCEL_CONFIG/GYRO_CONFIG are
+ * never written here, so they stay 0x00) - that's accel +/-2g
+ * (16384 LSB/g) and gyro +/-250 deg/s (131 LSB/(deg/s)).
+ * AD0 assumed tied low (0x68) - the common default on breakout boards; if
+ * i2c_master_probe/the wake write fails, check AD0 first (0x69 otherwise). */
+#define IMU_SDA_PIN       GPIO_NUM_26
+#define IMU_SCL_PIN       GPIO_NUM_25
+#define MPU6050_I2C_ADDR  0x68
+#define MPU6050_REG_PWR_MGMT_1   0x6B
+#define MPU6050_REG_ACCEL_XOUT_H 0x3B  /* accel(6) + temp(2) + gyro(6) = 14B burst */
+#define IMU_READ_LEN 14
 
 /* Moved up from near control_task() (2026-07-27): pid_step() needs this for
  * its dt calculation, but #define order matters in C - the compiler had
@@ -598,11 +619,14 @@ static void uros_task(void *arg) {
         rcl_subscription_t cmd_vel_sub;
         rcl_publisher_t odom_pub;
         rcl_publisher_t diag_pub;
+        rcl_publisher_t imu_pub;
         rclc_executor_t executor;
         geometry_msgs__msg__Twist cmd_vel_msg;
         nav_msgs__msg__Odometry odom_msg = {0};
         std_msgs__msg__String diag_msg = {0};
+        std_msgs__msg__String imu_msg = {0};
         char diag_text[96];
+        char imu_text[80];
 
         if (rclc_support_init(&support, 0, NULL, &allocator) != RCL_RET_OK) {
             vTaskDelay(pdMS_TO_TICKS(1000)); continue;
@@ -632,6 +656,15 @@ static void uros_task(void *arg) {
             rclc_support_fini(&support);
             vTaskDelay(pdMS_TO_TICKS(1000)); continue;
         }
+        if (rclc_publisher_init_default(&imu_pub, &node,
+                ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String), "imu_raw") != RCL_RET_OK) {
+            if (rcl_publisher_fini(&diag_pub, &node) != RCL_RET_OK) {}
+            if (rcl_publisher_fini(&odom_pub, &node) != RCL_RET_OK) {}
+            if (rcl_subscription_fini(&cmd_vel_sub, &node) != RCL_RET_OK) {}
+            if (rcl_node_fini(&node) != RCL_RET_OK) {}
+            rclc_support_fini(&support);
+            vTaskDelay(pdMS_TO_TICKS(1000)); continue;
+        }
 
         rclc_executor_t *exec = &executor;
         rclc_executor_init(exec, &support.context, 1, &allocator);
@@ -644,6 +677,8 @@ static void uros_task(void *arg) {
          * only need to be set once here. */
         diag_msg.data.data = diag_text;
         diag_msg.data.capacity = sizeof(diag_text);
+        imu_msg.data.data = imu_text;
+        imu_msg.data.capacity = sizeof(imu_text);
 
         /* Set once - frame_id strings don't change per-message, only the
          * numeric fields below do. */
@@ -697,6 +732,27 @@ static void uros_task(void *arg) {
                 if (rcl_publish(&diag_pub, &diag_msg, NULL) != RCL_RET_OK) {
                     agent_ok = false;
                 }
+
+                /* IMU sanity-check read (2026-08-14) - done inline here
+                 * rather than in its own task: I2C at 400kHz for 14 bytes
+                 * is on the order of tens of microseconds, negligible next
+                 * to this loop's 100ms period, and doing it in-line means
+                 * no shared volatile state and no ISR/task race to reason
+                 * about at all - unlike pulse_count_left/right, which DO
+                 * cross a real task boundary and need portENTER_CRITICAL. */
+                int16_t imu_ax, imu_ay, imu_az, imu_gx, imu_gy, imu_gz;
+                if (imu_read_raw(&imu_ax, &imu_ay, &imu_az,
+                                  &imu_gx, &imu_gy, &imu_gz)) {
+                    snprintf(imu_text, sizeof(imu_text),
+                             "ax=%d ay=%d az=%d gx=%d gy=%d gz=%d",
+                             imu_ax, imu_ay, imu_az, imu_gx, imu_gy, imu_gz);
+                } else {
+                    snprintf(imu_text, sizeof(imu_text), "imu_read_failed");
+                }
+                imu_msg.data.size = strlen(imu_text);
+                if (rcl_publish(&imu_pub, &imu_msg, NULL) != RCL_RET_OK) {
+                    agent_ok = false;
+                }
             }
 
             /* BUG FOUND 2026-07-27 (F5 first connectivity test): timeout=0
@@ -713,6 +769,7 @@ static void uros_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(20));
         }
 
+        if (rcl_publisher_fini(&imu_pub, &node) != RCL_RET_OK) {}
         if (rcl_publisher_fini(&diag_pub, &node) != RCL_RET_OK) {}
         if (rcl_publisher_fini(&odom_pub, &node) != RCL_RET_OK) {}
         if (rcl_subscription_fini(&cmd_vel_sub, &node) != RCL_RET_OK) {}
@@ -768,6 +825,74 @@ static void setup_pwm(void) {
     ESP_ERROR_CHECK(ledc_channel_config(&ch_b));
 }
 
+/* Set once in app_main(), read (not written) by uros_task() afterward - no
+ * cross-task synchronization needed for this handle itself (it's immutable
+ * after setup), unlike the encoder pulse counters which DO cross an
+ * ISR/task boundary and need portENTER_CRITICAL. */
+static i2c_master_dev_handle_t imu_dev = NULL;
+
+/* Bring up the I2C bus + MPU6050 device and wake it from sleep.
+ * Deliberately NOT ESP_ERROR_CHECK'd end-to-end like setup_gpio/setup_pwm:
+ * a bad/unplugged IMU should not crash-loop the whole robot and take the
+ * already-proven motor/encoder/odom path down with it. imu_dev stays NULL
+ * on any failure; imu_read_raw() checks that and no-ops. */
+static void setup_imu(void) {
+    i2c_master_bus_config_t bus_cfg = {
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .i2c_port = I2C_NUM_0,
+        .scl_io_num = IMU_SCL_PIN,
+        .sda_io_num = IMU_SDA_PIN,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true,
+    };
+    i2c_master_bus_handle_t bus_handle;
+    if (i2c_new_master_bus(&bus_cfg, &bus_handle) != ESP_OK) {
+        return;
+    }
+
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = MPU6050_I2C_ADDR,
+        .scl_speed_hz = 400000,
+    };
+    if (i2c_master_bus_add_device(bus_handle, &dev_cfg, &imu_dev) != ESP_OK) {
+        imu_dev = NULL;
+        return;
+    }
+
+    uint8_t wake_cmd[2] = { MPU6050_REG_PWR_MGMT_1, 0x00 };
+    if (i2c_master_transmit(imu_dev, wake_cmd, sizeof(wake_cmd),
+                             pdMS_TO_TICKS(100)) != ESP_OK) {
+        imu_dev = NULL;  /* wiring/address wrong - don't let later reads run */
+    }
+}
+
+/* Burst-reads accel+temp+gyro (14 bytes from ACCEL_XOUT_H) and splits it
+ * into the 6 raw int16 values callers actually want (temp bytes are read
+ * and discarded - the sensor only supports reading this block contiguously,
+ * there's no cheaper way to skip over temp mid-burst). Big-endian per
+ * MPU6050's register layout (MSB byte first for every axis). */
+static bool imu_read_raw(int16_t *ax, int16_t *ay, int16_t *az,
+                          int16_t *gx, int16_t *gy, int16_t *gz) {
+    if (imu_dev == NULL) {
+        return false;
+    }
+    uint8_t reg = MPU6050_REG_ACCEL_XOUT_H;
+    uint8_t data[IMU_READ_LEN];
+    if (i2c_master_transmit_receive(imu_dev, &reg, 1, data, sizeof(data),
+                                     pdMS_TO_TICKS(50)) != ESP_OK) {
+        return false;
+    }
+    *ax = (int16_t)((data[0]  << 8) | data[1]);
+    *ay = (int16_t)((data[2]  << 8) | data[3]);
+    *az = (int16_t)((data[4]  << 8) | data[5]);
+    /* data[6]/data[7] = temperature, unused here */
+    *gx = (int16_t)((data[8]  << 8) | data[9]);
+    *gy = (int16_t)((data[10] << 8) | data[11]);
+    *gz = (int16_t)((data[12] << 8) | data[13]);
+    return true;
+}
+
 /* UART0 is the same physical wire idf.py monitor uses for the console - see
  * the F5 note on ESP_LOGI above. Reused from the proven esp32/microros_hello
  * pin/transport setup (Week 1), not a new choice. */
@@ -780,6 +905,7 @@ void app_main(void) {
 
     setup_gpio();
     setup_pwm();
+    setup_imu();
 
     /* Direction pins are wired for forward, but F5 now drives actual speed
      * (including reverse/turn) through /cmd_vel via control_task - these
