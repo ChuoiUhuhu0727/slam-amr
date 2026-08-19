@@ -124,6 +124,17 @@
 #define MPU6050_REG_ACCEL_XOUT_H 0x3B  /* accel(6) + temp(2) + gyro(6) = 14B burst */
 #define IMU_READ_LEN 14
 
+/* Forward-declared: defined below setup_pwm() (near the other setup_*
+ * helpers), but called from uros_task() which appears EARLIER in this file.
+ * Without this, the compiler hits the call site first, assumes an
+ * implicit int-returning function, then errors on the real bool-returning
+ * definition later ("conflicting types") - the exact CONTROL_PERIOD_MS
+ * class of bug this file has been bitten by before (declaration-order
+ * bugs are silent at a glance, loud at build time - always read past the
+ * first error line before assuming a fix is complete). */
+static bool imu_read_raw(int16_t *ax, int16_t *ay, int16_t *az,
+                          int16_t *gx, int16_t *gy, int16_t *gz);
+
 /* Moved up from near control_task() (2026-07-27): pid_step() needs this for
  * its dt calculation, but #define order matters in C - the compiler had
  * never actually seen this macro yet at the point pid_step() used it,
