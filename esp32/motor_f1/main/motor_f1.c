@@ -630,14 +630,14 @@ static void uros_task(void *arg) {
         rcl_subscription_t cmd_vel_sub;
         rcl_publisher_t odom_pub;
         rcl_publisher_t diag_pub;
-        // rcl_publisher_t imu_pub;   // TEMP disabled - testing RMW_UXRCE_MAX_PUBLISHERS hypothesis
+        rcl_publisher_t imu_pub;
         rclc_executor_t executor;
         geometry_msgs__msg__Twist cmd_vel_msg;
         nav_msgs__msg__Odometry odom_msg = {0};
         std_msgs__msg__String diag_msg = {0};
-        // std_msgs__msg__String imu_msg = {0};   // TEMP disabled
+        std_msgs__msg__String imu_msg = {0};
         char diag_text[96];
-        // char imu_text[80];   // TEMP disabled
+        char imu_text[80];
 
         if (rclc_support_init(&support, 0, NULL, &allocator) != RCL_RET_OK) {
             vTaskDelay(pdMS_TO_TICKS(1000)); continue;
@@ -667,7 +667,6 @@ static void uros_task(void *arg) {
             rclc_support_fini(&support);
             vTaskDelay(pdMS_TO_TICKS(1000)); continue;
         }
-#if 0   /* TEMP disabled - testing RMW_UXRCE_MAX_PUBLISHERS hypothesis */
         if (rclc_publisher_init_default(&imu_pub, &node,
                 ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String), "imu_raw") != RCL_RET_OK) {
             if (rcl_publisher_fini(&diag_pub, &node) != RCL_RET_OK) {}
@@ -677,7 +676,6 @@ static void uros_task(void *arg) {
             rclc_support_fini(&support);
             vTaskDelay(pdMS_TO_TICKS(1000)); continue;
         }
-#endif
 
         rclc_executor_t *exec = &executor;
         rclc_executor_init(exec, &support.context, 1, &allocator);
@@ -690,8 +688,8 @@ static void uros_task(void *arg) {
          * only need to be set once here. */
         diag_msg.data.data = diag_text;
         diag_msg.data.capacity = sizeof(diag_text);
-        // imu_msg.data.data = imu_text;              // TEMP disabled
-        // imu_msg.data.capacity = sizeof(imu_text);   // TEMP disabled
+        imu_msg.data.data = imu_text;
+        imu_msg.data.capacity = sizeof(imu_text);
 
         /* Set once - frame_id strings don't change per-message, only the
          * numeric fields below do. */
@@ -746,7 +744,6 @@ static void uros_task(void *arg) {
                     agent_ok = false;
                 }
 
-#if 0   /* TEMP disabled - testing RMW_UXRCE_MAX_PUBLISHERS hypothesis */
                 /* IMU sanity-check read (2026-08-14) - done inline here
                  * rather than in its own task: I2C at 400kHz for 14 bytes
                  * is on the order of tens of microseconds, negligible next
@@ -767,7 +764,6 @@ static void uros_task(void *arg) {
                 if (rcl_publish(&imu_pub, &imu_msg, NULL) != RCL_RET_OK) {
                     agent_ok = false;
                 }
-#endif
             }
 
             /* BUG FOUND 2026-07-27 (F5 first connectivity test): timeout=0
@@ -784,7 +780,7 @@ static void uros_task(void *arg) {
             vTaskDelay(pdMS_TO_TICKS(20));
         }
 
-        // if (rcl_publisher_fini(&imu_pub, &node) != RCL_RET_OK) {}   // TEMP disabled
+        if (rcl_publisher_fini(&imu_pub, &node) != RCL_RET_OK) {}
         if (rcl_publisher_fini(&diag_pub, &node) != RCL_RET_OK) {}
         if (rcl_publisher_fini(&odom_pub, &node) != RCL_RET_OK) {}
         if (rcl_subscription_fini(&cmd_vel_sub, &node) != RCL_RET_OK) {}
