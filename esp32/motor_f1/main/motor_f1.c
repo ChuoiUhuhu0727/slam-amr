@@ -586,6 +586,24 @@ static void control_task(void *arg) {
  * needing the serial console at all. */
 static esp_reset_reason_t g_reset_reason;
 
+/* Populated once by i2c_scan_bus() (defined near setup_imu() below),
+ * surfaced in /esp32_diag - lets us see what (if anything) actually ACKs
+ * on the I2C bus without needing idf.py monitor (which can't run at the
+ * same time as the micro-ROS agent, since both want exclusive UART0).
+ * "unscanned" means setup_imu() never got far enough to run the scan
+ * (bus creation itself failed). Declared up here, not next to
+ * i2c_scan_bus() itself, because uros_task() (which reads it for the
+ * diag string) is defined earlier in this file than setup_imu() - same
+ * forward-reference trap as g_reset_reason above. */
+static char g_i2c_scan_result[40] = "unscanned";
+
+/* Which retry attempt (1-5) the IMU wake-up write succeeded on, 0 if never
+ * attempted (bus/device setup itself failed), -1 if all 5 attempts failed.
+ * Surfaced in /esp32_diag alongside g_i2c_scan_result - if this lands on
+ * attempt 2-5 rather than always 1 or always -1, that's a strong signal of
+ * a marginal/intermittent physical connection rather than a clean pass/fail. */
+static int g_imu_wake_attempts = 0;
+
 static const char *reset_reason_str(esp_reset_reason_t reason) {
     switch (reason) {
         case ESP_RST_POWERON:   return "POWERON";
@@ -734,10 +752,11 @@ static void uros_task(void *arg) {
                  * idf.py monitor is unusable once this transport owns
                  * UART0 (see note above cmd_vel_callback). */
                 snprintf(diag_text, sizeof(diag_text),
-                         "reset=%s RPM L=%.1f R=%.1f PWM L=%.0f R=%.0f",
+                         "reset=%s RPM L=%.1f R=%.1f PWM L=%.0f R=%.0f I2C=%s WAKE=%d",
                          reset_reason_str(g_reset_reason),
                          rpm_left_shared, rpm_right_shared,
-                         pwm_left_shared, pwm_right_shared);
+                         pwm_left_shared, pwm_right_shared,
+                         g_i2c_scan_result, g_imu_wake_attempts);
                 diag_msg.data.size = strlen(diag_text);
 
                 if (rcl_publish(&diag_pub, &diag_msg, NULL) != RCL_RET_OK) {
@@ -842,6 +861,31 @@ static void setup_pwm(void) {
  * ISR/task boundary and need portENTER_CRITICAL. */
 static i2c_master_dev_handle_t imu_dev = NULL;
 
+/* One-shot diagnostic: probe every valid 7-bit address (1-126) and record
+ * which ones ACK. TEMPORARY debugging aid for the 2026-08-20 imu_read_failed
+ * investigation (wiring/power/continuity all confirmed OK by hand, so the
+ * remaining question is literally "is anything answering, and at what
+ * address" - AD0 tied high would put the MPU6050 at 0x69, not the 0x68
+ * this firmware hardcodes). Fine to remove once the IMU is confirmed
+ * working - not something to keep running on every boot forever. */
+static void i2c_scan_bus(i2c_master_bus_handle_t bus_handle) {
+    char *p = g_i2c_scan_result;
+    char *end = g_i2c_scan_result + sizeof(g_i2c_scan_result);
+    int found = 0;
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        if (i2c_master_probe(bus_handle, addr, 30) == ESP_OK) {
+            int n = snprintf(p, end - p, found ? ",%02X" : "%02X", addr);
+            if (n > 0 && p + n < end) {
+                p += n;
+            }
+            found++;
+        }
+    }
+    if (!found) {
+        snprintf(g_i2c_scan_result, sizeof(g_i2c_scan_result), "none");
+    }
+}
+
 /* Bring up the I2C bus + MPU6050 device and wake it from sleep.
  * Deliberately NOT ESP_ERROR_CHECK'd end-to-end like setup_gpio/setup_pwm:
  * a bad/unplugged IMU should not crash-loop the whole robot and take the
@@ -869,19 +913,45 @@ static void setup_imu(void) {
         return;
     }
 
+    i2c_scan_bus(bus_handle);
+
+    /* 2026-08-20: was 400000 (Fast Mode). Real writes (the PWR_MGMT_1 wake
+     * command below) were failing while i2c_master_probe() - a much lighter
+     * transaction - still ACKed fine at the same address. Classic breadboard
+     * symptom: internal ESP32 pull-ups + jumper wire capacitance can't
+     * reliably hold Fast Mode timing even though the device is genuinely
+     * present and wired correctly. Standard Mode (100kHz) is far more
+     * tolerant of exactly this. */
     i2c_device_config_t dev_cfg = {
         .dev_addr_length = I2C_ADDR_BIT_LEN_7,
         .device_address = MPU6050_I2C_ADDR,
-        .scl_speed_hz = 400000,
+        .scl_speed_hz = 100000,
     };
     if (i2c_master_bus_add_device(bus_handle, &dev_cfg, &imu_dev) != ESP_OK) {
         imu_dev = NULL;
         return;
     }
 
+    /* Retried rather than one-shot: i2c_master_probe() above already
+     * confirmed the device ACKs its address, so if this still fails outright
+     * every time, address/wiring isn't the question anymore - only whether
+     * a real (multi-byte) transaction can get through at all. Retrying
+     * turns "always fails" vs. "succeeds on attempt N" into a diagnostic:
+     * the latter points at a marginal/intermittent connection rather than
+     * a clean broken/not-broken wiring fault. */
     uint8_t wake_cmd[2] = { MPU6050_REG_PWR_MGMT_1, 0x00 };
-    if (i2c_master_transmit(imu_dev, wake_cmd, sizeof(wake_cmd),
-                             pdMS_TO_TICKS(100)) != ESP_OK) {
+    bool wake_ok = false;
+    for (int attempt = 1; attempt <= 5; attempt++) {
+        if (i2c_master_transmit(imu_dev, wake_cmd, sizeof(wake_cmd),
+                                 pdMS_TO_TICKS(100)) == ESP_OK) {
+            g_imu_wake_attempts = attempt;
+            wake_ok = true;
+            break;
+        }
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+    if (!wake_ok) {
+        g_imu_wake_attempts = -1;
         imu_dev = NULL;  /* wiring/address wrong - don't let later reads run */
     }
 }
@@ -908,8 +978,13 @@ static bool imu_read_raw(int16_t *ax, int16_t *ay, int16_t *az,
     }
     uint8_t reg = MPU6050_REG_ACCEL_XOUT_H;
     uint8_t data[IMU_READ_LEN];
+    /* 2026-08-20: was 5ms. The wake-up write (a simpler transaction, no
+     * repeated-start) succeeds on attempt 1 every time, but this combined
+     * write+repeated-start+14-byte-read was failing 100% of the time at
+     * 5ms - testing whether that's simply too tight for the more complex
+     * transaction on this wiring, not a fully broken connection. */
     if (i2c_master_transmit_receive(imu_dev, &reg, 1, data, sizeof(data),
-                                     pdMS_TO_TICKS(5)) != ESP_OK) {
+                                     pdMS_TO_TICKS(100)) != ESP_OK) {
         if (++consecutive_failures >= IMU_MAX_CONSECUTIVE_FAILURES) {
             imu_dev = NULL;  /* bus likely wedged - stop paying the stall */
         }
