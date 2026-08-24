@@ -277,23 +277,34 @@ class SearchAndRescue(Node):
             f"-> estimated world ({world_x:.2f}, {world_y:.2f})"
         )
 
-    def _report(self):
+    def duck_estimate(self):
+        """Running average of every duck sighting so far -- a single-duck
+        assumption by design (no multi-target clustering). Used live by the
+        dashboard (updates continuously, not just at the end) and by the
+        final report (same number, just also bucketed into a grid cell)."""
         if not self.duck_sightings:
+            return None
+        avg_x = sum(p[0] for p in self.duck_sightings) / len(self.duck_sightings)
+        avg_y = sum(p[1] for p in self.duck_sightings) / len(self.duck_sightings)
+        return {'x': avg_x, 'y': avg_y, 'sightings': len(self.duck_sightings)}
+
+    def _report(self):
+        estimate = self.duck_estimate()
+        if estimate is None:
             self.get_logger().info("=== REPORT: loop complete, no duck sighted ===")
             self.report = {'sightings': 0}
             return
 
-        avg_x = sum(p[0] for p in self.duck_sightings) / len(self.duck_sightings)
-        avg_y = sum(p[1] for p in self.duck_sightings) / len(self.duck_sightings)
+        avg_x, avg_y = estimate['x'], estimate['y']
         cell_x = max(0, min(int(ROOM_SIZE_M / GRID_CELL_M) - 1, int(avg_x // GRID_CELL_M)))
         cell_y = max(0, min(int(ROOM_SIZE_M / GRID_CELL_M) - 1, int(avg_y // GRID_CELL_M)))
 
         self.get_logger().info(
-            f"=== REPORT: {len(self.duck_sightings)} sighting(s), "
+            f"=== REPORT: {estimate['sightings']} sighting(s), "
             f"averaged position ({avg_x:.2f}, {avg_y:.2f}) -> grid cell ({cell_x}, {cell_y}) ==="
         )
         self.report = {
-            'sightings': len(self.duck_sightings),
+            'sightings': estimate['sightings'],
             'avg_x': avg_x, 'avg_y': avg_y,
             'cell_x': cell_x, 'cell_y': cell_y,
         }
@@ -329,8 +340,10 @@ class SearchAndRescue(Node):
                 'done': node.done,
                 'started': node.started,
                 'duck_sightings': node.duck_sightings,
+                'duck_estimate': node.duck_estimate(),
                 'report': node.report,
                 'has_camera': not node.nav_only,
+                'target_waypoint': WAYPOINTS[node.waypoint_idx] if node.waypoint_idx < len(WAYPOINTS) else None,
             })
 
         @app.route('/video_feed')
@@ -445,6 +458,13 @@ HTML_PAGE = """<!doctype html>
   <div class="layout">
     <div class="panel">
       <canvas id="map" width="440" height="440"></canvas>
+      <div style="font-size:0.72rem; color:#8a94a6; margin-top:8px; line-height:1.5;">
+        solid box = room walls &middot; dashed box = patrol path &middot;
+        <span style="color:#ff5b5b;">&#9679;</span> = current best duck estimate &middot;
+        <span style="color:#ffd76b;">&#9679;</span> = individual sightings &middot;
+        <span style="color:#9fd3ff;">&#9654;</span> = robot &middot;
+        line = current target
+      </div>
     </div>
     <div class="panel">
       <img id="video" src="/video_feed">
@@ -500,18 +520,35 @@ function draw(state) {
     ctx.beginPath(); ctx.arc(sx, sy, 4, 0, 7); ctx.fill();
   });
 
-  // duck sightings
+  // raw duck sightings -- faint, small: a cloud of noisy individual readings,
+  // not meant to be read precisely on their own, just context for the estimate
   state.duck_sightings.forEach((p) => {
     const [sx, sy] = toScreen(p[0], p[1]);
-    ctx.fillStyle = '#ffd76b';
-    ctx.beginPath(); ctx.arc(sx, sy, 5, 0, 7); ctx.fill();
+    ctx.fillStyle = 'rgba(255, 215, 107, 0.35)';
+    ctx.beginPath(); ctx.arc(sx, sy, 3, 0, 7); ctx.fill();
   });
 
-  // final averaged duck estimate, once reported
-  if (state.report && state.report.sightings > 0) {
-    const [sx, sy] = toScreen(state.report.avg_x, state.report.avg_y);
+  // running average of all sightings so far -- THE answer, updates live the
+  // whole time (not just once the loop finishes)
+  if (state.duck_estimate) {
+    const [sx, sy] = toScreen(state.duck_estimate.x, state.duck_estimate.y);
+    ctx.fillStyle = '#ff5b5b';
+    ctx.beginPath(); ctx.arc(sx, sy, 6, 0, 7); ctx.fill();
     ctx.strokeStyle = '#ff5b5b'; ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.arc(sx, sy, 10, 0, 7); ctx.stroke();
+    ctx.beginPath(); ctx.arc(sx, sy, 11, 0, 7); ctx.stroke();
+  }
+
+  // line from robot to the waypoint it's currently driving toward
+  if (state.target_waypoint && !state.done) {
+    const [tx, ty] = toScreen(state.target_waypoint[0], state.target_waypoint[1]);
+    const [ox, oy] = toScreen(state.x, state.y);
+    ctx.strokeStyle = 'rgba(159, 211, 255, 0.5)';
+    ctx.lineWidth = 1.5;
+    ctx.setLineDash([3, 4]);
+    ctx.beginPath(); ctx.moveTo(ox, oy); ctx.lineTo(tx, ty); ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.fillStyle = '#9fd3ff';
+    ctx.beginPath(); ctx.arc(tx, ty, 6, 0, 7); ctx.fill();
   }
 
   // robot (triangle pointing in facing direction)
