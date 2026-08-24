@@ -63,10 +63,8 @@ DUCK_HEIGHT_M = 0.10  # PLACEHOLDER -- replace with a real measurement
 # straight-ahead-mounted camera would mostly look down the wall and rarely
 # catch the duck. Angling the camera inward fixes this without needing a
 # second camera. Positive = rotated toward the robot's left (REP103 CCW+).
-# PLACEHOLDER -- set this to match however you actually mount it (e.g. -0.785
-# for 45deg toward the room interior if the room center is to the right of
-# the direction of travel; sign depends on which way you mount it).
-CAMERA_BEARING_OFFSET_RAD = 0.0
+# Confirmed: camera mounted 45deg toward the robot's RIGHT -> negative.
+CAMERA_BEARING_OFFSET_RAD = -math.radians(45)
 
 GOAL_TOLERANCE_M = 0.10       # "close enough" to a waypoint
 TURN_IN_PLACE_THRESHOLD = 0.35  # rad (~20deg) -- above this, stop and turn first
