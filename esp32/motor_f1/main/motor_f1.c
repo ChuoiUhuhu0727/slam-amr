@@ -277,6 +277,16 @@ static volatile float pwm_right_shared = 0.0f;
 static volatile float imu_gz_rad_per_s_shared = 0.0f;
 static volatile bool imu_gz_valid_shared = false;
 
+/* MPU6050 power-on-reset default full-scale range: gyro +/-250deg/s at
+ * 131 LSB/(deg/s) (same constant jetson/tools/process_imu_raw.py uses
+ * off-device). /imu_raw itself stays raw ints by design - this conversion
+ * is only for control_task's internal heading math, which needs radians
+ * to add directly to pose_theta_shared. Defined here (before uros_task,
+ * which is the first user of it) - not down near imu_read_raw() where it
+ * conceptually "belongs", to avoid the exact declaration-order bug this
+ * file has been bitten by before (CONTROL_PERIOD_MS, 2026-07-27). */
+#define GYRO_RAW_TO_RAD_PER_S (PI_F / (180.0f * 131.0f))
+
 /* Spinlock used to make "read + reset" atomic (avoids the lost-pulse race
  * where a pulse arrives between reading the counter and zeroing it). */
 static portMUX_TYPE encoder_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -998,13 +1008,6 @@ static void setup_imu(void) {
  * there's no cheaper way to skip over temp mid-burst). Big-endian per
  * MPU6050's register layout (MSB byte first for every axis). */
 #define IMU_MAX_CONSECUTIVE_FAILURES 5
-
-/* MPU6050 power-on-reset default full-scale range: gyro +/-250deg/s at
- * 131 LSB/(deg/s) (same constant jetson/tools/process_imu_raw.py uses
- * off-device). /imu_raw itself stays raw ints by design (see imu_text
- * below) - this conversion is only for control_task's internal heading
- * math, which needs radians to add directly to pose_theta_shared. */
-#define GYRO_RAW_TO_RAD_PER_S (PI_F / (180.0f * 131.0f))
 
 /* Guards uros_task's control loop from a flaky/loose IMU wire: bounds each
  * stall tightly (a healthy MPU6050 answers in well under 1ms at 400kHz -
