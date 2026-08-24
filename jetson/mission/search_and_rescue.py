@@ -3,6 +3,13 @@ waypoints, go-to-goal control using /odom -- gyro-fused heading, wheel-encoder
 position), running duck detection the whole time. Reports which grid cell the
 duck was in once the loop completes.
 
+Also runs a live web dashboard (Flask, background thread) showing the room
+map, robot position/heading, duck sightings, and the camera feed with the
+current detection box drawn on it -- for watching/debugging a live run instead
+of only reading terminal logs. Reachable from any device on the same network
+at http://<jetson-hostname>.local:8080 (this Jetson's mDNS hostname is
+chuoi.local, already set up from earlier SSH work).
+
 Deliberately does NOT use Nav2, VSLAM, or the stereo depth pipeline:
 - Nav2/VSLAM: skipped because cuVSLAM still has an unresolved ~3-5x pose scale
   bug (see project memory), and Nav2's costmap/planner stack has never been
@@ -21,11 +28,15 @@ Run modes:
                                             # odometry drift before trusting
                                             # detection coordinates on top of it)
 
+Needs `pip3 install flask` in addition to the packages first_test.py already needs
+(ultralytics, numpy, opencv).
+
 Prerequisite: micro-ROS agent already connected (ESP32 publishing /odom,
 subscribed to /cmd_vel) -- this node doesn't manage that.
 """
 import argparse
 import math
+import threading
 import time
 from pathlib import Path
 
@@ -50,7 +61,8 @@ WAYPOINTS = [
     (0.3, 0.3),  # back to start -- also how we measure real loop drift
 ]
 
-# Full room extent (NOT the inset patrol path) -- used only for grid reporting.
+# Full room extent (NOT the inset patrol path) -- used only for grid reporting
+# and drawing the dashboard map. Easy to change later, just constants.
 ROOM_SIZE_M = 2.0
 GRID_CELL_M = 0.5  # -> 4x4 grid
 
@@ -73,7 +85,9 @@ KP_HEADING = 1.5
 
 CONTROL_PERIOD_S = 0.1   # 10 Hz control loop
 DETECT_EVERY_N_TICKS = 3  # run YOLO ~every 3rd control tick (~3.3 Hz) -- inference
-                           # is the slow part, don't let it stall steering updates
+                           # is the slow part, don't let it stall steering updates.
+                           # The camera frame itself is still grabbed every tick
+                           # (cheap) so the dashboard video feed stays smooth.
 
 WEIGHTS_PATH = Path(__file__).resolve().parents[1] / "training/runs/detect/train-4/weights/best.pt"
 CALIB_PATH = Path(__file__).resolve().parents[2] / "stereo_calibration.npz"
@@ -87,6 +101,9 @@ CSI_PIPELINE = (
     "videoconvert ! "
     "video/x-raw, format=BGR ! appsink drop=1"
 )
+
+WEB_HOST = "0.0.0.0"  # bind all interfaces so other devices on the wifi can reach it
+WEB_PORT = 8080
 
 
 def yaw_from_quaternion(q):
@@ -116,6 +133,10 @@ class SearchAndRescue(Node):
         self.tick_count = 0
 
         self.duck_sightings = []  # list of (world_x, world_y)
+        self.report = None        # filled in once the loop finishes
+
+        self.latest_frame = None       # for the dashboard video feed
+        self.latest_detection = None   # {'x1','y1','x2','y2','conf','t'} for the overlay box
 
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.create_subscription(Odometry, '/odom', self.on_odom, 10)
@@ -126,11 +147,12 @@ class SearchAndRescue(Node):
         else:
             self.get_logger().info("--nav-only: skipping camera/model, navigation loop only")
 
+        self._start_web_server()
+
     def _init_vision(self):
         import cv2
         from ultralytics import YOLO
 
-        self.cv2 = cv2
         calib = np.load(str(CALIB_PATH))
         K1 = calib["K1"]
         self.fx = float(K1[0, 0])
@@ -158,12 +180,14 @@ class SearchAndRescue(Node):
 
         self.tick_count += 1
 
+        if not self.nav_only:
+            self._grab_frame()
+            if self.tick_count % DETECT_EVERY_N_TICKS == 0:
+                self._detect_tick()
+
         if self.done:
             self.cmd_pub.publish(Twist())  # stay stopped
             return
-
-        if not self.nav_only and self.tick_count % DETECT_EVERY_N_TICKS == 0:
-            self._detect_tick()
 
         self._navigate_tick()
 
@@ -198,22 +222,30 @@ class SearchAndRescue(Node):
             cmd.angular.z = max(-MAX_ANGULAR_SPEED, min(MAX_ANGULAR_SPEED, KP_HEADING * heading_error))
         self.cmd_pub.publish(cmd)
 
-    def _detect_tick(self):
+    def _grab_frame(self):
         ok, frame = self.cap.read()
-        if not ok:
-            self.get_logger().warn("Frame grab failed")
+        if ok:
+            self.latest_frame = frame
+
+    def _detect_tick(self):
+        frame = self.latest_frame
+        if frame is None:
             return
 
         results = self.model(frame, conf=CONF_THRESHOLD, verbose=False)
         boxes = results[0].boxes
         if boxes is None or len(boxes) == 0:
+            self.latest_detection = None
             return
 
         # take the largest/most confident box if more than one hit
         box = boxes[boxes.conf.argmax()]
         x1, y1, x2, y2 = box.xyxy[0].tolist()
+        conf = float(box.conf[0])
         bbox_height_px = y2 - y1
         bbox_center_x = (x1 + x2) / 2.0
+
+        self.latest_detection = {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2, 'conf': conf, 't': time.time()}
 
         if bbox_height_px <= 1:
             return
@@ -222,8 +254,9 @@ class SearchAndRescue(Node):
 
         # Pixel offset from image center -> bearing angle. Camera mount has
         # ~0 x/y offset from base_link (see stereo_depth_argus.launch.py),
-        # just faces the same forward direction, so camera position/heading
-        # ~= robot's own -- no extra transform needed beyond this angle.
+        # just faces a fixed direction relative to the chassis, so camera
+        # position ~= robot's own -- no extra translation needed, only the
+        # CAMERA_BEARING_OFFSET_RAD rotation below.
         # SIGN NOT YET EMPIRICALLY VERIFIED: image-right (+dx) should mean
         # "duck is to the robot's right" = negative yaw offset (REP103: CCW
         # positive). Test with the duck placed to one known side first: if
@@ -243,6 +276,7 @@ class SearchAndRescue(Node):
     def _report(self):
         if not self.duck_sightings:
             self.get_logger().info("=== REPORT: loop complete, no duck sighted ===")
+            self.report = {'sightings': 0}
             return
 
         avg_x = sum(p[0] for p in self.duck_sightings) / len(self.duck_sightings)
@@ -254,6 +288,223 @@ class SearchAndRescue(Node):
             f"=== REPORT: {len(self.duck_sightings)} sighting(s), "
             f"averaged position ({avg_x:.2f}, {avg_y:.2f}) -> grid cell ({cell_x}, {cell_y}) ==="
         )
+        self.report = {
+            'sightings': len(self.duck_sightings),
+            'avg_x': avg_x, 'avg_y': avg_y,
+            'cell_x': cell_x, 'cell_y': cell_y,
+        }
+
+    # -- web dashboard --------------------------------------------------------
+
+    def _start_web_server(self):
+        from flask import Flask, Response, jsonify
+
+        app = Flask(__name__)
+        node = self
+
+        @app.route('/')
+        def index():
+            return HTML_PAGE
+
+        @app.route('/state')
+        def state():
+            return jsonify({
+                'x': node.x, 'y': node.y, 'theta_deg': math.degrees(node.theta),
+                'waypoint_idx': node.waypoint_idx,
+                'waypoints': WAYPOINTS,
+                'room_size': ROOM_SIZE_M,
+                'grid_cell': GRID_CELL_M,
+                'done': node.done,
+                'duck_sightings': node.duck_sightings,
+                'report': node.report,
+                'has_camera': not node.nav_only,
+            })
+
+        @app.route('/video_feed')
+        def video_feed():
+            if node.nav_only:
+                return Response("Camera not active in --nav-only mode", mimetype='text/plain')
+            return Response(_mjpeg_generator(node), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+        thread = threading.Thread(
+            target=lambda: app.run(host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False, threaded=True),
+            daemon=True,
+        )
+        thread.start()
+        self.get_logger().info(f"Web dashboard on http://<jetson-hostname>.local:{WEB_PORT}  (e.g. http://chuoi.local:{WEB_PORT})")
+
+
+def _mjpeg_generator(node):
+    import cv2
+    while True:
+        frame = node.latest_frame
+        if frame is not None:
+            display = frame.copy()
+            det = node.latest_detection
+            if det and (time.time() - det['t']) < 1.0:
+                p1 = (int(det['x1']), int(det['y1']))
+                p2 = (int(det['x2']), int(det['y2']))
+                cv2.rectangle(display, p1, p2, (0, 255, 0), 2)
+                cv2.putText(display, f"duck {det['conf']:.2f}", (p1[0], max(0, p1[1] - 8)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+            ok, buf = cv2.imencode('.jpg', display)
+            if ok:
+                yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
+        time.sleep(0.1)
+
+
+HTML_PAGE = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Search and Rescue -- live</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    background: #12151a; color: #e6e6e6;
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    margin: 0; padding: 20px;
+  }
+  h1 { font-size: 1.2rem; font-weight: 600; margin: 0 0 16px; color: #9fd3ff; }
+  .layout { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start; }
+  .panel {
+    background: #1b1f27; border: 1px solid #2a2f3a; border-radius: 10px;
+    padding: 14px;
+  }
+  canvas { background: #0e1116; border-radius: 6px; display: block; }
+  img#video { width: 480px; max-width: 100%; border-radius: 6px; background: #000; }
+  .status-line { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.85rem; line-height: 1.6; }
+  .status-line b { color: #9fd3ff; }
+  .badge {
+    display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.75rem;
+    background: #2a2f3a; margin-left: 6px;
+  }
+  .badge.done { background: #1c4d2b; color: #9fe6ae; }
+  .report {
+    margin-top: 10px; padding: 10px; border-radius: 8px; background: #2a2410;
+    border: 1px solid #4a3f18; color: #ffe08a; font-family: ui-monospace, monospace; font-size: 0.85rem;
+  }
+</style>
+</head>
+<body>
+  <h1>Search &amp; Rescue -- live dashboard</h1>
+  <div class="layout">
+    <div class="panel">
+      <canvas id="map" width="440" height="440"></canvas>
+    </div>
+    <div class="panel">
+      <img id="video" src="/video_feed">
+    </div>
+    <div class="panel" style="min-width: 240px;">
+      <div class="status-line" id="status">connecting...</div>
+      <div id="reportBox"></div>
+    </div>
+  </div>
+
+<script>
+const canvas = document.getElementById('map');
+const ctx = canvas.getContext('2d');
+
+function draw(state) {
+  const room = state.room_size;
+  const scale = canvas.width / room;
+  const toScreen = (x, y) => [x * scale, canvas.height - y * scale];
+
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+  // grid
+  ctx.strokeStyle = '#232833';
+  ctx.lineWidth = 1;
+  for (let g = 0; g <= room + 1e-6; g += state.grid_cell) {
+    let [gx, ] = toScreen(g, 0);
+    ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, canvas.height); ctx.stroke();
+    let [, gy] = toScreen(0, g);
+    ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(canvas.width, gy); ctx.stroke();
+  }
+
+  // room boundary
+  ctx.strokeStyle = '#4a5568';
+  ctx.lineWidth = 2;
+  ctx.strokeRect(0, 0, canvas.width, canvas.height);
+
+  // waypoint path
+  ctx.strokeStyle = '#3a5a7a';
+  ctx.setLineDash([6, 5]);
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  state.waypoints.forEach((wp, i) => {
+    const [sx, sy] = toScreen(wp[0], wp[1]);
+    if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+  });
+  ctx.stroke();
+  ctx.setLineDash([]);
+
+  // waypoint markers
+  state.waypoints.forEach((wp) => {
+    const [sx, sy] = toScreen(wp[0], wp[1]);
+    ctx.fillStyle = '#3a5a7a';
+    ctx.beginPath(); ctx.arc(sx, sy, 4, 0, 7); ctx.fill();
+  });
+
+  // duck sightings
+  state.duck_sightings.forEach((p) => {
+    const [sx, sy] = toScreen(p[0], p[1]);
+    ctx.fillStyle = '#ffd76b';
+    ctx.beginPath(); ctx.arc(sx, sy, 5, 0, 7); ctx.fill();
+  });
+
+  // final averaged duck estimate, once reported
+  if (state.report && state.report.sightings > 0) {
+    const [sx, sy] = toScreen(state.report.avg_x, state.report.avg_y);
+    ctx.strokeStyle = '#ff5b5b'; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.arc(sx, sy, 10, 0, 7); ctx.stroke();
+  }
+
+  // robot (triangle pointing in facing direction)
+  const [rx, ry] = toScreen(state.x, state.y);
+  const theta = state.theta_deg * Math.PI / 180;
+  ctx.save();
+  ctx.translate(rx, ry);
+  ctx.rotate(-theta);  // canvas y is flipped vs. room y, so flip rotation too
+  ctx.fillStyle = state.done ? '#9fe6ae' : '#9fd3ff';
+  ctx.beginPath();
+  ctx.moveTo(10, 0); ctx.lineTo(-6, 6); ctx.lineTo(-6, -6); ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function poll() {
+  fetch('/state').then(r => r.json()).then(state => {
+    draw(state);
+    const doneBadge = state.done ? '<span class="badge done">LOOP DONE</span>' : '<span class="badge">patrolling</span>';
+    document.getElementById('status').innerHTML =
+      `pos: <b>(${state.x.toFixed(2)}, ${state.y.toFixed(2)})</b> ` +
+      `heading: <b>${state.theta_deg.toFixed(1)}&deg;</b><br>` +
+      `waypoint: <b>${state.waypoint_idx}/${state.waypoints.length}</b> ${doneBadge}<br>` +
+      `duck sightings: <b>${state.duck_sightings.length}</b><br>` +
+      `camera: <b>${state.has_camera ? 'on' : 'off (--nav-only)'}</b>`;
+
+    const reportBox = document.getElementById('reportBox');
+    if (state.report) {
+      if (state.report.sightings > 0) {
+        reportBox.innerHTML = `<div class="report">REPORT<br>duck at (${state.report.avg_x.toFixed(2)}, ${state.report.avg_y.toFixed(2)})<br>grid cell (${state.report.cell_x}, ${state.report.cell_y})<br>from ${state.report.sightings} sighting(s)</div>`;
+      } else {
+        reportBox.innerHTML = `<div class="report">REPORT<br>loop complete, no duck sighted</div>`;
+      }
+    } else {
+      reportBox.innerHTML = '';
+    }
+  }).catch(() => {
+    document.getElementById('status').innerText = 'connection lost, retrying...';
+  });
+}
+
+setInterval(poll, 400);
+poll();
+</script>
+</body>
+</html>
+"""
 
 
 def main():
