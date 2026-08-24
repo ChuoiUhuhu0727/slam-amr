@@ -130,6 +130,8 @@ class SearchAndRescue(Node):
 
         self.waypoint_idx = 0
         self.done = False
+        self.started = False  # gated by the dashboard's Start button -- camera/
+                               # detection run regardless, only driving waits
         self.tick_count = 0
 
         self.duck_sightings = []  # list of (world_x, world_y)
@@ -185,8 +187,8 @@ class SearchAndRescue(Node):
             if self.tick_count % DETECT_EVERY_N_TICKS == 0:
                 self._detect_tick()
 
-        if self.done:
-            self.cmd_pub.publish(Twist())  # stay stopped
+        if self.done or not self.started:
+            self.cmd_pub.publish(Twist())  # stay stopped -- either finished, or waiting for Start
             return
 
         self._navigate_tick()
@@ -315,6 +317,7 @@ class SearchAndRescue(Node):
                 'room_size': ROOM_SIZE_M,
                 'grid_cell': GRID_CELL_M,
                 'done': node.done,
+                'started': node.started,
                 'duck_sightings': node.duck_sightings,
                 'report': node.report,
                 'has_camera': not node.nav_only,
@@ -325,6 +328,19 @@ class SearchAndRescue(Node):
             if node.nav_only:
                 return Response("Camera not active in --nav-only mode", mimetype='text/plain')
             return Response(_mjpeg_generator(node), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+        @app.route('/start', methods=['POST'])
+        def start():
+            node.started = True
+            node.get_logger().info("Patrol STARTED (via dashboard)")
+            return jsonify({'started': True})
+
+        @app.route('/stop', methods=['POST'])
+        def stop():
+            node.started = False
+            node.cmd_pub.publish(Twist())
+            node.get_logger().info("Patrol STOPPED (via dashboard)")
+            return jsonify({'started': False})
 
         thread = threading.Thread(
             target=lambda: app.run(host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False, threaded=True),
@@ -380,14 +396,28 @@ HTML_PAGE = """<!doctype html>
     background: #2a2f3a; margin-left: 6px;
   }
   .badge.done { background: #1c4d2b; color: #9fe6ae; }
+  .badge.waiting { background: #4a3f18; color: #ffe08a; }
   .report {
     margin-top: 10px; padding: 10px; border-radius: 8px; background: #2a2410;
     border: 1px solid #4a3f18; color: #ffe08a; font-family: ui-monospace, monospace; font-size: 0.85rem;
   }
+  .controls { margin-bottom: 14px; }
+  button {
+    font-size: 0.95rem; font-weight: 600; padding: 10px 20px; border-radius: 8px;
+    border: none; cursor: pointer; margin-right: 10px;
+  }
+  #startBtn { background: #1c4d2b; color: #9fe6ae; }
+  #startBtn:disabled { background: #23282f; color: #555; cursor: not-allowed; }
+  #stopBtn { background: #5a1c1c; color: #ffb3b3; }
+  #stopBtn:disabled { background: #23282f; color: #555; cursor: not-allowed; }
 </style>
 </head>
 <body>
   <h1>Search &amp; Rescue -- live dashboard</h1>
+  <div class="controls">
+    <button id="startBtn" onclick="sendCmd('/start')">Start Patrol</button>
+    <button id="stopBtn" onclick="sendCmd('/stop')">Stop</button>
+  </div>
   <div class="layout">
     <div class="panel">
       <canvas id="map" width="440" height="440"></canvas>
@@ -473,16 +503,28 @@ function draw(state) {
   ctx.restore();
 }
 
+function sendCmd(path) {
+  fetch(path, { method: 'POST' }).catch(() => {});
+}
+
 function poll() {
   fetch('/state').then(r => r.json()).then(state => {
     draw(state);
-    const doneBadge = state.done ? '<span class="badge done">LOOP DONE</span>' : '<span class="badge">patrolling</span>';
+
+    let statusBadge;
+    if (state.done) statusBadge = '<span class="badge done">LOOP DONE</span>';
+    else if (state.started) statusBadge = '<span class="badge">patrolling</span>';
+    else statusBadge = '<span class="badge waiting">waiting for Start</span>';
+
     document.getElementById('status').innerHTML =
       `pos: <b>(${state.x.toFixed(2)}, ${state.y.toFixed(2)})</b> ` +
       `heading: <b>${state.theta_deg.toFixed(1)}&deg;</b><br>` +
-      `waypoint: <b>${state.waypoint_idx}/${state.waypoints.length}</b> ${doneBadge}<br>` +
+      `waypoint: <b>${state.waypoint_idx}/${state.waypoints.length}</b> ${statusBadge}<br>` +
       `duck sightings: <b>${state.duck_sightings.length}</b><br>` +
       `camera: <b>${state.has_camera ? 'on' : 'off (--nav-only)'}</b>`;
+
+    document.getElementById('startBtn').disabled = state.started || state.done;
+    document.getElementById('stopBtn').disabled = !state.started;
 
     const reportBox = document.getElementById('reportBox');
     if (state.report) {
