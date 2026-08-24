@@ -54,8 +54,7 @@ WAYPOINTS = [
 ROOM_SIZE_M = 2.0
 GRID_CELL_M = 0.5  # -> 4x4 grid
 
-# TODO(vịt): measure the duck toy's real height with a ruler, meters.
-DUCK_HEIGHT_M = 0.10  # PLACEHOLDER -- replace with a real measurement
+DUCK_HEIGHT_M = 0.13  # measured 2026-08-24
 
 # How far the camera is physically rotated relative to the chassis' forward
 # direction (base_link +x), radians. While hugging the perimeter the robot's
