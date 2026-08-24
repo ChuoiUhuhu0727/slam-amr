@@ -267,6 +267,16 @@ static volatile float angular_vel_shared = 0.0f;
 static volatile float pwm_left_shared = 0.0f;
 static volatile float pwm_right_shared = 0.0f;
 
+/* Gyro-Z heading fusion (2026-08-22), written by uros_task's existing IMU
+ * read, read by control_task - same cross-task pattern as rpm_*_shared
+ * above. imu_gz_valid_shared is false whenever the most recent read failed
+ * (IMU never woke, or the ~20s-uptime read-degradation bug latched imu_dev
+ * dead for this boot - see README "Lessons Learned") so control_task can
+ * always fail safe back to the original encoder-differential dtheta
+ * instead of blending in a stale/garbage gyro value. */
+static volatile float imu_gz_rad_per_s_shared = 0.0f;
+static volatile bool imu_gz_valid_shared = false;
+
 /* Spinlock used to make "read + reset" atomic (avoids the lost-pulse race
  * where a pulse arrives between reading the counter and zeroing it). */
 static portMUX_TYPE encoder_mux = portMUX_INITIALIZER_UNLOCKED;
@@ -342,26 +352,30 @@ static void encoder_gpio_init(void) {
     gpio_isr_handler_add(ENC_R_PIN, encoder_isr_handler, (void *)&enc_right_arg);
 }
 
-/* VM now has its own wire from the powerbank (fixed 2026-07-24, see README
- * "Power Architecture") — the brownout reset loop this cap was guarding
- * against is confirmed gone. Left at 100 for now since Kp hasn't been
- * retuned with valid encoder data yet; raise deliberately, not by default,
- * once real RPM tracking data says the controller needs more headroom. */
-#define MAX_SAFE_PWM 100.0f
+/* Raised to the true hardware ceiling 2026-08-24: confirmed live that PID
+ * was maxing out at the old 100/200 cap (out of the LEDC's real 0-255
+ * range) with RPM still reading 0 - wheels needed more than that to
+ * overcome stall/friction, so the cap itself was the blocker, not a real
+ * mechanical problem. VM has had its own dedicated powerbank wire since
+ * 2026-07-24 (see README "Power Architecture"), so the original brownout
+ * concern this cap was guarding against doesn't apply. No ceiling below
+ * hardware max anymore - this bound only exists so a PID overshoot can't
+ * cast a value above 255 into the uint32_t duty (undefined/wraps), not to
+ * limit real power. */
+#define MAX_SAFE_PWM 255.0f
 
-/* Floor, not just a "can't go negative" clamp: the powerbank feeding VM
- * auto-shuts-off when it sees low/no current draw (no-load detection meant
- * for phone charging, wrong assumption for a motor). Lowered 40 -> 20
- * (2026-07-27, power confirmed stable since the hardware fix) because 40
- * was clamping the right wheel's PWM even though its actual RPM sat well
- * above TARGET_RPM=30 - PID couldn't slow it down further to reach target.
- * Lowered again 20 -> 10 (same day, real ground test): right wheel still
- * pinned at PWM=20 with RPM 150-195 (vs. left's ~45) while actually driving
- * - the sync-trim fix couldn't help because PID still couldn't push PWM any
- * lower. This is a diagnostic test as much as a fix: if RPM stays this high
- * even at PWM=10, the cause isn't the floor anymore, it's a real mechanical/
- * motor asymmetry - raise the floor back if the powerbank cuts out. */
-#define MIN_SAFE_PWM 10.0f
+/* No floor as of 2026-08-24 - confirmed the powerbank no longer needs the
+ * artificial minimum current draw the old 10.0f floor existed for. True 0
+ * is now reachable, so the robot can actually sit fully silent/still
+ * instead of a constant faint motor whine at idle. That whine's real cause
+ * (never fully root-caused, see README "Lessons Learned"): target_rpm
+ * reaching pid_step() as a tiny non-zero float instead of bit-exact 0.0f
+ * (e.g. from sync_trim) skips the target_rpm==0.0f bypass above and used
+ * to fall through to this floor. Setting the floor itself to 0 removes
+ * that symptom too, not just this constant's original intended case - the
+ * lower bound stays here (not removed outright) purely so a negative `u`
+ * can't underflow the uint32_t cast below, same reasoning as the ceiling. */
+#define MIN_SAFE_PWM 0.0f
 
 /* error(t) = target - actual; u(t) = Kp*error(t) + Ki*integral(t);
  * PWM = clamp(u(t), MIN_SAFE_PWM, MAX_SAFE_PWM). `integral` is per-wheel
@@ -487,9 +501,24 @@ static void control_task(void *arg) {
         float dist_left  = snapshot_left  * DISTANCE_PER_PULSE_M;
         float dist_right = snapshot_right * DISTANCE_PER_PULSE_M;
         float dist_center = (dist_left + dist_right) / 2.0f;
-        float dtheta = (dist_right - dist_left) / WHEELBASE_M;
-        float theta_mid = pose_theta_shared + dtheta / 2.0f;
         float dt = CONTROL_PERIOD_MS / 1000.0f;
+
+        /* Heading (2026-08-22): the encoder-differential dtheta below is
+         * exactly what causes the documented ~-5 to -16deg wobble on a
+         * nominally-straight command - wheel slip/quantization shows up
+         * directly as false rotation. Prefer the gyro whenever the most
+         * recent IMU read succeeded (no wheel-contact dependency at all);
+         * snapshot both shared vars once, matching the pulse-count
+         * snapshot pattern above, since uros_task writes them
+         * concurrently. Falls back to pure encoder dtheta - the original,
+         * already-proven formula - whenever the IMU hasn't initialized or
+         * has latched dead (see imu_gz_valid_shared comment above): never
+         * blend in a stale/failed gyro reading. */
+        bool imu_gz_ok = imu_gz_valid_shared;
+        float imu_gz_rad_per_s = imu_gz_rad_per_s_shared;
+        float dtheta_encoder = (dist_right - dist_left) / WHEELBASE_M;
+        float dtheta = imu_gz_ok ? (imu_gz_rad_per_s * dt) : dtheta_encoder;
+        float theta_mid = pose_theta_shared + dtheta / 2.0f;
 
         pose_x_shared += dist_center * cosf(theta_mid);
         pose_y_shared += dist_center * sinf(theta_mid);
@@ -776,8 +805,15 @@ static void uros_task(void *arg) {
                     snprintf(imu_text, sizeof(imu_text),
                              "ax=%d ay=%d az=%d gx=%d gy=%d gz=%d",
                              imu_ax, imu_ay, imu_az, imu_gx, imu_gy, imu_gz);
+                    /* gz <-> robot Z (yaw), empirically confirmed 2026-08-22:
+                     * positive gz = turning left (CCW from above), matching
+                     * control_task's existing encoder-differential dtheta
+                     * sign exactly - no sign flip needed. */
+                    imu_gz_rad_per_s_shared = (float)imu_gz * GYRO_RAW_TO_RAD_PER_S;
+                    imu_gz_valid_shared = true;
                 } else {
                     snprintf(imu_text, sizeof(imu_text), "imu_read_failed");
+                    imu_gz_valid_shared = false;
                 }
                 imu_msg.data.size = strlen(imu_text);
                 if (rcl_publish(&imu_pub, &imu_msg, NULL) != RCL_RET_OK) {
@@ -962,6 +998,13 @@ static void setup_imu(void) {
  * there's no cheaper way to skip over temp mid-burst). Big-endian per
  * MPU6050's register layout (MSB byte first for every axis). */
 #define IMU_MAX_CONSECUTIVE_FAILURES 5
+
+/* MPU6050 power-on-reset default full-scale range: gyro +/-250deg/s at
+ * 131 LSB/(deg/s) (same constant jetson/tools/process_imu_raw.py uses
+ * off-device). /imu_raw itself stays raw ints by design (see imu_text
+ * below) - this conversion is only for control_task's internal heading
+ * math, which needs radians to add directly to pose_theta_shared. */
+#define GYRO_RAW_TO_RAD_PER_S (PI_F / (180.0f * 131.0f))
 
 /* Guards uros_task's control loop from a flaky/loose IMU wire: bounds each
  * stall tightly (a healthy MPU6050 answers in well under 1ms at 400kHz -
