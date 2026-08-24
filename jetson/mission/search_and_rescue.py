@@ -365,6 +365,25 @@ class SearchAndRescue(Node):
             node.get_logger().info("Patrol STOPPED (via dashboard)")
             return jsonify({'started': False})
 
+        @app.route('/reset', methods=['POST'])
+        def reset():
+            # Resets the MISSION state only (waypoint progress, duck sightings,
+            # start/done flags) -- NOT the robot's actual (x,y,theta), which
+            # comes from the ESP32's own odometry and only zeroes when the
+            # ESP32 itself reboots. If you physically move the robot back to
+            # the start corner between test runs, the position number won't
+            # go back to 0 just from clicking this -- that needs an ESP32
+            # reset (unplug/replug, or the board's reset button).
+            node.started = False
+            node.done = False
+            node.waypoint_idx = 0
+            node.duck_sightings = []
+            node.latest_detection = None
+            node.report = None
+            node.cmd_pub.publish(Twist())
+            node.get_logger().info("Dashboard: RESET (mission state cleared)")
+            return jsonify({'reset': True})
+
         thread = threading.Thread(
             target=lambda: app.run(host=WEB_HOST, port=WEB_PORT, debug=False, use_reloader=False, threaded=True),
             daemon=True,
@@ -447,6 +466,7 @@ HTML_PAGE = """<!doctype html>
   #startBtn:disabled { background: #23282f; color: #555; cursor: not-allowed; }
   #stopBtn { background: #5a1c1c; color: #ffb3b3; }
   #stopBtn:disabled { background: #23282f; color: #555; cursor: not-allowed; }
+  #resetBtn { background: #2a2f3a; color: #c8ccd4; }
 </style>
 </head>
 <body>
@@ -454,6 +474,7 @@ HTML_PAGE = """<!doctype html>
   <div class="controls">
     <button id="startBtn" onclick="sendCmd('/start')">Start Patrol</button>
     <button id="stopBtn" onclick="sendCmd('/stop')">Stop</button>
+    <button id="resetBtn" onclick="sendCmd('/reset')">Reset All</button>
   </div>
   <div class="layout">
     <div class="panel">
