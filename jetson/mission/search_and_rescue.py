@@ -228,6 +228,8 @@ class SearchAndRescue(Node):
         ok, frame = self.cap.read()
         if ok:
             self.latest_frame = frame
+        elif self.tick_count % 50 == 0:  # throttled -- don't spam if it keeps failing
+            self.get_logger().warn("Camera frame grab failing (cap.read() returned False)")
 
     def _detect_tick(self):
         frame = self.latest_frame
@@ -299,7 +301,14 @@ class SearchAndRescue(Node):
     # -- web dashboard --------------------------------------------------------
 
     def _start_web_server(self):
+        import logging
         from flask import Flask, Response, jsonify
+
+        # Flask's dev server logs every single request by default (including
+        # the dashboard's own /state poll every 400ms) -- floods the terminal
+        # and buries the actual ROS2/detection logs. Silence it; real errors
+        # still raise exceptions and aren't hidden by this.
+        logging.getLogger('werkzeug').setLevel(logging.ERROR)
 
         app = Flask(__name__)
         node = self
@@ -312,6 +321,7 @@ class SearchAndRescue(Node):
         def state():
             return jsonify({
                 'x': node.x, 'y': node.y, 'theta_deg': math.degrees(node.theta),
+                'have_odom': node.have_odom,
                 'waypoint_idx': node.waypoint_idx,
                 'waypoints': WAYPOINTS,
                 'room_size': ROOM_SIZE_M,
@@ -352,21 +362,35 @@ class SearchAndRescue(Node):
 
 def _mjpeg_generator(node):
     import cv2
-    while True:
-        frame = node.latest_frame
-        if frame is not None:
-            display = frame.copy()
-            det = node.latest_detection
-            if det and (time.time() - det['t']) < 1.0:
-                p1 = (int(det['x1']), int(det['y1']))
-                p2 = (int(det['x2']), int(det['y2']))
-                cv2.rectangle(display, p1, p2, (0, 255, 0), 2)
-                cv2.putText(display, f"duck {det['conf']:.2f}", (p1[0], max(0, p1[1] - 8)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+    node.get_logger().info("Dashboard: video client connected")
+    try:
+        while True:
+            frame = node.latest_frame
+            if frame is None:
+                # No real frame yet -- send a placeholder instead of nothing, so the
+                # browser actually renders something instead of spinning forever
+                # waiting for the first byte. If you see this image, the camera
+                # pipeline itself isn't producing frames (check the "Camera frame
+                # grab failing" warning in the terminal); if you never see even
+                # this, the problem is the HTTP stream, not the camera.
+                display = np.zeros((360, 640, 3), dtype=np.uint8)
+                cv2.putText(display, "waiting for camera frame...", (30, 180),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
+            else:
+                display = frame.copy()
+                det = node.latest_detection
+                if det and (time.time() - det['t']) < 1.0:
+                    p1 = (int(det['x1']), int(det['y1']))
+                    p2 = (int(det['x2']), int(det['y2']))
+                    cv2.rectangle(display, p1, p2, (0, 255, 0), 2)
+                    cv2.putText(display, f"duck {det['conf']:.2f}", (p1[0], max(0, p1[1] - 8)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
             ok, buf = cv2.imencode('.jpg', display)
             if ok:
                 yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
-        time.sleep(0.1)
+            time.sleep(0.1)
+    finally:
+        node.get_logger().info("Dashboard: video client disconnected")
 
 
 HTML_PAGE = """<!doctype html>
@@ -516,9 +540,13 @@ function poll() {
     else if (state.started) statusBadge = '<span class="badge">patrolling</span>';
     else statusBadge = '<span class="badge waiting">waiting for Start</span>';
 
+    const odomBadge = state.have_odom
+      ? '<span class="badge done">odom OK</span>'
+      : '<span class="badge" style="background:#5a1c1c;color:#ffb3b3;">NO /odom -- check micro-ROS agent</span>';
+
     document.getElementById('status').innerHTML =
       `pos: <b>(${state.x.toFixed(2)}, ${state.y.toFixed(2)})</b> ` +
-      `heading: <b>${state.theta_deg.toFixed(1)}&deg;</b><br>` +
+      `heading: <b>${state.theta_deg.toFixed(1)}&deg;</b> ${odomBadge}<br>` +
       `waypoint: <b>${state.waypoint_idx}/${state.waypoints.length}</b> ${statusBadge}<br>` +
       `duck sightings: <b>${state.duck_sightings.length}</b><br>` +
       `camera: <b>${state.has_camera ? 'on' : 'off (--nav-only)'}</b>`;
