@@ -126,8 +126,19 @@ STEREO_MAX_DISTANCE_M = 5.0
 
 GOAL_TOLERANCE_M = 0.10       # "close enough" to a waypoint
 TURN_IN_PLACE_THRESHOLD = 0.35  # rad (~20deg) -- above this, stop and turn first
-MAX_LINEAR_SPEED = 0.15       # m/s -- deliberately slow, this is a small room
-MAX_ANGULAR_SPEED = 0.8       # rad/s
+# Raised 2026-08-26: PWM maxing at ~78/255 during live tests was traced to
+# these caps, not a weak PID -- target_rpm = v / WHEEL_CIRCUMFERENCE_M * 60,
+# so 0.15 m/s only ever asked for ~43 RPM, and the tiny WHEELBASE_M (0.10m)
+# meant 0.8 rad/s in-place turns only asked for ~11 RPM per wheel. The
+# firmware PID was correctly hitting those (small) targets at low PWM --
+# retuning Kp/Ki would not have changed the ceiling, only convergence speed.
+# Verify live after this change: ESP32 diag panel's RPM should now track
+# the higher targets, not just PWM going up -- if RPM lags far behind PWM at
+# these new values, THAT is real evidence of an undertuned/underpowered PID
+# worth revisiting (it wasn't, at the old low targets).
+MAX_LINEAR_SPEED = 0.30       # m/s -- still cautious for a 2.23m-long room
+MAX_ANGULAR_SPEED = 1.5       # rad/s -- wheelbase is small, turns need more
+                               # angular.z than you'd expect for real wheel RPM
 KP_HEADING = 1.5
 
 CONTROL_PERIOD_S = 0.1   # 10 Hz control loop, navigation only -- camera grab +
