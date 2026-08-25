@@ -109,17 +109,9 @@ MAX_LINEAR_SPEED = 0.15       # m/s -- deliberately slow, this is a small room
 MAX_ANGULAR_SPEED = 0.8       # rad/s
 KP_HEADING = 1.5
 
-CONTROL_PERIOD_S = 0.1   # 10 Hz control loop
-DETECT_EVERY_N_TICKS = 5  # run YOLO ~every 5th control tick (~2 Hz). Everything in
-                           # control_tick runs on one thread (ROS2's default executor),
-                           # so a slow YOLO call delays the NEXT frame grab and cmd_vel
-                           # update too, not just itself -- this is the real source of
-                           # the dashboard/driving lag (CPU-only inference, no GPU --
-                           # see DETECT_IMGSZ comment below), not a website/network
-                           # issue. Raised from 3 to spread that stall out more; the
-                           # real fix (run detection on a background thread so it can't
-                           # block frame grabs/driving) is a bigger change, deliberately
-                           # not done today -- this is the safe stopgap.
+CONTROL_PERIOD_S = 0.1   # 10 Hz control loop, navigation only -- camera grab +
+                         # detection run on their own thread (see _vision_loop),
+                         # paced naturally by how long YOLO takes, not this timer.
 
 WEIGHTS_PATH = Path(__file__).resolve().parents[1] / "training/runs/detect/train-4/weights/best.pt"
 CALIB_PATH = Path(__file__).resolve().parents[2] / "stereo_calibration.npz"
@@ -188,7 +180,6 @@ class SearchAndRescue(Node):
         self.done = False
         self.started = False  # gated by the dashboard's Start button -- camera/
                                # detection run regardless, only driving waits
-        self.tick_count = 0
 
         self.duck_sightings = []  # list of (world_x, world_y)
         self.report = None        # filled in once the loop finishes
@@ -272,6 +263,24 @@ class SearchAndRescue(Node):
             f"baseline={self.baseline_m*100:.2f}cm"
         )
 
+        # Camera grab + detection run on their own thread, completely decoupled
+        # from the 10Hz ROS control timer -- previously this ran inline inside
+        # control_tick, so a slow (CPU-only, no usable GPU on this Jetson) YOLO
+        # call blocked frame grabs AND cmd_vel updates too, which was the real
+        # source of the reported lag, not a network/dashboard issue. Results
+        # are written to plain instance attributes; CPython's GIL makes single
+        # reads/writes of these safe enough across threads for this use case
+        # (no lock needed -- nothing here does a multi-step read-modify-write
+        # on shared state, only whole-object replacement).
+        self.vision_loop_count = 0
+        threading.Thread(target=self._vision_loop, daemon=True).start()
+
+    def _vision_loop(self):
+        while rclpy.ok():
+            self.vision_loop_count += 1
+            self._grab_frame()
+            self._detect_tick()
+
     # -- odometry -----------------------------------------------------------
 
     def on_odom(self, msg: Odometry):
@@ -286,13 +295,9 @@ class SearchAndRescue(Node):
         if not self.have_odom:
             return  # wait for first /odom message before doing anything
 
-        self.tick_count += 1
-
-        if not self.nav_only:
-            self._grab_frame()
-            if self.tick_count % DETECT_EVERY_N_TICKS == 0:
-                self._detect_tick()
-
+        # Camera grab + detection run on their own background thread (see
+        # _vision_loop) -- this callback is navigation-only now, so a slow
+        # detection frame can never delay a cmd_vel update.
         if self.done or not self.started:
             self.cmd_pub.publish(Twist())  # stay stopped -- either finished, or waiting for Start
             return
@@ -336,14 +341,20 @@ class SearchAndRescue(Node):
         ok_l, frame_l = self.cap_left.read()
         ok_r, frame_r = self.cap_right.read()
         if ok_l and ok_r:
-            # Rectify both every grab tick (not just on detect ticks) so the
-            # dashboard video stays smooth AND the overlay box (drawn using
-            # rectified-frame coordinates) lines up with what's shown.
-            # cv2.remap is cheap (no CUDA needed) compared to YOLO inference,
-            # safe to run at the full 10Hz control-tick rate.
+            # Rig was physically remounted rolled 180deg 2026-08-26 (cable-
+            # length reason) -- undo that here, on the RAW frame, before
+            # anything else touches it. A 180deg roll about the lens's own
+            # optical axis is optically equivalent to capturing normally and
+            # rotating the picture afterward (true because the calibration's
+            # distortion model is radially symmetric around the image
+            # center) -- so correcting it here means the existing
+            # rectification maps, disparity math, and bearing math all just
+            # keep working unchanged, exactly as if the rig had never rolled.
+            frame_l = cv2.rotate(frame_l, cv2.ROTATE_180)
+            frame_r = cv2.rotate(frame_r, cv2.ROTATE_180)
             self.latest_frame_left = cv2.remap(frame_l, self.map_left_x, self.map_left_y, cv2.INTER_LINEAR)
             self.latest_frame_right = cv2.remap(frame_r, self.map_right_x, self.map_right_y, cv2.INTER_LINEAR)
-        elif self.tick_count % 50 == 0:  # throttled -- don't spam if it keeps failing
+        elif self.vision_loop_count % 50 == 0:  # throttled -- don't spam if it keeps failing
             self.get_logger().warn(
                 f"Camera frame grab failing (left ok={ok_l}, right ok={ok_r})"
             )
