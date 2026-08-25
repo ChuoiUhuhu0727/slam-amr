@@ -201,7 +201,8 @@ static bool imu_read_raw(int16_t *ax, int16_t *ay, int16_t *az,
 #define KSYNC 0.05f
 #define MAX_SYNC_TRIM 15.0f   /* clamp: don't let sync fighting dominate over the base target */
 
-/* --- F4: odometry (measured 2026-07-27: wheel diameter 6cm, wheelbase 10cm) ---
+/* --- F4: odometry (measured 2026-07-27: wheelbase 10cm; wheel diameter
+ * re-measured 2026-08-26 as 6.7cm, corrected from the original 6cm) ---
  * distance per pulse = wheel circumference / slots per rev - converts a raw
  * pulse count directly into linear distance traveled by that wheel.
  * Differential-drive kinematics: center-of-robot distance is the AVERAGE of
