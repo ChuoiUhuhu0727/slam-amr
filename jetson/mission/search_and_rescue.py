@@ -122,7 +122,10 @@ CONF_THRESHOLD = 0.3
 # lot for not much accuracy loss -- the duck is a large, obvious shape, it
 # doesn't need full resolution to be found. Now running twice per detect
 # tick (once per camera) instead of once, so this matters more than before.
-DETECT_IMGSZ = 480
+DETECT_IMGSZ = 384  # dropped from 480 2026-08-26 -- measured 1.2Hz at 480 with
+                    # two cameras, still CPU-bound (see TARGET_DETECT_HZ log
+                    # line). If a far/small duck stops being detected reliably,
+                    # this is the first thing to raise back up.
 
 # Caps the vision loop's rate -- NOTE this can only make it SLOWER (adds a
 # pause if a loop finishes early), it can't make YOLO itself faster than
@@ -405,22 +408,30 @@ class SearchAndRescue(Node):
             return
 
         box_l = self._best_box(frame_l)
-        box_r = self._best_box(frame_r)
-
         self.latest_detection_left = None
         self.latest_detection_right = None
         if box_l:
             x1, y1, x2, y2, conf = box_l
             self.latest_detection_left = {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2, 'conf': conf, 't': time.time()}
-        if box_r:
-            x1, y1, x2, y2, conf = box_r
-            self.latest_detection_right = {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2, 'conf': conf, 't': time.time()}
 
-        if not box_l or not box_r:
-            # Duck only visible in one camera (or neither) -- per plan, don't
-            # guess. Skip this sighting entirely and wait for a tick where
-            # both cameras agree the duck is there.
+        if not box_l:
+            # Nothing to pair even if the right camera happens to see
+            # something -- skip that second, equally expensive YOLO call
+            # entirely. This is the common case during patrol (duck not
+            # currently in view), so it roughly halves average detection
+            # cost. Means the right feed won't show its own box unless the
+            # left camera ALSO currently sees the duck -- an acceptable
+            # trade since a lone-camera sighting was never usable anyway
+            # (see below).
             return
+
+        box_r = self._best_box(frame_r)
+        if not box_r:
+            # Duck only visible in the left camera -- per plan, don't guess.
+            # Skip this sighting, wait for a tick where both agree.
+            return
+        x1, y1, x2, y2, conf = box_r
+        self.latest_detection_right = {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2, 'conf': conf, 't': time.time()}
 
         x1_l, _, x2_l, _, _ = box_l
         x1_r, _, x2_r, _, _ = box_r
