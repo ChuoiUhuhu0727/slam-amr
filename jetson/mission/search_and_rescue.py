@@ -118,6 +118,13 @@ DETECT_EVERY_N_TICKS = 3  # run YOLO ~every 3rd control tick (~3.3 Hz) -- infere
 WEIGHTS_PATH = Path(__file__).resolve().parents[1] / "training/runs/detect/train-4/weights/best.pt"
 CALIB_PATH = Path(__file__).resolve().parents[2] / "stereo_calibration.npz"
 CONF_THRESHOLD = 0.3
+# Detection runs on the CPU on this Jetson (torch/CUDA driver mismatch --
+# separate, pre-existing issue, not fixed here). Shrinking the image the
+# model looks at (default would be the full 1280x720 frame) cuts CPU cost a
+# lot for not much accuracy loss -- the duck is a large, obvious shape, it
+# doesn't need full resolution to be found. Now running twice per detect
+# tick (once per camera) instead of once, so this matters more than before.
+DETECT_IMGSZ = 480
 
 
 def csi_pipeline(sensor_id: int) -> str:
@@ -327,7 +334,7 @@ class SearchAndRescue(Node):
     def _best_box(self, frame):
         """Run detection on one rectified frame, return the highest-confidence
         box as (x1,y1,x2,y2,conf), or None if nothing above threshold."""
-        results = self.model(frame, conf=CONF_THRESHOLD, verbose=False)
+        results = self.model(frame, conf=CONF_THRESHOLD, imgsz=DETECT_IMGSZ, verbose=False)
         boxes = results[0].boxes
         if boxes is None or len(boxes) == 0:
             return None
