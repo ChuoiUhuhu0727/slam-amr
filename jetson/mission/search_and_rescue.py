@@ -124,6 +124,17 @@ CONF_THRESHOLD = 0.3
 # tick (once per camera) instead of once, so this matters more than before.
 DETECT_IMGSZ = 480
 
+# Caps the vision loop's rate -- NOTE this can only make it SLOWER (adds a
+# pause if a loop finishes early), it can't make YOLO itself faster than
+# whatever it naturally takes. Real benefit: (a) a steady, predictable
+# cadence instead of a jittery flat-out one -- looks better for a live demo
+# -- and (b) stops the vision thread from hogging CPU with zero breathing
+# room for the dashboard/steering threads. If YOLO is already naturally
+# slower than this, the cap is a no-op -- watch the terminal's "vision loop"
+# log line to see the REAL achieved rate before assuming this changed
+# anything.
+TARGET_DETECT_HZ = 5.0
+
 
 def csi_pipeline(sensor_id: int) -> str:
     return (
@@ -276,10 +287,25 @@ class SearchAndRescue(Node):
         threading.Thread(target=self._vision_loop, daemon=True).start()
 
     def _vision_loop(self):
+        target_period_s = 1.0 / TARGET_DETECT_HZ
         while rclpy.ok():
+            iter_start = time.time()
             self.vision_loop_count += 1
             self._grab_frame()
             self._detect_tick()
+            elapsed = time.time() - iter_start
+
+            if self.vision_loop_count % 20 == 0:
+                # Real achieved rate, not the target -- if this is already
+                # below TARGET_DETECT_HZ, the cap above isn't doing anything.
+                self.get_logger().info(
+                    f"Vision loop: {1.0/elapsed:.2f}Hz this iteration "
+                    f"(target {TARGET_DETECT_HZ}Hz, {'capped' if elapsed < target_period_s else 'uncapped -- YOLO is the bottleneck'})"
+                )
+
+            remaining = target_period_s - elapsed
+            if remaining > 0:
+                time.sleep(remaining)
 
     # -- odometry -----------------------------------------------------------
 
