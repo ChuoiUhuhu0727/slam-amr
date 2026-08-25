@@ -4,39 +4,22 @@ position), running duck detection the whole time. Reports which grid cell the
 duck was in once the loop completes.
 
 Also runs a live web dashboard (Flask, background thread) showing the room
-map, robot position/heading, duck sightings, and both camera feeds with the
-current detection box drawn on each -- for watching/debugging a live run
-instead of only reading terminal logs. Reachable from any device on the same
-network at http://<jetson-hostname>.local:8080 (this Jetson's mDNS hostname is
+map, robot position/heading, duck sightings, and the camera feed with the
+current detection box drawn on it -- for watching/debugging a live run instead
+of only reading terminal logs. Reachable from any device on the same network
+at http://<jetson-hostname>.local:8080 (this Jetson's mDNS hostname is
 chuoi.local, already set up from earlier SSH work).
 
-Deliberately does NOT use Nav2, VSLAM, or the Isaac ROS stereo depth pipeline:
+Deliberately does NOT use Nav2, VSLAM, or the stereo depth pipeline:
 - Nav2/VSLAM: skipped because cuVSLAM still has an unresolved ~3-5x pose scale
   bug (see project memory), and Nav2's costmap/planner stack has never been
   tested end-to-end on real hardware. A small known/bounded room doesn't need
   either -- hardcoded waypoints + /odom (already tested, gyro-fused heading)
   cover it.
-- Isaac ROS stereo depth (/stereo/points2): needs the full Isaac ROS Docker
-  container + rectified stereo launch just to get points, and produces a full
-  dense point cloud we don't need. Instead, this does its OWN lightweight
-  stereo just for the one object we care about: run detection on both
-  rectified camera frames, use the pixel shift (disparity) of the duck's box
-  between the two frames + the known 8.3cm camera separation to triangulate
-  real-world distance. Needs only plain OpenCV + the existing calibration
-  file -- no Isaac ROS / ROS image pipeline dependency. Replaces the earlier
-  monocular distance-from-known-duck-height approach (kept as
-  search_and_rescue_monocular_backup.py) which needed the duck's real height
-  hardcoded -- this doesn't need to know the duck's size at all.
-
-Physical setup this assumes (confirmed with vịt 2026-08-25): both cameras
-still exactly 8.3cm apart, same height as each other, rigidly mounted as one
-unit -- ONLY the whole rig's heading changed (rotated 45deg right, same as
-the old single-camera mount angle) so it looks toward the room center while
-perimeter-hugging. Because the two cameras' position relative to EACH OTHER
-didn't change, the existing stereo_calibration.npz (from the original
-forward-facing mount) is still valid -- no recalibration needed, only the
-existing CAMERA_BEARING_OFFSET_RAD (rig-to-chassis angle) applies, same as
-before.
+- Stereo depth (/stereo/points2): needs the full Isaac ROS Docker container +
+  rectified stereo launch running just to get points. Instead, this uses
+  monocular distance-from-known-object-height, which needs only one camera
+  frame + the existing calibration intrinsics -- no Isaac ROS dependency.
 
 Run modes:
   python3 search_and_rescue.py             # full run: navigate + detect
@@ -83,25 +66,16 @@ WAYPOINTS = [
 ROOM_SIZE_M = 2.0
 GRID_CELL_M = 0.5  # -> 4x4 grid
 
-# How far the camera RIG (both cameras, rigidly mounted together) is
-# physically rotated relative to the chassis' forward direction (base_link
-# +x), radians. While hugging the perimeter the robot's forward direction
-# points ALONG the wall, not toward room center -- a straight-ahead-mounted
-# rig would mostly look down the wall and rarely catch the duck. Angling it
-# inward fixes this. Positive = rotated toward the robot's left (REP103
-# CCW+). Confirmed: rig mounted 45deg toward the robot's RIGHT -> negative.
+DUCK_HEIGHT_M = 0.13  # measured 2026-08-24
+
+# How far the camera is physically rotated relative to the chassis' forward
+# direction (base_link +x), radians. While hugging the perimeter the robot's
+# forward direction points ALONG the wall, not toward room center -- a
+# straight-ahead-mounted camera would mostly look down the wall and rarely
+# catch the duck. Angling the camera inward fixes this without needing a
+# second camera. Positive = rotated toward the robot's left (REP103 CCW+).
+# Confirmed: camera mounted 45deg toward the robot's RIGHT -> negative.
 CAMERA_BEARING_OFFSET_RAD = -math.radians(45)
-
-# Safety floor for stereo disparity (pixels). Real disparity shrinks as the
-# duck gets farther away; near-zero or negative disparity means either the
-# duck is implausibly far, or the two cameras' detections don't actually
-# match the same object (a bad L/R pairing) -- reject rather than divide by
-# a tiny/negative number and report a garbage distance.
-STEREO_MIN_DISPARITY_PX = 2.0
-
-# Sanity ceiling on computed distance (m). Room is 2x2m (diagonal ~2.83m) --
-# anything past this is treated as a bad stereo match, not a real reading.
-STEREO_MAX_DISTANCE_M = 5.0
 
 GOAL_TOLERANCE_M = 0.10       # "close enough" to a waypoint
 TURN_IN_PLACE_THRESHOLD = 0.35  # rad (~20deg) -- above this, stop and turn first
@@ -119,23 +93,14 @@ WEIGHTS_PATH = Path(__file__).resolve().parents[1] / "training/runs/detect/train
 CALIB_PATH = Path(__file__).resolve().parents[2] / "stereo_calibration.npz"
 CONF_THRESHOLD = 0.3
 
-
-def csi_pipeline(sensor_id: int) -> str:
-    return (
-        f"nvarguscamerasrc sensor-id={sensor_id} ! "
-        "video/x-raw(memory:NVMM), width=1280, height=720, framerate=30/1 ! "
-        "nvvidconv ! "
-        "video/x-raw, format=BGRx ! "
-        "videoconvert ! "
-        "video/x-raw, format=BGR ! appsink drop=1"
-    )
-
-
-# sensor-id 0 = left, sensor-id 1 = right -- must match capture_stereo_pairs.py's
-# convention, since that's what stereo_calibration.npz's K1/D1 (left) and
-# K2/D2 (right) were calibrated against.
-LEFT_SENSOR_ID = 0
-RIGHT_SENSOR_ID = 1
+CSI_PIPELINE = (
+    "nvarguscamerasrc sensor-id=0 ! "
+    "video/x-raw(memory:NVMM), width=1280, height=720, framerate=30/1 ! "
+    "nvvidconv ! "
+    "video/x-raw, format=BGRx ! "
+    "videoconvert ! "
+    "video/x-raw, format=BGR ! appsink drop=1"
+)
 
 WEB_HOST = "0.0.0.0"  # bind all interfaces so other devices on the wifi can reach it
 WEB_PORT = 8080
@@ -172,10 +137,8 @@ class SearchAndRescue(Node):
         self.duck_sightings = []  # list of (world_x, world_y)
         self.report = None        # filled in once the loop finishes
 
-        self.latest_frame_left = None       # for the dashboard video feed (rectified)
-        self.latest_frame_right = None
-        self.latest_detection_left = None   # {'x1','y1','x2','y2','conf','t'} for the overlay box
-        self.latest_detection_right = None
+        self.latest_frame = None       # for the dashboard video feed
+        self.latest_detection = None   # {'x1','y1','x2','y2','conf','t'} for the overlay box
 
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.create_subscription(Odometry, '/odom', self.on_odom, 10)
@@ -193,60 +156,15 @@ class SearchAndRescue(Node):
         from ultralytics import YOLO
 
         calib = np.load(str(CALIB_PATH))
-        K1, D1, K2, D2 = calib["K1"], calib["D1"], calib["K2"], calib["D2"]
-        R, T = calib["R"], calib["T"]
-        width, height = int(calib["image_size"][0]), int(calib["image_size"][1])
-        size = (width, height)
-
-        baseline_m = float(calib["baseline_m"])
-        if not (0.05 < baseline_m < 0.15):
-            # Sanity check against the known ~0.083m mount -- if this is off,
-            # something's wrong with the calibration file, fail loudly now
-            # rather than silently reporting garbage distances all mission.
-            raise RuntimeError(
-                f"Calibration baseline_m={baseline_m:.4f} is way off the known "
-                "~0.083m mount -- wrong/stale calibration file, refusing to start."
-            )
-
-        # Real stereo rectification (same math as the earlier abandoned
-        # npz_to_camera_info_yaml_rectified.py, just applied directly in
-        # OpenCV here instead of feeding it to Isaac ROS). CALIB_ZERO_DISPARITY
-        # aligns principal points; alpha=0 crops to the valid-pixel region only.
-        # This rig-rotation doesn't touch R/T (camera-to-camera geometry is
-        # unchanged), so this is the same R/T that was already trusted before.
-        R1, R2, P1, P2, _, _, _ = cv2.stereoRectify(
-            K1, D1, K2, D2, size, R, T,
-            flags=cv2.CALIB_ZERO_DISPARITY, alpha=0,
-        )
-        self.map_left_x, self.map_left_y = cv2.initUndistortRectifyMap(
-            K1, D1, R1, P1, size, cv2.CV_32FC1)
-        self.map_right_x, self.map_right_y = cv2.initUndistortRectifyMap(
-            K2, D2, R2, P2, size, cv2.CV_32FC1)
-
-        # After rectification both cameras share the same focal length by
-        # construction -- P1[0,0] and P2[0,0] should match closely.
-        self.fx_rect = float(P1[0, 0])
-        self.cx_rect = float(P1[0, 2])
-        fx_rect_right = float(P2[0, 0])
-        if abs(self.fx_rect - fx_rect_right) > 1.0:
-            raise RuntimeError(
-                f"Rectified fx mismatch L={self.fx_rect:.1f} R={fx_rect_right:.1f} "
-                "-- stereoRectify output looks wrong, refusing to start."
-            )
-        self.baseline_m = baseline_m
+        K1 = calib["K1"]
+        self.fx = float(K1[0, 0])
+        self.cx = float(K1[0, 2])
 
         self.model = YOLO(str(WEIGHTS_PATH))
-        self.cap_left = cv2.VideoCapture(csi_pipeline(LEFT_SENSOR_ID), cv2.CAP_GSTREAMER)
-        if not self.cap_left.isOpened():
-            raise RuntimeError(f"Could not open LEFT CSI camera (sensor-id={LEFT_SENSOR_ID})")
-        self.cap_right = cv2.VideoCapture(csi_pipeline(RIGHT_SENSOR_ID), cv2.CAP_GSTREAMER)
-        if not self.cap_right.isOpened():
-            raise RuntimeError(f"Could not open RIGHT CSI camera (sensor-id={RIGHT_SENSOR_ID})")
-
-        self.get_logger().info(
-            f"Stereo vision ready: fx_rect={self.fx_rect:.1f}, cx_rect={self.cx_rect:.1f}, "
-            f"baseline={self.baseline_m*100:.2f}cm"
-        )
+        self.cap = cv2.VideoCapture(CSI_PIPELINE, cv2.CAP_GSTREAMER)
+        if not self.cap.isOpened():
+            raise RuntimeError("Could not open CSI camera -- check sensor-id / GStreamer pipeline")
+        self.get_logger().info(f"Vision ready: fx={self.fx:.1f}, cx={self.cx:.1f}")
 
     # -- odometry -----------------------------------------------------------
 
@@ -307,98 +225,56 @@ class SearchAndRescue(Node):
         self.cmd_pub.publish(cmd)
 
     def _grab_frame(self):
-        import cv2
-
-        ok_l, frame_l = self.cap_left.read()
-        ok_r, frame_r = self.cap_right.read()
-        if ok_l and ok_r:
-            # Rectify both every grab tick (not just on detect ticks) so the
-            # dashboard video stays smooth AND the overlay box (drawn using
-            # rectified-frame coordinates) lines up with what's shown.
-            # cv2.remap is cheap (no CUDA needed) compared to YOLO inference,
-            # safe to run at the full 10Hz control-tick rate.
-            self.latest_frame_left = cv2.remap(frame_l, self.map_left_x, self.map_left_y, cv2.INTER_LINEAR)
-            self.latest_frame_right = cv2.remap(frame_r, self.map_right_x, self.map_right_y, cv2.INTER_LINEAR)
+        ok, frame = self.cap.read()
+        if ok:
+            self.latest_frame = frame
         elif self.tick_count % 50 == 0:  # throttled -- don't spam if it keeps failing
-            self.get_logger().warn(
-                f"Camera frame grab failing (left ok={ok_l}, right ok={ok_r})"
-            )
+            self.get_logger().warn("Camera frame grab failing (cap.read() returned False)")
 
-    def _best_box(self, frame):
-        """Run detection on one rectified frame, return the highest-confidence
-        box as (x1,y1,x2,y2,conf), or None if nothing above threshold."""
+    def _detect_tick(self):
+        frame = self.latest_frame
+        if frame is None:
+            return
+
         results = self.model(frame, conf=CONF_THRESHOLD, verbose=False)
         boxes = results[0].boxes
         if boxes is None or len(boxes) == 0:
-            return None
+            self.latest_detection = None
+            return
+
+        # take the largest/most confident box if more than one hit
         box = boxes[boxes.conf.argmax()]
         x1, y1, x2, y2 = box.xyxy[0].tolist()
         conf = float(box.conf[0])
-        return (x1, y1, x2, y2, conf)
+        bbox_height_px = y2 - y1
+        bbox_center_x = (x1 + x2) / 2.0
 
-    def _detect_tick(self):
-        frame_l = self.latest_frame_left
-        frame_r = self.latest_frame_right
-        if frame_l is None or frame_r is None:
+        self.latest_detection = {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2, 'conf': conf, 't': time.time()}
+
+        if bbox_height_px <= 1:
             return
 
-        box_l = self._best_box(frame_l)
-        box_r = self._best_box(frame_r)
+        distance = (DUCK_HEIGHT_M * self.fx) / bbox_height_px
 
-        self.latest_detection_left = None
-        self.latest_detection_right = None
-        if box_l:
-            x1, y1, x2, y2, conf = box_l
-            self.latest_detection_left = {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2, 'conf': conf, 't': time.time()}
-        if box_r:
-            x1, y1, x2, y2, conf = box_r
-            self.latest_detection_right = {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2, 'conf': conf, 't': time.time()}
-
-        if not box_l or not box_r:
-            # Duck only visible in one camera (or neither) -- per plan, don't
-            # guess. Skip this sighting entirely and wait for a tick where
-            # both cameras agree the duck is there.
-            return
-
-        x1_l, _, x2_l, _, _ = box_l
-        x1_r, _, x2_r, _, _ = box_r
-        center_x_l = (x1_l + x2_l) / 2.0
-        center_x_r = (x1_r + x2_r) / 2.0
-
-        disparity_px = center_x_l - center_x_r
-        if disparity_px < STEREO_MIN_DISPARITY_PX:
-            self.get_logger().warn(
-                f"Duck seen in both cameras but disparity={disparity_px:.1f}px too small/negative "
-                "(implausibly far, or L/R boxes don't match the same object) -- skipping sighting"
-            )
-            return
-
-        distance = (self.fx_rect * self.baseline_m) / disparity_px
-        if distance > STEREO_MAX_DISTANCE_M:
-            self.get_logger().warn(
-                f"Duck stereo distance={distance:.2f}m exceeds room-size sanity ceiling -- skipping sighting"
-            )
-            return
-
-        # Pixel offset from image center -> bearing angle, using the LEFT
-        # (reference) rectified camera, same convention as the old monocular
-        # code. Camera rig has ~0 x/y offset from base_link, just faces a
-        # fixed direction relative to the chassis -- no extra translation
-        # needed, only the CAMERA_BEARING_OFFSET_RAD rotation below.
+        # Pixel offset from image center -> bearing angle. Camera mount has
+        # ~0 x/y offset from base_link (see stereo_depth_argus.launch.py),
+        # just faces a fixed direction relative to the chassis, so camera
+        # position ~= robot's own -- no extra translation needed, only the
+        # CAMERA_BEARING_OFFSET_RAD rotation below.
         # SIGN NOT YET EMPIRICALLY VERIFIED: image-right (+dx) should mean
         # "duck is to the robot's right" = negative yaw offset (REP103: CCW
         # positive). Test with the duck placed to one known side first: if
         # the reported y comes out on the wrong side, flip this sign.
-        dx_px = center_x_l - self.cx_rect
-        bearing = -math.atan2(dx_px, self.fx_rect)
+        dx_px = bbox_center_x - self.cx
+        bearing = -math.atan2(dx_px, self.fx)
 
         world_x = self.x + distance * math.cos(self.theta + CAMERA_BEARING_OFFSET_RAD + bearing)
         world_y = self.y + distance * math.sin(self.theta + CAMERA_BEARING_OFFSET_RAD + bearing)
 
         self.duck_sightings.append((world_x, world_y))
         self.get_logger().info(
-            f"Duck seen (stereo): disparity={disparity_px:.1f}px dist={distance:.2f}m "
-            f"bearing={math.degrees(bearing):.1f}deg -> estimated world ({world_x:.2f}, {world_y:.2f})"
+            f"Duck seen: dist={distance:.2f}m bearing={math.degrees(bearing):.1f}deg "
+            f"-> estimated world ({world_x:.2f}, {world_y:.2f})"
         )
 
     def duck_estimate(self):
@@ -470,17 +346,11 @@ class SearchAndRescue(Node):
                 'target_waypoint': WAYPOINTS[node.waypoint_idx] if node.waypoint_idx < len(WAYPOINTS) else None,
             })
 
-        @app.route('/video_feed_left')
-        def video_feed_left():
+        @app.route('/video_feed')
+        def video_feed():
             if node.nav_only:
                 return Response("Camera not active in --nav-only mode", mimetype='text/plain')
-            return Response(_mjpeg_generator(node, 'left'), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-        @app.route('/video_feed_right')
-        def video_feed_right():
-            if node.nav_only:
-                return Response("Camera not active in --nav-only mode", mimetype='text/plain')
-            return Response(_mjpeg_generator(node, 'right'), mimetype='multipart/x-mixed-replace; boundary=frame')
+            return Response(_mjpeg_generator(node), mimetype='multipart/x-mixed-replace; boundary=frame')
 
         @app.route('/start', methods=['POST'])
         def start():
@@ -508,8 +378,7 @@ class SearchAndRescue(Node):
             node.done = False
             node.waypoint_idx = 0
             node.duck_sightings = []
-            node.latest_detection_left = None
-            node.latest_detection_right = None
+            node.latest_detection = None
             node.report = None
             node.cmd_pub.publish(Twist())
             node.get_logger().info("Dashboard: RESET (mission state cleared)")
@@ -523,25 +392,25 @@ class SearchAndRescue(Node):
         self.get_logger().info(f"Web dashboard on http://<jetson-hostname>.local:{WEB_PORT}  (e.g. http://chuoi.local:{WEB_PORT})")
 
 
-def _mjpeg_generator(node, side):
+def _mjpeg_generator(node):
     import cv2
-    node.get_logger().info(f"Dashboard: {side} video client connected")
+    node.get_logger().info("Dashboard: video client connected")
     try:
         while True:
-            frame = node.latest_frame_left if side == 'left' else node.latest_frame_right
-            det = node.latest_detection_left if side == 'left' else node.latest_detection_right
+            frame = node.latest_frame
             if frame is None:
                 # No real frame yet -- send a placeholder instead of nothing, so the
                 # browser actually renders something instead of spinning forever
-                # waiting for the first byte. If you see this image, that camera's
+                # waiting for the first byte. If you see this image, the camera
                 # pipeline itself isn't producing frames (check the "Camera frame
                 # grab failing" warning in the terminal); if you never see even
                 # this, the problem is the HTTP stream, not the camera.
                 display = np.zeros((360, 640, 3), dtype=np.uint8)
-                cv2.putText(display, f"waiting for {side} camera frame...", (20, 180),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 200, 255), 2)
+                cv2.putText(display, "waiting for camera frame...", (30, 180),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 200, 255), 2)
             else:
                 display = frame.copy()
+                det = node.latest_detection
                 if det and (time.time() - det['t']) < 1.0:
                     p1 = (int(det['x1']), int(det['y1']))
                     p2 = (int(det['x2']), int(det['y2']))
@@ -553,7 +422,7 @@ def _mjpeg_generator(node, side):
                 yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
             time.sleep(0.1)
     finally:
-        node.get_logger().info(f"Dashboard: {side} video client disconnected")
+        node.get_logger().info("Dashboard: video client disconnected")
 
 
 HTML_PAGE = """<!doctype html>
@@ -575,7 +444,7 @@ HTML_PAGE = """<!doctype html>
     padding: 14px;
   }
   canvas { background: #0e1116; border-radius: 6px; display: block; }
-  img#video-left, img#video-right { width: 480px; max-width: 100%; border-radius: 6px; background: #000; display: block; }
+  img#video { width: 480px; max-width: 100%; border-radius: 6px; background: #000; }
   .status-line { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.85rem; line-height: 1.6; }
   .status-line b { color: #9fd3ff; }
   .badge {
@@ -619,10 +488,7 @@ HTML_PAGE = """<!doctype html>
       </div>
     </div>
     <div class="panel">
-      <div style="font-size:0.72rem; color:#8a94a6; margin-bottom:4px;">LEFT camera</div>
-      <img id="video-left" src="/video_feed_left">
-      <div style="font-size:0.72rem; color:#8a94a6; margin:8px 0 4px;">RIGHT camera</div>
-      <img id="video-right" src="/video_feed_right">
+      <img id="video" src="/video_feed">
     </div>
     <div class="panel" style="min-width: 240px;">
       <div class="status-line" id="status">connecting...</div>
