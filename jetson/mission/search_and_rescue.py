@@ -183,6 +183,9 @@ class SearchAndRescue(Node):
         self.latest_frame_right = None
         self.latest_detection_left = None   # {'x1','y1','x2','y2','conf','t'} for the overlay box
         self.latest_detection_right = None
+        self.latest_stereo_reading = None   # {'distance_m','bearing_deg','disparity_px','t'} -- for
+                                             # a live "distance right now" readout, useful for a
+                                             # ruler accuracy check without reading terminal logs
 
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.create_subscription(Odometry, '/odom', self.on_odom, 10)
@@ -336,6 +339,7 @@ class SearchAndRescue(Node):
         box as (x1,y1,x2,y2,conf), or None if nothing above threshold."""
         results = self.model(frame, conf=CONF_THRESHOLD, imgsz=DETECT_IMGSZ, verbose=False)
         boxes = results[0].boxes
+      
         if boxes is None or len(boxes) == 0:
             return None
         box = boxes[boxes.conf.argmax()]
@@ -398,6 +402,13 @@ class SearchAndRescue(Node):
         # the reported y comes out on the wrong side, flip this sign.
         dx_px = center_x_l - self.cx_rect
         bearing = -math.atan2(dx_px, self.fx_rect)
+
+        self.latest_stereo_reading = {
+            'distance_m': distance,
+            'bearing_deg': math.degrees(bearing),
+            'disparity_px': disparity_px,
+            't': time.time(),
+        }
 
         world_x = self.x + distance * math.cos(self.theta + CAMERA_BEARING_OFFSET_RAD + bearing)
         world_y = self.y + distance * math.sin(self.theta + CAMERA_BEARING_OFFSET_RAD + bearing)
@@ -472,6 +483,7 @@ class SearchAndRescue(Node):
                 'started': node.started,
                 'duck_sightings': node.duck_sightings,
                 'duck_estimate': node.duck_estimate(),
+                'latest_stereo': node.latest_stereo_reading,
                 'report': node.report,
                 'has_camera': not node.nav_only,
                 'target_waypoint': WAYPOINTS[node.waypoint_idx] if node.waypoint_idx < len(WAYPOINTS) else None,
@@ -517,6 +529,7 @@ class SearchAndRescue(Node):
             node.duck_sightings = []
             node.latest_detection_left = None
             node.latest_detection_right = None
+            node.latest_stereo_reading = None
             node.report = None
             node.cmd_pub.publish(Twist())
             node.get_logger().info("Dashboard: RESET (mission state cleared)")
@@ -743,12 +756,22 @@ function poll() {
       ? '<span class="badge done">odom OK</span>'
       : '<span class="badge" style="background:#5a1c1c;color:#ffb3b3;">NO /odom -- check micro-ROS agent</span>';
 
+    let stereoLine;
+    if (state.latest_stereo && (Date.now() / 1000 - state.latest_stereo.t) < 2.0) {
+      stereoLine = `<b>${state.latest_stereo.distance_m.toFixed(2)}m</b> ` +
+        `@ ${state.latest_stereo.bearing_deg.toFixed(1)}&deg; ` +
+        `<span style="color:#8a94a6;">(disparity ${state.latest_stereo.disparity_px.toFixed(0)}px)</span>`;
+    } else {
+      stereoLine = '<span style="color:#8a94a6;">no current stereo lock (duck not seen by both cameras right now)</span>';
+    }
+
     document.getElementById('status').innerHTML =
       `pos: <b>(${state.x.toFixed(2)}, ${state.y.toFixed(2)})</b> ` +
       `heading: <b>${state.theta_deg.toFixed(1)}&deg;</b> ${odomBadge}<br>` +
       `waypoint: <b>${state.waypoint_idx}/${state.waypoints.length}</b> ${statusBadge}<br>` +
       `duck sightings: <b>${state.duck_sightings.length}</b><br>` +
-      `camera: <b>${state.has_camera ? 'on' : 'off (--nav-only)'}</b>`;
+      `camera: <b>${state.has_camera ? 'on' : 'off (--nav-only)'}</b><br>` +
+      `distance to duck now: ${stereoLine}`;
 
     document.getElementById('startBtn').disabled = state.started || state.done;
     document.getElementById('stopBtn').disabled = !state.started;
