@@ -110,10 +110,16 @@ MAX_ANGULAR_SPEED = 0.8       # rad/s
 KP_HEADING = 1.5
 
 CONTROL_PERIOD_S = 0.1   # 10 Hz control loop
-DETECT_EVERY_N_TICKS = 3  # run YOLO ~every 3rd control tick (~3.3 Hz) -- inference
-                           # is the slow part, don't let it stall steering updates.
-                           # The camera frame itself is still grabbed every tick
-                           # (cheap) so the dashboard video feed stays smooth.
+DETECT_EVERY_N_TICKS = 5  # run YOLO ~every 5th control tick (~2 Hz). Everything in
+                           # control_tick runs on one thread (ROS2's default executor),
+                           # so a slow YOLO call delays the NEXT frame grab and cmd_vel
+                           # update too, not just itself -- this is the real source of
+                           # the dashboard/driving lag (CPU-only inference, no GPU --
+                           # see DETECT_IMGSZ comment below), not a website/network
+                           # issue. Raised from 3 to spread that stall out more; the
+                           # real fix (run detection on a background thread so it can't
+                           # block frame grabs/driving) is a bigger change, deliberately
+                           # not done today -- this is the safe stopgap.
 
 WEIGHTS_PATH = Path(__file__).resolve().parents[1] / "training/runs/detect/train-4/weights/best.pt"
 CALIB_PATH = Path(__file__).resolve().parents[2] / "stereo_calibration.npz"
@@ -138,11 +144,19 @@ def csi_pipeline(sensor_id: int) -> str:
     )
 
 
-# sensor-id 0 = left, sensor-id 1 = right -- must match capture_stereo_pairs.py's
-# convention, since that's what stereo_calibration.npz's K1/D1 (left) and
-# K2/D2 (right) were calibrated against.
-LEFT_SENSOR_ID = 0
-RIGHT_SENSOR_ID = 1
+# Which physical camera plays the calibration's "camera1/left" role (K1/D1)
+# vs "camera2/right" role (K2/D2) -- must match whichever sensor-id was
+# captured as the LEFT file during capture_stereo_pairs.py, since that's
+# what stereo_calibration.npz's K1/D1 (left) and K2/D2 (right) were fit to.
+# This is about ELECTRICAL port pairing to calibration data, not physical
+# geometry -- swapping the whole rig's orientation on the chassis (the
+# 45deg mount) never breaks this. It WOULD break if the two camera modules'
+# physical CSI connections got swapped/re-plugged since calibration (easy
+# to do by accident when rebuilding the mount) -- vịt found live evidence
+# of exactly that 2026-08-25 (disparity consistently negative even for
+# far-away detections, not just close-range noise). Flipped here to match.
+LEFT_SENSOR_ID = 1
+RIGHT_SENSOR_ID = 0
 
 WEB_HOST = "0.0.0.0"  # bind all interfaces so other devices on the wifi can reach it
 WEB_PORT = 8080
@@ -589,26 +603,42 @@ HTML_PAGE = """<!doctype html>
     margin: 0; padding: 20px;
   }
   h1 { font-size: 1.2rem; font-weight: 600; margin: 0 0 16px; color: #9fd3ff; }
-  .layout { display: flex; gap: 20px; flex-wrap: wrap; align-items: flex-start; }
+  .column { display: flex; flex-direction: column; gap: 16px; }
+  .layout { display: grid; grid-template-columns: minmax(300px, 460px) minmax(300px, 1fr); gap: 16px; align-items: start; }
+  @media (max-width: 860px) { .layout { grid-template-columns: 1fr; } }
   .panel {
     background: #1b1f27; border: 1px solid #2a2f3a; border-radius: 10px;
     padding: 14px;
   }
-  canvas { background: #0e1116; border-radius: 6px; display: block; }
-  img#video-left, img#video-right { width: 480px; max-width: 100%; border-radius: 6px; background: #000; display: block; }
-  .status-line { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.85rem; line-height: 1.6; }
+  .panel-title {
+    font-size: 0.72rem; text-transform: uppercase; letter-spacing: 0.04em;
+    color: #6b7688; margin-bottom: 10px; font-weight: 600;
+  }
+  canvas { background: #0e1116; border-radius: 6px; display: block; max-width: 100%; }
+  .video-row { display: flex; gap: 10px; flex-wrap: wrap; }
+  .video-cell { flex: 1 1 200px; }
+  .video-cell img { width: 100%; border-radius: 6px; background: #000; display: block; }
+  .video-cell .label { font-size: 0.7rem; color: #8a94a6; margin-bottom: 4px; }
+  .status-line { font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.85rem; line-height: 1.7; }
   .status-line b { color: #9fd3ff; }
+  .stat-highlight {
+    font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 1.05rem;
+    padding: 8px 10px; margin-top: 8px; border-radius: 8px;
+    background: #10201c; border: 1px solid #1c4d2b; color: #9fe6ae;
+  }
+  .stat-highlight.stale { background: #201c10; border-color: #4a3f18; color: #8a94a6; }
   .badge {
     display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.75rem;
     background: #2a2f3a; margin-left: 6px;
   }
   .badge.done { background: #1c4d2b; color: #9fe6ae; }
   .badge.waiting { background: #4a3f18; color: #ffe08a; }
+  .legend { font-size: 0.72rem; color: #8a94a6; margin-top: 8px; line-height: 1.5; }
   .report {
     margin-top: 10px; padding: 10px; border-radius: 8px; background: #2a2410;
     border: 1px solid #4a3f18; color: #ffe08a; font-family: ui-monospace, monospace; font-size: 0.85rem;
   }
-  .controls { margin-bottom: 14px; }
+  .controls { margin-bottom: 16px; }
   button {
     font-size: 0.95rem; font-weight: 600; padding: 10px 20px; border-radius: 8px;
     border: none; cursor: pointer; margin-right: 10px;
@@ -628,25 +658,43 @@ HTML_PAGE = """<!doctype html>
     <button id="resetBtn" onclick="sendCmd('/reset')">Reset All</button>
   </div>
   <div class="layout">
-    <div class="panel">
-      <canvas id="map" width="440" height="440"></canvas>
-      <div style="font-size:0.72rem; color:#8a94a6; margin-top:8px; line-height:1.5;">
-        solid box = room walls &middot; dashed box = patrol path &middot;
-        <span style="color:#ff5b5b;">&#9679;</span> = current best duck estimate &middot;
-        <span style="color:#ffd76b;">&#9679;</span> = individual sightings &middot;
-        <span style="color:#9fd3ff;">&#9654;</span> = robot &middot;
-        line = current target
+    <div class="column">
+      <div class="panel">
+        <div class="panel-title">Room map</div>
+        <canvas id="map" width="440" height="440"></canvas>
+        <div class="legend">
+          solid box = room walls &middot; dashed box = patrol path &middot;
+          <span style="color:#ff5b5b;">&#9679;</span> = current best duck estimate &middot;
+          <span style="color:#ffd76b;">&#9679;</span> = individual sightings &middot;
+          <span style="color:#9fd3ff;">&#9654;</span> = robot &middot;
+          line = current target
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">Robot / mission status</div>
+        <div class="status-line" id="navStatus">connecting...</div>
       </div>
     </div>
-    <div class="panel">
-      <div style="font-size:0.72rem; color:#8a94a6; margin-bottom:4px;">LEFT camera</div>
-      <img id="video-left" src="/video_feed_left">
-      <div style="font-size:0.72rem; color:#8a94a6; margin:8px 0 4px;">RIGHT camera</div>
-      <img id="video-right" src="/video_feed_right">
-    </div>
-    <div class="panel" style="min-width: 240px;">
-      <div class="status-line" id="status">connecting...</div>
-      <div id="reportBox"></div>
+    <div class="column">
+      <div class="panel">
+        <div class="panel-title">Camera feeds (rectified)</div>
+        <div class="video-row">
+          <div class="video-cell">
+            <div class="label">LEFT camera</div>
+            <img id="video-left" src="/video_feed_left">
+          </div>
+          <div class="video-cell">
+            <div class="label">RIGHT camera</div>
+            <img id="video-right" src="/video_feed_right">
+          </div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">Duck detection</div>
+        <div class="status-line" id="duckStatus">connecting...</div>
+        <div id="stereoBox"></div>
+        <div id="reportBox"></div>
+      </div>
     </div>
   </div>
 
@@ -756,22 +804,25 @@ function poll() {
       ? '<span class="badge done">odom OK</span>'
       : '<span class="badge" style="background:#5a1c1c;color:#ffb3b3;">NO /odom -- check micro-ROS agent</span>';
 
-    let stereoLine;
-    if (state.latest_stereo && (Date.now() / 1000 - state.latest_stereo.t) < 2.0) {
-      stereoLine = `<b>${state.latest_stereo.distance_m.toFixed(2)}m</b> ` +
-        `@ ${state.latest_stereo.bearing_deg.toFixed(1)}&deg; ` +
-        `<span style="color:#8a94a6;">(disparity ${state.latest_stereo.disparity_px.toFixed(0)}px)</span>`;
-    } else {
-      stereoLine = '<span style="color:#8a94a6;">no current stereo lock (duck not seen by both cameras right now)</span>';
-    }
-
-    document.getElementById('status').innerHTML =
+    document.getElementById('navStatus').innerHTML =
       `pos: <b>(${state.x.toFixed(2)}, ${state.y.toFixed(2)})</b> ` +
       `heading: <b>${state.theta_deg.toFixed(1)}&deg;</b> ${odomBadge}<br>` +
-      `waypoint: <b>${state.waypoint_idx}/${state.waypoints.length}</b> ${statusBadge}<br>` +
-      `duck sightings: <b>${state.duck_sightings.length}</b><br>` +
+      `waypoint: <b>${state.waypoint_idx}/${state.waypoints.length}</b> ${statusBadge}`;
+
+    const stereoFresh = state.latest_stereo && (Date.now() / 1000 - state.latest_stereo.t) < 2.0;
+    document.getElementById('duckStatus').innerHTML =
       `camera: <b>${state.has_camera ? 'on' : 'off (--nav-only)'}</b><br>` +
-      `distance to duck now: ${stereoLine}`;
+      `duck sightings recorded: <b>${state.duck_sightings.length}</b>`;
+
+    const stereoBox = document.getElementById('stereoBox');
+    if (stereoFresh) {
+      stereoBox.innerHTML = `<div class="stat-highlight">distance to duck now: ` +
+        `<b>${state.latest_stereo.distance_m.toFixed(2)}m</b> @ ${state.latest_stereo.bearing_deg.toFixed(1)}&deg; ` +
+        `<span style="color:#8a94a6;">(disparity ${state.latest_stereo.disparity_px.toFixed(0)}px)</span></div>`;
+    } else {
+      stereoBox.innerHTML = `<div class="stat-highlight stale">no current stereo lock ` +
+        `(duck not seen by both cameras right now)</div>`;
+    }
 
     document.getElementById('startBtn').disabled = state.started || state.done;
     document.getElementById('stopBtn').disabled = !state.started;
@@ -787,7 +838,7 @@ function poll() {
       reportBox.innerHTML = '';
     }
   }).catch(() => {
-    document.getElementById('status').innerText = 'connection lost, retrying...';
+    document.getElementById('navStatus').innerText = 'connection lost, retrying...';
   });
 }
 
