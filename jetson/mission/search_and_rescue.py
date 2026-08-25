@@ -62,6 +62,7 @@ import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
+from std_msgs.msg import String
 
 # ---------------------------------------------------------------------------
 # CONFIG -- confirm/measure these before trusting the output
@@ -82,11 +83,22 @@ ROOM_LENGTH_M = 2.23  # y-axis extent
 # lines) -- should still be safe based on that room's testing, but worth a
 # physical eyeball check before the real run given how tight this one is.
 WAYPOINT_INSET_M = 0.3
+
+# Loop direction matters: the camera rig is mounted looking toward the
+# robot's RIGHT (CAMERA_BEARING_OFFSET_RAD below). For it to look toward
+# the room's interior (not out past the wall) the whole loop, the interior
+# must stay on the robot's right side throughout -- which only happens
+# walking the loop CLOCKWISE (right turn at every corner). Fixed
+# 2026-08-26: this order starts with one in-place left turn (normal,
+# already-supported behavior) toward the far wall first, then turns right
+# at every corner from there -- the previous order turned left at every
+# corner (counter-clockwise), which pointed the camera outward the entire
+# patrol, never toward the duck.
 WAYPOINTS = [
     (WAYPOINT_INSET_M, WAYPOINT_INSET_M),
-    (ROOM_WIDTH_M - WAYPOINT_INSET_M, WAYPOINT_INSET_M),
-    (ROOM_WIDTH_M - WAYPOINT_INSET_M, ROOM_LENGTH_M - WAYPOINT_INSET_M),
     (WAYPOINT_INSET_M, ROOM_LENGTH_M - WAYPOINT_INSET_M),
+    (ROOM_WIDTH_M - WAYPOINT_INSET_M, ROOM_LENGTH_M - WAYPOINT_INSET_M),
+    (ROOM_WIDTH_M - WAYPOINT_INSET_M, WAYPOINT_INSET_M),
     (WAYPOINT_INSET_M, WAYPOINT_INSET_M),  # back to start -- also how we measure real loop drift
 ]
 
@@ -202,6 +214,9 @@ class SearchAndRescue(Node):
         self.y = 0.0
         self.theta = 0.0
         self.have_odom = False
+        self.esp32_diag = ''  # raw text from /esp32_diag (RPM/PWM/reset/I2C from
+                               # the firmware's own PID loop) -- shown as-is on
+                               # the dashboard for troubleshooting, no parsing
 
         self.waypoint_idx = 0
         self.done = False
@@ -221,6 +236,7 @@ class SearchAndRescue(Node):
 
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.create_subscription(Odometry, '/odom', self.on_odom, 10)
+        self.create_subscription(String, '/esp32_diag', self.on_diag, 10)
         self.control_timer = self.create_timer(CONTROL_PERIOD_S, self.control_tick)
 
         if not nav_only:
@@ -330,6 +346,9 @@ class SearchAndRescue(Node):
         self.y = msg.pose.pose.position.y
         self.theta = yaw_from_quaternion(msg.pose.pose.orientation)
         self.have_odom = True
+
+    def on_diag(self, msg: String):
+        self.esp32_diag = msg.data
 
     # -- main loop ------------------------------------------------------------
 
@@ -550,6 +569,7 @@ class SearchAndRescue(Node):
             return jsonify({
                 'x': node.x, 'y': node.y, 'theta_deg': math.degrees(node.theta),
                 'have_odom': node.have_odom,
+                'esp32_diag': node.esp32_diag,
                 'waypoint_idx': node.waypoint_idx,
                 'waypoints': WAYPOINTS,
                 'room_width': ROOM_WIDTH_M,
@@ -736,6 +756,10 @@ HTML_PAGE = """<!doctype html>
         <div class="panel-title">Robot / mission status</div>
         <div class="status-line" id="navStatus">connecting...</div>
       </div>
+      <div class="panel">
+        <div class="panel-title">ESP32 diagnostics (PID / encoder)</div>
+        <div class="status-line" id="diagStatus" style="font-size:0.78rem;">connecting...</div>
+      </div>
     </div>
     <div class="column">
       <div class="panel">
@@ -879,6 +903,9 @@ function poll() {
       `pos: <b>(${state.x.toFixed(2)}, ${state.y.toFixed(2)})</b> ` +
       `heading: <b>${state.theta_deg.toFixed(1)}&deg;</b> ${odomBadge}<br>` +
       `waypoint: <b>${state.waypoint_idx}/${state.waypoints.length}</b> ${statusBadge}`;
+
+    document.getElementById('diagStatus').innerText =
+      state.esp32_diag || '(nothing received yet from /esp32_diag)';
 
     const stereoFresh = state.latest_stereo && (Date.now() / 1000 - state.latest_stereo.t) < 2.0;
     document.getElementById('duckStatus').innerHTML =
