@@ -68,20 +68,29 @@ from nav_msgs.msg import Odometry
 # ---------------------------------------------------------------------------
 
 # Room origin = robot's start position, facing +x down one wall (confirmed
-# with vịt 2026-08-24). 0.3m margin from the actual walls so the robot
-# doesn't clip anything while hugging the perimeter.
+# with vịt 2026-08-24). Room extent -- x-axis is the direction the robot
+# initially faces (down one wall), y-axis the other. Confirmed with vịt
+# 2026-08-26 for this specific room: robot's +x direction runs along the
+# 1m wall.
+ROOM_WIDTH_M = 1.0    # x-axis extent
+ROOM_LENGTH_M = 2.23  # y-axis extent
+
+# Inset from the walls for the patrol path (physical clearance while
+# perimeter-hugging) -- same 0.3m used in the original 2x2m room. On this
+# room's 1m-wide axis that's still the same absolute 0.3m wall clearance
+# as before (just a visually narrower 0.4m gap between the two inset
+# lines) -- should still be safe based on that room's testing, but worth a
+# physical eyeball check before the real run given how tight this one is.
+WAYPOINT_INSET_M = 0.3
 WAYPOINTS = [
-    (0.3, 0.3),
-    (1.7, 0.3),
-    (1.7, 1.7),
-    (0.3, 1.7),
-    (0.3, 0.3),  # back to start -- also how we measure real loop drift
+    (WAYPOINT_INSET_M, WAYPOINT_INSET_M),
+    (ROOM_WIDTH_M - WAYPOINT_INSET_M, WAYPOINT_INSET_M),
+    (ROOM_WIDTH_M - WAYPOINT_INSET_M, ROOM_LENGTH_M - WAYPOINT_INSET_M),
+    (WAYPOINT_INSET_M, ROOM_LENGTH_M - WAYPOINT_INSET_M),
+    (WAYPOINT_INSET_M, WAYPOINT_INSET_M),  # back to start -- also how we measure real loop drift
 ]
 
-# Full room extent (NOT the inset patrol path) -- used only for grid reporting
-# and drawing the dashboard map. Easy to change later, just constants.
-ROOM_SIZE_M = 2.0
-GRID_CELL_M = 0.5  # -> 4x4 grid
+GRID_CELL_M = 0.5  # grid reporting resolution, same in both directions -> 2x4 grid here
 
 # How far the camera RIG (both cameras, rigidly mounted together) is
 # physically rotated relative to the chassis' forward direction (base_link
@@ -504,8 +513,8 @@ class SearchAndRescue(Node):
             return
 
         avg_x, avg_y = estimate['x'], estimate['y']
-        cell_x = max(0, min(int(ROOM_SIZE_M / GRID_CELL_M) - 1, int(avg_x // GRID_CELL_M)))
-        cell_y = max(0, min(int(ROOM_SIZE_M / GRID_CELL_M) - 1, int(avg_y // GRID_CELL_M)))
+        cell_x = max(0, min(int(ROOM_WIDTH_M / GRID_CELL_M) - 1, int(avg_x // GRID_CELL_M)))
+        cell_y = max(0, min(int(ROOM_LENGTH_M / GRID_CELL_M) - 1, int(avg_y // GRID_CELL_M)))
 
         self.get_logger().info(
             f"=== REPORT: {estimate['sightings']} sighting(s), "
@@ -543,7 +552,8 @@ class SearchAndRescue(Node):
                 'have_odom': node.have_odom,
                 'waypoint_idx': node.waypoint_idx,
                 'waypoints': WAYPOINTS,
-                'room_size': ROOM_SIZE_M,
+                'room_width': ROOM_WIDTH_M,
+                'room_length': ROOM_LENGTH_M,
                 'grid_cell': GRID_CELL_M,
                 'done': node.done,
                 'started': node.started,
@@ -713,7 +723,7 @@ HTML_PAGE = """<!doctype html>
     <div class="column">
       <div class="panel">
         <div class="panel-title">Room map</div>
-        <canvas id="map" width="440" height="440"></canvas>
+        <canvas id="map" width="150" height="335"></canvas>
         <div class="legend">
           solid box = room walls &middot; dashed box = patrol path &middot;
           <span style="color:#ff5b5b;">&#9679;</span> = current best duck estimate &middot;
@@ -754,19 +764,28 @@ HTML_PAGE = """<!doctype html>
 const canvas = document.getElementById('map');
 const ctx = canvas.getContext('2d');
 
+const PX_PER_M = 150;  // fixed scale, same on both axes -- keeps circles round
+                       // and distances visually comparable regardless of the
+                       // room's aspect ratio, unlike sizing to a fixed square.
+
 function draw(state) {
-  const room = state.room_size;
-  const scale = canvas.width / room;
-  const toScreen = (x, y) => [x * scale, canvas.height - y * scale];
+  // Canvas itself sized to the room's real proportions (setting width/height
+  // clears it, which is fine -- redrawn fully every call anyway). Works for
+  // any room shape without editing this page, not just square ones.
+  canvas.width = Math.round(state.room_width * PX_PER_M);
+  canvas.height = Math.round(state.room_length * PX_PER_M);
+  const toScreen = (x, y) => [x * PX_PER_M, canvas.height - y * PX_PER_M];
 
   ctx.clearRect(0, 0, canvas.width, canvas.height);
 
   // grid
   ctx.strokeStyle = '#232833';
   ctx.lineWidth = 1;
-  for (let g = 0; g <= room + 1e-6; g += state.grid_cell) {
+  for (let g = 0; g <= state.room_width + 1e-6; g += state.grid_cell) {
     let [gx, ] = toScreen(g, 0);
     ctx.beginPath(); ctx.moveTo(gx, 0); ctx.lineTo(gx, canvas.height); ctx.stroke();
+  }
+  for (let g = 0; g <= state.room_length + 1e-6; g += state.grid_cell) {
     let [, gy] = toScreen(0, g);
     ctx.beginPath(); ctx.moveTo(0, gy); ctx.lineTo(canvas.width, gy); ctx.stroke();
   }

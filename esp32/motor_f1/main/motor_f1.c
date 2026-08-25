@@ -210,7 +210,7 @@ static bool imu_read_raw(int16_t *ax, int16_t *ay, int16_t *az,
  * wheelbase (if right travels further than left, robot rotates toward the
  * left/slower side - matches the direction convention already confirmed
  * earlier today: faster right wheel -> drifts left). */
-#define WHEEL_DIAMETER_M 0.06f
+#define WHEEL_DIAMETER_M 0.067f
 #define WHEELBASE_M 0.10f
 #define PI_F 3.14159265f   /* not relying on M_PI - not guaranteed defined by every libc without _USE_MATH_DEFINES */
 #define WHEEL_CIRCUMFERENCE_M (PI_F * WHEEL_DIAMETER_M)
