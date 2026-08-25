@@ -20,13 +20,31 @@ Deliberately does NOT use Nav2, VSLAM, or the Isaac ROS stereo depth pipeline:
   container + rectified stereo launch just to get points, and produces a full
   dense point cloud we don't need. Instead, this does its OWN lightweight
   stereo just for the one object we care about: run detection on both
-  rectified camera frames, use the pixel shift (disparity) of the duck's box
-  between the two frames + the known 8.3cm camera separation to triangulate
+  cameras' frames, use the pixel shift (disparity) of the duck's box between
+  the two frames + the known 8.3cm camera separation to triangulate
   real-world distance. Needs only plain OpenCV + the existing calibration
   file -- no Isaac ROS / ROS image pipeline dependency. Replaces the earlier
   monocular distance-from-known-duck-height approach (kept as
   search_and_rescue_monocular_backup.py) which needed the duck's real height
   hardcoded -- this doesn't need to know the duck's size at all.
+
+- IMPORTANT (found 2026-08-25): detection runs on the RAW frame (rotation-
+  corrected only, NOT undistorted/rectified), not the rectified frame used
+  for display and stereo math. best.pt was trained exclusively on raw,
+  distorted single-camera frames (see jetson/dataset_collection/
+  record_video.py -- writes cap.read() straight to disk, no undistort).
+  Feeding it the fully undistorted+cropped rectified frame instead put it
+  outside its training distribution -- confirmed as the cause of a real
+  live-deploy accuracy collapse (worked great in first_test.py/monocular
+  testing, "totally trash" once this stereo rig's rectify-then-detect
+  pipeline went live). Fix: detect on the raw frame (matches training
+  exactly, zero accuracy risk), then map just the resulting box's corner
+  points into rectified pixel space via cv2.undistortPoints(..., R, P) --
+  the same per-camera R/P stereoRectify() already produces for the
+  map_left_x/y / map_right_x/y remap, just applied to points instead of the
+  whole image. That keeps disparity/distance math (which needs rectified,
+  epipolar-aligned coordinates) exact while detection itself never sees a
+  geometrically altered frame. See _detect_tick / _undistort_point.
 
 Physical setup this assumes (confirmed with vịt 2026-08-25): both cameras
 still exactly 8.3cm apart, same height as each other, rigidly mounted as one
@@ -270,6 +288,8 @@ class SearchAndRescue(Node):
 
         self.latest_frame_left = None       # for the dashboard video feed (rectified)
         self.latest_frame_right = None
+        self.latest_frame_left_raw = None   # rotation-corrected but NOT undistorted/rectified --
+        self.latest_frame_right_raw = None  # this is what YOLO actually sees, matching training data
         self.latest_detection_left = None   # {'x1','y1','x2','y2','conf','t'} for the overlay box
         self.latest_detection_right = None
         self.latest_stereo_reading = None   # {'distance_m','bearing_deg','disparity_px','t'} -- for
@@ -328,6 +348,15 @@ class SearchAndRescue(Node):
             K1, D1, R1, P1, size, cv2.CV_32FC1)
         self.map_right_x, self.map_right_y = cv2.initUndistortRectifyMap(
             K2, D2, R2, P2, size, cv2.CV_32FC1)
+
+        # Kept per-camera (not just the map_*_x/y pixel grids above) so
+        # _undistort_point can run the same undistort+rectify transform on a
+        # single detected box corner instead of a whole image -- see
+        # _detect_tick, which detects on the RAW frame and only needs the
+        # resulting box's coordinates in rectified space, not a rectified
+        # image to detect on.
+        self.K1, self.D1, self.R1, self.P1 = K1, D1, R1, P1
+        self.K2, self.D2, self.R2, self.P2 = K2, D2, R2, P2
 
         # After rectification both cameras share the same focal length by
         # construction -- P1[0,0] and P2[0,0] should match closely.
@@ -474,6 +503,12 @@ class SearchAndRescue(Node):
             # keep working unchanged, exactly as if the rig had never rolled.
             frame_l = cv2.rotate(frame_l, cv2.ROTATE_180)
             frame_r = cv2.rotate(frame_r, cv2.ROTATE_180)
+            # Keep this raw (rotation-corrected only) pair for detection --
+            # best.pt was trained on raw CSI frames, never on undistorted/
+            # rectified ones, so YOLO must see this, not the remap() output
+            # below. See _detect_tick / module docstring.
+            self.latest_frame_left_raw = frame_l
+            self.latest_frame_right_raw = frame_r
             self.latest_frame_left = cv2.remap(frame_l, self.map_left_x, self.map_left_y, cv2.INTER_LINEAR)
             self.latest_frame_right = cv2.remap(frame_r, self.map_right_x, self.map_right_y, cv2.INTER_LINEAR)
         elif self.vision_loop_count % 50 == 0:  # throttled -- don't spam if it keeps failing
@@ -482,8 +517,11 @@ class SearchAndRescue(Node):
             )
 
     def _best_box(self, frame):
-        """Run detection on one rectified frame, return the highest-confidence
-        box as (x1,y1,x2,y2,conf), or None if nothing above threshold."""
+        """Run detection on one RAW (rotation-corrected only, NOT undistorted/
+        rectified) frame -- matches what best.pt was trained on, see module
+        docstring. Returns the highest-confidence box as (x1,y1,x2,y2,conf)
+        in that same raw frame's pixel coordinates, or None if nothing above
+        threshold."""
         kwargs = {'imgsz': DETECT_IMGSZ} if DETECT_IMGSZ is not None else {}
         results = self.model(frame, conf=CONF_THRESHOLD, verbose=False, **kwargs)
         boxes = results[0].boxes
@@ -494,19 +532,32 @@ class SearchAndRescue(Node):
         conf = float(box.conf[0])
         return (x1, y1, x2, y2, conf)
 
+    def _undistort_point(self, x, y, K, D, R, P):
+        """Map one raw-frame pixel coordinate into rectified-frame pixel
+        coordinates -- the point-wise equivalent of the cv2.remap() applied
+        to whole frames via map_left_x/y / map_right_x/y (same K/D/R/P,
+        just via cv2.undistortPoints instead of a per-pixel grid). Lets
+        detection stay on the raw frame while stereo math (which needs
+        rectified, epipolar-aligned coordinates) still gets what it needs."""
+        import cv2
+        pt = np.array([[[x, y]]], dtype=np.float64)
+        out = cv2.undistortPoints(pt, K, D, R=R, P=P)
+        return float(out[0, 0, 0]), float(out[0, 0, 1])
+
     def _detect_tick(self):
-        frame_l = self.latest_frame_left
-        frame_r = self.latest_frame_right
-        if frame_l is None or frame_r is None:
+        # Detection runs on the RAW (rotation-corrected only) frames -- see
+        # module docstring / _best_box. Stereo math below needs rectified,
+        # epipolar-aligned coordinates, so each box's corners get mapped
+        # into rectified space via _undistort_point right after detection,
+        # once, rather than detecting on an already-rectified frame.
+        frame_l_raw = self.latest_frame_left_raw
+        frame_r_raw = self.latest_frame_right_raw
+        if frame_l_raw is None or frame_r_raw is None:
             return
 
-        box_l = self._best_box(frame_l)
+        box_l = self._best_box(frame_l_raw)
         self.latest_detection_left = None
         self.latest_detection_right = None
-        if box_l:
-            x1, y1, x2, y2, conf = box_l
-            self.latest_detection_left = {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2, 'conf': conf, 't': time.time()}
-
         if not box_l:
             # Nothing to pair even if the right camera happens to see
             # something -- skip that second, equally expensive YOLO call
@@ -518,18 +569,27 @@ class SearchAndRescue(Node):
             # (see below).
             return
 
-        box_r = self._best_box(frame_r)
+        x1, y1, x2, y2, conf = box_l
+        lx1, ly1 = self._undistort_point(x1, y1, self.K1, self.D1, self.R1, self.P1)
+        lx2, ly2 = self._undistort_point(x2, y2, self.K1, self.D1, self.R1, self.P1)
+        self.latest_detection_left = {'x1': lx1, 'y1': ly1, 'x2': lx2, 'y2': ly2, 'conf': conf, 't': time.time()}
+
+        box_r = self._best_box(frame_r_raw)
         if not box_r:
             # Duck only visible in the left camera -- per plan, don't guess.
             # Skip this sighting, wait for a tick where both agree.
             return
         x1, y1, x2, y2, conf = box_r
-        self.latest_detection_right = {'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2, 'conf': conf, 't': time.time()}
+        rx1, ry1 = self._undistort_point(x1, y1, self.K2, self.D2, self.R2, self.P2)
+        rx2, ry2 = self._undistort_point(x2, y2, self.K2, self.D2, self.R2, self.P2)
+        self.latest_detection_right = {'x1': rx1, 'y1': ry1, 'x2': rx2, 'y2': ry2, 'conf': conf, 't': time.time()}
 
-        x1_l, _, x2_l, _, _ = box_l
-        x1_r, _, x2_r, _, _ = box_r
-        center_x_l = (x1_l + x2_l) / 2.0
-        center_x_r = (x1_r + x2_r) / 2.0
+        # Both boxes are now in rectified pixel space (same space the
+        # fx_rect/cx_rect/baseline math below was already written for) --
+        # everything past this point is unchanged from before the raw-frame
+        # detection fix.
+        center_x_l = (lx1 + lx2) / 2.0
+        center_x_r = (rx1 + rx2) / 2.0
 
         disparity_px = center_x_l - center_x_r
         if disparity_px < STEREO_MIN_DISPARITY_PX:
