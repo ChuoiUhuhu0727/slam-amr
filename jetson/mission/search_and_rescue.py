@@ -116,16 +116,20 @@ CONTROL_PERIOD_S = 0.1   # 10 Hz control loop, navigation only -- camera grab +
 WEIGHTS_PATH = Path(__file__).resolve().parents[1] / "training/runs/detect/train-4/weights/best.pt"
 CALIB_PATH = Path(__file__).resolve().parents[2] / "stereo_calibration.npz"
 CONF_THRESHOLD = 0.3
-# Detection runs on the CPU on this Jetson (torch/CUDA driver mismatch --
-# separate, pre-existing issue, not fixed here). Shrinking the image the
-# model looks at (default would be the full 1280x720 frame) cuts CPU cost a
-# lot for not much accuracy loss -- the duck is a large, obvious shape, it
-# doesn't need full resolution to be found. Now running twice per detect
-# tick (once per camera) instead of once, so this matters more than before.
-DETECT_IMGSZ = 384  # dropped from 480 2026-08-26 -- measured 1.2Hz at 480 with
-                    # two cameras, still CPU-bound (see TARGET_DETECT_HZ log
-                    # line). If a far/small duck stops being detected reliably,
-                    # this is the first thing to raise back up.
+# Tried shrinking the image the model looks at (640 default -> 480 -> 384)
+# to cut CPU cost, since detection runs on CPU here (torch/CUDA driver
+# mismatch, separate pre-existing issue, not fixed). REVERTED 2026-08-26 --
+# vịt caught a real accuracy regression from this (a wildly oversized,
+# low-confidence box on the RIGHT camera -- the one already flagged as
+# harder to detect on due to its color-cast difference from the left
+# camera). Today's actual goal is validating distance ACCURACY, which
+# depends entirely on getting a correct box -- not worth trading that for
+# frame rate right now. DETECT_IMGSZ = None means "don't override, let
+# ultralytics use its own default," exactly matching yesterday's working
+# single-camera behavior. Revisit speed only after accuracy is confirmed
+# sound, as its own separate, deliberate trade-off -- not bundled in again
+# by accident.
+DETECT_IMGSZ = None
 
 # Caps the vision loop's rate -- NOTE this can only make it SLOWER (adds a
 # pause if a loop finishes early), it can't make YOLO itself faster than
@@ -391,9 +395,9 @@ class SearchAndRescue(Node):
     def _best_box(self, frame):
         """Run detection on one rectified frame, return the highest-confidence
         box as (x1,y1,x2,y2,conf), or None if nothing above threshold."""
-        results = self.model(frame, conf=CONF_THRESHOLD, imgsz=DETECT_IMGSZ, verbose=False)
+        kwargs = {'imgsz': DETECT_IMGSZ} if DETECT_IMGSZ is not None else {}
+        results = self.model(frame, conf=CONF_THRESHOLD, verbose=False, **kwargs)
         boxes = results[0].boxes
-      
         if boxes is None or len(boxes) == 0:
             return None
         box = boxes[boxes.conf.argmax()]
