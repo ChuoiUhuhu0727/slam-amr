@@ -52,6 +52,7 @@ Prerequisite: micro-ROS agent already connected (ESP32 publishing /odom,
 subscribed to /cmd_vel) -- this node doesn't manage that.
 """
 import argparse
+import json
 import math
 import threading
 import time
@@ -144,6 +145,36 @@ KP_HEADING = 1.5
 CONTROL_PERIOD_S = 0.1   # 10 Hz control loop, navigation only -- camera grab +
                          # detection run on their own thread (see _vision_loop),
                          # paced naturally by how long YOLO takes, not this timer.
+
+# PID tuning box (2026-08-27) -- the ESP32's Kp/Ki/max-integral-contribution
+# used to be #define constants, needing a reflash to change. They're now
+# live-tunable over a new /pid_gains topic (see motor_f1.c pid_gains_callback)
+# so vịt can iterate against the real robot from the dashboard. Persisted HERE
+# on the Jetson (not the ESP32's flash/NVS) -- simpler, and matches the actual
+# need: the ESP32 resets to these firmware defaults on every reboot, and this
+# node re-publishes the saved gains on PID_GAINS_REPUBLISH_PERIOD_S so an
+# ESP32 reboot/reconnect gets corrected back within a couple seconds without
+# needing a manual click every time.
+PID_GAINS_PATH = Path(__file__).resolve().parent / "pid_gains.json"
+PID_GAINS_REPUBLISH_PERIOD_S = 2.0
+# Must match motor_f1.c's g_kp/g_ki/g_max_i_contribution defaults -- these are
+# only the fallback used before any dashboard save has ever happened (or if
+# pid_gains.json is missing/corrupt).
+DEFAULT_PID_GAINS = {'kp': 3.0, 'ki': 0.2, 'max_i': 40.0}
+
+
+def load_pid_gains():
+    try:
+        with open(PID_GAINS_PATH) as f:
+            data = json.load(f)
+        return {'kp': float(data['kp']), 'ki': float(data['ki']), 'max_i': float(data['max_i'])}
+    except (FileNotFoundError, KeyError, ValueError, TypeError, json.JSONDecodeError):
+        return dict(DEFAULT_PID_GAINS)
+
+
+def save_pid_gains(gains):
+    with open(PID_GAINS_PATH, 'w') as f:
+        json.dump(gains, f)
 
 WEIGHTS_PATH = Path(__file__).resolve().parents[1] / "training/runs/detect/train-4/weights/best.pt"
 CALIB_PATH = Path(__file__).resolve().parents[2] / "stereo_calibration.npz"
@@ -246,9 +277,15 @@ class SearchAndRescue(Node):
                                              # ruler accuracy check without reading terminal logs
 
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
+        self.pid_pub = self.create_publisher(String, '/pid_gains', 10)
         self.create_subscription(Odometry, '/odom', self.on_odom, 10)
         self.create_subscription(String, '/esp32_diag', self.on_diag, 10)
         self.control_timer = self.create_timer(CONTROL_PERIOD_S, self.control_tick)
+
+        self.pid_gains = load_pid_gains()
+        self._publish_pid_gains()  # push once immediately at boot, in case the
+                                    # ESP32 is already connected and waiting
+        self.create_timer(PID_GAINS_REPUBLISH_PERIOD_S, self._publish_pid_gains)
 
         if not nav_only:
             self._init_vision()
@@ -360,6 +397,19 @@ class SearchAndRescue(Node):
 
     def on_diag(self, msg: String):
         self.esp32_diag = msg.data
+
+    # -- PID tuning -----------------------------------------------------------
+
+    def _publish_pid_gains(self):
+        msg = String()
+        g = self.pid_gains
+        msg.data = f"KP={g['kp']:.4f},KI={g['ki']:.4f},MAXI={g['max_i']:.4f}"
+        self.pid_pub.publish(msg)
+
+    def set_pid_gains(self, kp: float, ki: float, max_i: float):
+        self.pid_gains = {'kp': kp, 'ki': ki, 'max_i': max_i}
+        save_pid_gains(self.pid_gains)
+        self._publish_pid_gains()
 
     # -- main loop ------------------------------------------------------------
 
@@ -560,7 +610,7 @@ class SearchAndRescue(Node):
 
     def _start_web_server(self):
         import logging
-        from flask import Flask, Response, jsonify
+        from flask import Flask, Response, jsonify, request
 
         # Flask's dev server logs every single request by default (including
         # the dashboard's own /state poll every 400ms) -- floods the terminal
@@ -594,7 +644,21 @@ class SearchAndRescue(Node):
                 'report': node.report,
                 'has_camera': not node.nav_only,
                 'target_waypoint': WAYPOINTS[node.waypoint_idx] if node.waypoint_idx < len(WAYPOINTS) else None,
+                'pid_gains': node.pid_gains,
             })
+
+        @app.route('/pid_gains', methods=['POST'])
+        def post_pid_gains():
+            try:
+                data = request.get_json(force=True)
+                kp = float(data['kp'])
+                ki = float(data['ki'])
+                max_i = float(data['max_i'])
+            except (TypeError, ValueError, KeyError):
+                return jsonify({'ok': False, 'error': 'expected JSON {kp, ki, max_i} as numbers'}), 400
+            node.set_pid_gains(kp, ki, max_i)
+            node.get_logger().info(f"PID gains updated via dashboard: Kp={kp} Ki={ki} MaxI={max_i}")
+            return jsonify({'ok': True, 'pid_gains': node.pid_gains})
 
         @app.route('/video_feed_left')
         def video_feed_left():
@@ -741,6 +805,13 @@ HTML_PAGE = """<!doctype html>
   #stopBtn { background: #5a1c1c; color: #ffb3b3; }
   #stopBtn:disabled { background: #23282f; color: #555; cursor: not-allowed; }
   #resetBtn { background: #2a2f3a; color: #c8ccd4; }
+  .pid-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
+  .pid-row label { font-size: 0.72rem; color: #8a94a6; display: flex; flex-direction: column; gap: 4px; }
+  .pid-row input {
+    background: #0e1116; color: #e6e6e6; border: 1px solid #2a2f3a; border-radius: 6px;
+    padding: 6px 8px; font-size: 0.9rem; width: 80px;
+  }
+  #pidPushBtn { background: #1c3a4d; color: #9fd3ff; padding: 8px 16px; }
 </style>
 </head>
 <body>
@@ -770,6 +841,18 @@ HTML_PAGE = """<!doctype html>
       <div class="panel">
         <div class="panel-title">ESP32 diagnostics (PID / encoder)</div>
         <div class="status-line" id="diagStatus" style="font-size:0.78rem;">connecting...</div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">PID tuning (saved on this Jetson, pushed to ESP32 live)</div>
+        <div class="pid-row">
+          <label>Kp <input id="pidKp" type="number" step="0.1"></label>
+          <label>Ki <input id="pidKi" type="number" step="0.05"></label>
+          <label>Max I contribution <input id="pidMaxI" type="number" step="5"></label>
+          <button id="pidPushBtn" onclick="pushPidGains()">Push to robot</button>
+        </div>
+        <div class="legend" id="pidStatus">
+          re-pushed automatically every 2s, so an ESP32 reboot picks the saved values back up on its own
+        </div>
       </div>
     </div>
     <div class="column">
@@ -897,6 +980,31 @@ function sendCmd(path) {
   fetch(path, { method: 'POST' }).catch(() => {});
 }
 
+let pidFieldsInitialized = false;  // only fill the inputs once from the server --
+                                    // otherwise the 400ms poll would overwrite
+                                    // whatever vịt is mid-typing
+
+function pushPidGains() {
+  const kp = parseFloat(document.getElementById('pidKp').value);
+  const ki = parseFloat(document.getElementById('pidKi').value);
+  const max_i = parseFloat(document.getElementById('pidMaxI').value);
+  if (!isFinite(kp) || !isFinite(ki) || !isFinite(max_i)) {
+    document.getElementById('pidStatus').innerText = 'enter valid numbers in all three fields first';
+    return;
+  }
+  fetch('/pid_gains', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ kp, ki, max_i }),
+  }).then(r => r.json()).then(res => {
+    document.getElementById('pidStatus').innerText = res.ok
+      ? `saved + pushed at ${new Date().toLocaleTimeString()} -- watch the diag panel above for KP/KI/MAXI to confirm the ESP32 picked it up`
+      : (res.error || 'push failed');
+  }).catch(() => {
+    document.getElementById('pidStatus').innerText = 'push failed (dashboard unreachable?)';
+  });
+}
+
 function poll() {
   fetch('/state').then(r => r.json()).then(state => {
     draw(state);
@@ -917,6 +1025,13 @@ function poll() {
 
     document.getElementById('diagStatus').innerText =
       state.esp32_diag || '(nothing received yet from /esp32_diag)';
+
+    if (!pidFieldsInitialized && state.pid_gains) {
+      document.getElementById('pidKp').value = state.pid_gains.kp;
+      document.getElementById('pidKi').value = state.pid_gains.ki;
+      document.getElementById('pidMaxI').value = state.pid_gains.max_i;
+      pidFieldsInitialized = true;
+    }
 
     const stereoFresh = state.latest_stereo && (Date.now() / 1000 - state.latest_stereo.t) < 2.0;
     document.getElementById('duckStatus').innerHTML =

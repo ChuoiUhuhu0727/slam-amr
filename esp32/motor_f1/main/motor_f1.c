@@ -32,6 +32,7 @@
 
 #include <math.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <string.h>
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
@@ -161,28 +162,24 @@ static bool imu_read_raw(int16_t *ax, int16_t *ay, int16_t *az,
  * instead (see the F5 section below). Kept using it through F1-F4 was the
  * right call (needed *some* number to validate the control loop before the
  * real command source existed) - it's just no longer the source of truth. */
-#define KP 3.0f            /* start small, increase until oscillation appears, back off */
-
-/* Added 2026-07-27: P-only data showed the right wheel settling ~15 RPM
- * below TARGET_RPM consistently (30-60 RPM band, target 60) - a textbook
- * P-only steady-state error, not noise (resolution is now 15 RPM/step,
- * fine enough to trust this as real). KI=0.2 is a conservative starting
- * guess, same "start small" approach as KP.
- * Kd deliberately NOT added: RPM is still a coarse step signal (15 RPM/step
- * @ 5Hz) - differentiating a stair-step amplifies jitter into PWM swings
- * ("derivative kick") rather than smoothing anything. PI is the standard
- * choice for velocity/RPM loops anyway; Kd matters more for position
- * control. Revisit only if PI alone proves insufficient. */
-#define KI 0.2f
-
-/* Anti-windup: without this, the integral term grows unbounded whenever
- * output is pinned at MIN/MAX_SAFE_PWM - exactly what happened during
- * today's left-wheel stall (PWM=100, RPM=0, for 10+ seconds straight).
- * An unclamped integral would have kept accumulating that whole time, then
- * caused a huge overshoot the moment the wheel freed up. Caps the integral
- * term's own contribution to output, independent of Kp's contribution. */
-#define MAX_I_CONTRIBUTION 40.0f
-#define MAX_INTEGRAL (MAX_I_CONTRIBUTION / KI)
+/* Kp/Ki/max-integral-contribution converted from #define to live-tunable
+ * globals 2026-08-27: raising the mission's speed caps exposed a real
+ * steady-state PID weakness (PWM plateauing ~100-130 under real load,
+ * never reaching the wheels' true target RPM) - the fixed MAX_I_CONTRIBUTION
+ * below was too small to let the integral term close a persistent error on
+ * this heavier-than-bench-tested robot. Rather than guess a new fixed
+ * number blind and reflash repeatedly, these are now pushed live from the
+ * dashboard over /pid_gains (see pid_gains_callback below and the
+ * dashboard's PID box in search_and_rescue.py) so they can be tuned against
+ * the real load in real time. Defaults are just the starting point - not
+ * meant to be the final tuned values anymore. */
+static volatile float g_kp = 3.0f;             /* start small, increase until oscillation appears, back off */
+static volatile float g_ki = 0.2f;
+/* Anti-windup: without SOME limit, integral grows unbounded whenever output
+ * is pinned at MIN/MAX_SAFE_PWM (e.g. a stalled wheel), causing a huge
+ * overshoot once it frees up. Was a fixed 40.0f contribution cap - too
+ * tight for real load, hence live-tunable now too. */
+static volatile float g_max_i_contribution = 40.0f;
 
 /* Wheel sync: per-wheel PID keeps each wheel near TARGET_RPM independently,
  * but confirmed live (2026-07-27) that's not enough - robot pulls right,
@@ -410,12 +407,13 @@ static uint32_t pid_step(float target_rpm, float actual_rpm, float *integral) {
 
     float error = target_rpm - actual_rpm;
     float dt = CONTROL_PERIOD_MS / 1000.0f;
+    float max_integral = g_max_i_contribution / g_ki;   /* live-tunable now, see g_kp/g_ki/g_max_i_contribution above */
 
     *integral += error * dt;
-    if (*integral > MAX_INTEGRAL)  *integral = MAX_INTEGRAL;   /* anti-windup clamp, see MAX_INTEGRAL comment */
-    if (*integral < -MAX_INTEGRAL) *integral = -MAX_INTEGRAL;
+    if (*integral > max_integral)  *integral = max_integral;   /* anti-windup clamp */
+    if (*integral < -max_integral) *integral = -max_integral;
 
-    float u = KP * error + KI * (*integral);
+    float u = g_kp * error + g_ki * (*integral);
 
     if (u < MIN_SAFE_PWM)   u = MIN_SAFE_PWM;   /* clamp: floor keeps current draw above the powerbank's auto-shutoff threshold */
     if (u > MAX_SAFE_PWM)   u = MAX_SAFE_PWM;   /* clamp: temporary current-safety ceiling, not the LEDC max */
@@ -423,20 +421,18 @@ static uint32_t pid_step(float target_rpm, float actual_rpm, float *integral) {
     return (uint32_t)u;
 }
 
-/* Caps how much the applied PWM can change in one cycle, regardless of how
- * big a jump pid_step() wants. This limits di/dt on the shared power rail —
- * a sudden PWM jump stresses a marginal supply harder than the same
- * steady-state current reached gradually. Does not replace the VM rewire;
- * it reduces (not eliminates) brownout risk while that's still pending. */
-#define MAX_PWM_STEP_PER_CYCLE 10.0f
-
-static float slew_limit(float applied, float target) {
-    if (target > applied + MAX_PWM_STEP_PER_CYCLE) return applied + MAX_PWM_STEP_PER_CYCLE;
-    if (target < applied - MAX_PWM_STEP_PER_CYCLE) return applied - MAX_PWM_STEP_PER_CYCLE;
-    return target;
-}
-
-/* Encoder read + PID + PWM write, all in ONE task/cycle — replaces the old
+/* Slew limiter (capped PWM change per cycle) REMOVED 2026-08-27 at vịt's
+ * explicit request ("no annoying motor power or rotation speed cap") - it
+ * existed to limit di/dt on a marginal power rail, but VM has had its own
+ * dedicated powerbank wire since 2026-07-24 (see MAX_SAFE_PWM comment
+ * above), which was the actual fix for that brownout risk; this was only
+ * ever a secondary mitigation on top of it. Real trade-off being accepted:
+ * PID output can now jump PWM instantly cycle-to-cycle instead of ramping,
+ * which is a small step back toward the original brownout risk if VM's
+ * wiring is ever disturbed - worth remembering if brownouts/resets reappear
+ * in g_reset_reason/esp32_diag.
+ *
+ * Encoder read + PID + PWM write, all in ONE task/cycle — replaces the old
  * separate encoder_task (1 Hz) + pid_task (100 Hz). That split meant PID
  * recomputed 100x/sec against an RPM value that was up to 1 full second
  * stale. Running both halves in the same 20 Hz loop means PID always acts
@@ -589,8 +585,8 @@ static void control_task(void *arg) {
         float target_pwm_left  = (float)pid_step(fabsf(signed_target_left),  rpm_left_shared,  &integral_left);
         float target_pwm_right = (float)pid_step(fabsf(signed_target_right), rpm_right_shared, &integral_right);
 
-        applied_pwm_left  = slew_limit(applied_pwm_left,  target_pwm_left);
-        applied_pwm_right = slew_limit(applied_pwm_right, target_pwm_right);
+        applied_pwm_left  = target_pwm_left;
+        applied_pwm_right = target_pwm_right;
         pwm_left_shared  = applied_pwm_left;
         pwm_right_shared = applied_pwm_right;
 
@@ -690,6 +686,24 @@ static void cmd_vel_callback(const void *msgin) {
     last_cmd_vel_us = esp_timer_get_time();
 }
 
+/* Live PID gain updates (2026-08-27) - the dashboard publishes a plain text
+ * command instead of a std_msgs/Float32MultiArray on purpose: this project's
+ * micro-ROS build only has bounded-string sequences proven working (see
+ * diag_msg/imu_msg), and a dynamic-array message type would need new
+ * colcon.meta bounds + a full library rebuild to add mid-session - real risk
+ * for zero benefit over just parsing three numbers out of a string. Malformed
+ * text (wrong field count, e.g. a stale/partial message) is silently ignored
+ * - gains only change on an unambiguous full match, never partially. */
+static void pid_gains_callback(const void *msgin) {
+    const std_msgs__msg__String *msg = (const std_msgs__msg__String *)msgin;
+    float kp, ki, max_i;
+    if (sscanf(msg->data.data, "KP=%f,KI=%f,MAXI=%f", &kp, &ki, &max_i) == 3) {
+        g_kp = kp;
+        g_ki = ki;
+        g_max_i_contribution = max_i;
+    }
+}
+
 /* F5: connects to the micro-ROS agent, subscribes /cmd_vel, publishes /odom.
  * Structured the same way as the proven esp32/microros_hello.c pattern
  * (Week 1) - outer loop pings the agent and (re)creates everything on
@@ -709,15 +723,20 @@ static void uros_task(void *arg) {
         rclc_support_t support;
         rcl_node_t node;
         rcl_subscription_t cmd_vel_sub;
+        rcl_subscription_t pid_gains_sub;
         rcl_publisher_t odom_pub;
         rcl_publisher_t diag_pub;
         rcl_publisher_t imu_pub;
         rclc_executor_t executor;
         geometry_msgs__msg__Twist cmd_vel_msg;
+        std_msgs__msg__String pid_gains_msg = {0};
         nav_msgs__msg__Odometry odom_msg = {0};
         std_msgs__msg__String diag_msg = {0};
         std_msgs__msg__String imu_msg = {0};
-        char diag_text[96];
+        char pid_gains_text[64];
+        char diag_text[160];   /* grown from 96/112 -- KP/KI/MAXI fields plus the existing
+                                 * RPM/PWM/I2C/WAKE fields plus g_i2c_scan_result's own 40-char
+                                 * worst case can exceed 112 */
         char imu_text[80];
 
         if (rclc_support_init(&support, 0, NULL, &allocator) != RCL_RET_OK) {
@@ -733,8 +752,16 @@ static void uros_task(void *arg) {
             rclc_support_fini(&support);
             vTaskDelay(pdMS_TO_TICKS(1000)); continue;
         }
+        if (rclc_subscription_init_default(&pid_gains_sub, &node,
+                ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String), "pid_gains") != RCL_RET_OK) {
+            if (rcl_subscription_fini(&cmd_vel_sub, &node) != RCL_RET_OK) {}
+            if (rcl_node_fini(&node) != RCL_RET_OK) {}
+            rclc_support_fini(&support);
+            vTaskDelay(pdMS_TO_TICKS(1000)); continue;
+        }
         if (rclc_publisher_init_default(&odom_pub, &node,
                 ROSIDL_GET_MSG_TYPE_SUPPORT(nav_msgs, msg, Odometry), "odom") != RCL_RET_OK) {
+            if (rcl_subscription_fini(&pid_gains_sub, &node) != RCL_RET_OK) {}
             if (rcl_subscription_fini(&cmd_vel_sub, &node) != RCL_RET_OK) {}
             if (rcl_node_fini(&node) != RCL_RET_OK) {}
             rclc_support_fini(&support);
@@ -743,6 +770,7 @@ static void uros_task(void *arg) {
         if (rclc_publisher_init_default(&diag_pub, &node,
                 ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String), "esp32_diag") != RCL_RET_OK) {
             if (rcl_publisher_fini(&odom_pub, &node) != RCL_RET_OK) {}
+            if (rcl_subscription_fini(&pid_gains_sub, &node) != RCL_RET_OK) {}
             if (rcl_subscription_fini(&cmd_vel_sub, &node) != RCL_RET_OK) {}
             if (rcl_node_fini(&node) != RCL_RET_OK) {}
             rclc_support_fini(&support);
@@ -752,6 +780,7 @@ static void uros_task(void *arg) {
                 ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, String), "imu_raw") != RCL_RET_OK) {
             if (rcl_publisher_fini(&diag_pub, &node) != RCL_RET_OK) {}
             if (rcl_publisher_fini(&odom_pub, &node) != RCL_RET_OK) {}
+            if (rcl_subscription_fini(&pid_gains_sub, &node) != RCL_RET_OK) {}
             if (rcl_subscription_fini(&cmd_vel_sub, &node) != RCL_RET_OK) {}
             if (rcl_node_fini(&node) != RCL_RET_OK) {}
             rclc_support_fini(&support);
@@ -759,18 +788,23 @@ static void uros_task(void *arg) {
         }
 
         rclc_executor_t *exec = &executor;
-        rclc_executor_init(exec, &support.context, 1, &allocator);
+        rclc_executor_init(exec, &support.context, 2, &allocator);
         rclc_executor_add_subscription(exec, &cmd_vel_sub, &cmd_vel_msg, &cmd_vel_callback, ON_NEW_DATA);
+        rclc_executor_add_subscription(exec, &pid_gains_sub, &pid_gains_msg, &pid_gains_callback, ON_NEW_DATA);
 
         /* diag_text's CONTENT is now rebuilt every publish cycle (see the
          * publish block below) so /esp32_diag carries live per-wheel
          * RPM/PWM, not just the reset reason from connection time. The
          * buffer pointer/capacity themselves don't change per-message, so
-         * only need to be set once here. */
+         * only need to be set once here. pid_gains_msg's buffer likewise -
+         * micro-ROS writes each incoming message into this same buffer, it's
+         * not allocated fresh per-message. */
         diag_msg.data.data = diag_text;
         diag_msg.data.capacity = sizeof(diag_text);
         imu_msg.data.data = imu_text;
         imu_msg.data.capacity = sizeof(imu_text);
+        pid_gains_msg.data.data = pid_gains_text;
+        pid_gains_msg.data.capacity = sizeof(pid_gains_text);
 
         /* Set once - frame_id strings don't change per-message, only the
          * numeric fields below do. */
@@ -815,10 +849,11 @@ static void uros_task(void *arg) {
                  * idf.py monitor is unusable once this transport owns
                  * UART0 (see note above cmd_vel_callback). */
                 snprintf(diag_text, sizeof(diag_text),
-                         "reset=%s RPM L=%.1f R=%.1f PWM L=%.0f R=%.0f I2C=%s WAKE=%d",
+                         "reset=%s RPM L=%.1f R=%.1f PWM L=%.0f R=%.0f KP=%.2f KI=%.2f MAXI=%.1f I2C=%s WAKE=%d",
                          reset_reason_str(g_reset_reason),
                          rpm_left_shared, rpm_right_shared,
                          pwm_left_shared, pwm_right_shared,
+                         g_kp, g_ki, g_max_i_contribution,
                          g_i2c_scan_result, g_imu_wake_attempts);
                 diag_msg.data.size = strlen(diag_text);
 
@@ -872,6 +907,7 @@ static void uros_task(void *arg) {
         if (rcl_publisher_fini(&imu_pub, &node) != RCL_RET_OK) {}
         if (rcl_publisher_fini(&diag_pub, &node) != RCL_RET_OK) {}
         if (rcl_publisher_fini(&odom_pub, &node) != RCL_RET_OK) {}
+        if (rcl_subscription_fini(&pid_gains_sub, &node) != RCL_RET_OK) {}
         if (rcl_subscription_fini(&cmd_vel_sub, &node) != RCL_RET_OK) {}
         if (rclc_executor_fini(exec) != RCL_RET_OK) {}
         if (rcl_node_fini(&node) != RCL_RET_OK) {}
