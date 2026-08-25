@@ -563,8 +563,31 @@ static void control_task(void *arg) {
         if (sync_trim > MAX_SYNC_TRIM)  sync_trim = MAX_SYNC_TRIM;
         if (sync_trim < -MAX_SYNC_TRIM) sync_trim = -MAX_SYNC_TRIM;
 
-        float target_pwm_left  = (float)pid_step(target_rpm_left  - sync_trim, rpm_left_shared,  &integral_left);
-        float target_pwm_right = (float)pid_step(target_rpm_right + sync_trim, rpm_right_shared, &integral_right);
+        float signed_target_left  = target_rpm_left  - sync_trim;
+        float signed_target_right = target_rpm_right + sync_trim;
+
+        /* Direction pins, set every cycle from this cycle's target sign.
+         * BUG FIXED 2026-08-26: these were only ever set ONCE at boot (see
+         * app_main), always to forward, and never updated here. PID/PWM
+         * only ever computes a MAGNITUDE (the single-channel encoders can't
+         * report direction either, so actual_rpm is always >=0 too) -
+         * direction is a separate concern that has to be set explicitly.
+         * Any command needing a wheel to reverse (e.g. an in-place turn,
+         * where the inner wheel's target goes negative) was silently
+         * clamped to PWM=0 by pid_step's MIN_SAFE_PWM floor instead of
+         * actually reversing - that wheel was completely dead the whole
+         * time, which is why in-place turns couldn't move the (heavy)
+         * robot even with PWM ramping up on the other wheel: it was trying
+         * to drag the whole chassis around a single stationary wheel using
+         * only one motor. AIN1=0/AIN2=1 (BIN1=0/BIN2=1) = forward, per the
+         * flipped convention set in app_main - reverse is the opposite pair. */
+        gpio_set_level(AIN1_PIN, signed_target_left  < 0.0f ? 1 : 0);
+        gpio_set_level(AIN2_PIN, signed_target_left  < 0.0f ? 0 : 1);
+        gpio_set_level(BIN1_PIN, signed_target_right < 0.0f ? 1 : 0);
+        gpio_set_level(BIN2_PIN, signed_target_right < 0.0f ? 0 : 1);
+
+        float target_pwm_left  = (float)pid_step(fabsf(signed_target_left),  rpm_left_shared,  &integral_left);
+        float target_pwm_right = (float)pid_step(fabsf(signed_target_right), rpm_right_shared, &integral_right);
 
         applied_pwm_left  = slew_limit(applied_pwm_left,  target_pwm_left);
         applied_pwm_right = slew_limit(applied_pwm_right, target_pwm_right);
@@ -1062,10 +1085,11 @@ void app_main(void) {
     setup_pwm();
     setup_imu();
 
-    /* Direction pins are wired for forward, but F5 now drives actual speed
-     * (including reverse/turn) through /cmd_vel via control_task - these
-     * just set the electrical default; PWM=0 from a stale/absent /cmd_vel
-     * (the safety default) means the motors don't move regardless.
+    /* Sets the electrical default (forward) before control_task starts
+     * updating these live every cycle from the actual commanded direction
+     * (see the signed_target_left/right block in control_task, fixed
+     * 2026-08-26). PWM=0 from a stale/absent /cmd_vel (the safety default)
+     * means the motors don't move regardless of what these say.
      *
      * FLIPPED 2026-08-11 (was AIN1=1,AIN2=0 / BIN1=1,BIN2=0): the front/back
      * half of the forward-direction redefinition — see the AIN1_PIN #define
