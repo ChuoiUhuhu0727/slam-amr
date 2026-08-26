@@ -244,6 +244,20 @@ static volatile float g_max_i_contribution = 40.0f;
 static volatile float g_kheading = 15.0f;   /* RPM of trim per rad/s of heading-rate error - live-tunable, see pid_gains_callback */
 #define MAX_HEADING_TRIM_RPM 20.0f          /* clamp: don't let heading correction alone dominate the base speed target */
 
+/* Manual per-wheel PWM trim (2026-08-28) - a flat PWM offset added on top of
+ * everything the PID/heading loops already decided, for compensating a
+ * mechanically weaker motor (different friction/torque between the two
+ * physical motors - not something a speed PID or heading PID is meant to
+ * fix, since it's a per-wheel hardware asymmetry, not an error signal).
+ * Live-tunable via the same /pid_gains mechanism as Kp/Ki/etc (see
+ * pid_gains_callback) - deliberately NOT touched by pid_step's target==0
+ * safety bypass (see the avg_target_rpm > 0.01f gate at its application
+ * site below): a commanded stop must still mean PWM=0, trim included -
+ * otherwise a stale/lost /cmd_vel would leave one wheel creeping instead of
+ * actually stopping, defeating the whole point of that safety bypass. */
+static volatile float g_trim_left = 0.0f;
+static volatile float g_trim_right = 0.0f;
+
 /* --- F4: odometry (measured 2026-07-27: wheelbase 10cm; wheel diameter
  * re-measured 2026-08-26 as 6.7cm, corrected from the original 6cm) ---
  * distance per pulse = wheel circumference / slots per rev - converts a raw
@@ -718,6 +732,21 @@ static void control_task(void *arg) {
         float right_ratio = (avg_target_rpm > 0.01f) ? (fabsf(signed_target_right) / avg_target_rpm) : 1.0f;
         float target_pwm_left  = base_pwm * left_ratio;
         float target_pwm_right = base_pwm * right_ratio;
+
+        /* Manual trim, added last - only while actually commanded to move
+         * (same avg_target_rpm > 0.01f condition as the ratio split above),
+         * so a commanded/watchdog stop still means true PWM=0 on both
+         * wheels, trim included. Clamped both ends now (not just the top) -
+         * trim didn't exist when the original MAX_SAFE_PWM-only clamp was
+         * written, and a negative trim could otherwise push this below 0
+         * before the uint32_t cast a few lines down, wrapping into a huge
+         * PWM value instead of a small negative one. */
+        if (avg_target_rpm > 0.01f) {
+            target_pwm_left  += g_trim_left;
+            target_pwm_right += g_trim_right;
+        }
+        if (target_pwm_left  < 0.0f) target_pwm_left  = 0.0f;
+        if (target_pwm_right < 0.0f) target_pwm_right = 0.0f;
         if (target_pwm_left  > MAX_SAFE_PWM) target_pwm_left  = MAX_SAFE_PWM;
         if (target_pwm_right > MAX_SAFE_PWM) target_pwm_right = MAX_SAFE_PWM;
 
@@ -832,12 +861,15 @@ static void cmd_vel_callback(const void *msgin) {
  * - gains only change on an unambiguous full match, never partially. */
 static void pid_gains_callback(const void *msgin) {
     const std_msgs__msg__String *msg = (const std_msgs__msg__String *)msgin;
-    float kp, ki, max_i, khead;
-    if (sscanf(msg->data.data, "KP=%f,KI=%f,MAXI=%f,KHEAD=%f", &kp, &ki, &max_i, &khead) == 4) {
+    float kp, ki, max_i, khead, trim_l, trim_r;
+    if (sscanf(msg->data.data, "KP=%f,KI=%f,MAXI=%f,KHEAD=%f,TRIML=%f,TRIMR=%f",
+               &kp, &ki, &max_i, &khead, &trim_l, &trim_r) == 6) {
         g_kp = kp;
         g_ki = ki;
         g_max_i_contribution = max_i;
         g_kheading = khead;
+        g_trim_left = trim_l;
+        g_trim_right = trim_r;
     }
 }
 
@@ -871,9 +903,9 @@ static void uros_task(void *arg) {
         std_msgs__msg__String diag_msg = {0};
         std_msgs__msg__String imu_msg = {0};
         char pid_gains_text[64];
-        char diag_text[280];   /* grown from 96/112/160/200 -- added raw MX/MY/MZ + MAGHDG fields
-                                 * plus the existing RPM/PWM/KP/KI/MAXI/KHEAD/I2C/WAKE/GZ/MAG
-                                 * fields plus g_i2c_scan_result's own 40-char worst case can
+        char diag_text[320];   /* grown from 96/112/160/200/280 -- added TRIML/TRIMR fields plus
+                                 * the existing RPM/PWM/KP/KI/MAXI/KHEAD/I2C/WAKE/GZ/MAG/MX/MY/MZ/
+                                 * MAGHDG fields plus g_i2c_scan_result's own 40-char worst case can
                                  * exceed 200 */
         char imu_text[80];
 
@@ -1067,11 +1099,11 @@ static void uros_task(void *arg) {
                  * drive motors' permanent magnets - or a wrong axis in the
                  * atan2f call swamping the real signal). */
                 snprintf(diag_text, sizeof(diag_text),
-                         "reset=%s RPM L=%.1f R=%.1f PWM L=%.0f R=%.0f KP=%.2f KI=%.2f MAXI=%.1f KHEAD=%.1f I2C=%s WAKE=%d GZ=%s GZBIAS=%.1f MAG=%s MX=%d MY=%d MZ=%d MAGHDG=%.1f",
+                         "reset=%s RPM L=%.1f R=%.1f PWM L=%.0f R=%.0f KP=%.2f KI=%.2f MAXI=%.1f KHEAD=%.1f TRIML=%.1f TRIMR=%.1f I2C=%s WAKE=%d GZ=%s GZBIAS=%.1f MAG=%s MX=%d MY=%d MZ=%d MAGHDG=%.1f",
                          reset_reason_str(g_reset_reason),
                          rpm_left_shared, rpm_right_shared,
                          pwm_left_shared, pwm_right_shared,
-                         g_kp, g_ki, g_max_i_contribution, g_kheading,
+                         g_kp, g_ki, g_max_i_contribution, g_kheading, g_trim_left, g_trim_right,
                          g_i2c_scan_result, g_imu_wake_attempts,
                          imu_gz_valid_shared ? "ok" : "no-read",
                          g_gyro_z_bias_raw / 131.0f,   /* raw LSB -> deg/s, human-readable */
