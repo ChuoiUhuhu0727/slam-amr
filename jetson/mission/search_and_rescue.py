@@ -175,17 +175,20 @@ CONTROL_PERIOD_S = 0.1   # 10 Hz control loop, navigation only -- camera grab +
 # needing a manual click every time.
 PID_GAINS_PATH = Path(__file__).resolve().parent / "pid_gains.json"
 PID_GAINS_REPUBLISH_PERIOD_S = 2.0
-# Must match motor_f1.c's g_kp/g_ki/g_max_i_contribution defaults -- these are
-# only the fallback used before any dashboard save has ever happened (or if
-# pid_gains.json is missing/corrupt).
-DEFAULT_PID_GAINS = {'kp': 3.0, 'ki': 0.2, 'max_i': 40.0}
+# Must match motor_f1.c's g_kp/g_ki/g_max_i_contribution/g_kheading defaults --
+# these are only the fallback used before any dashboard save has ever happened
+# (or if pid_gains.json is missing/corrupt).
+DEFAULT_PID_GAINS = {'kp': 3.0, 'ki': 0.2, 'max_i': 40.0, 'khead': 15.0}
 
 
 def load_pid_gains():
     try:
         with open(PID_GAINS_PATH) as f:
             data = json.load(f)
-        return {'kp': float(data['kp']), 'ki': float(data['ki']), 'max_i': float(data['max_i'])}
+        return {
+            'kp': float(data['kp']), 'ki': float(data['ki']),
+            'max_i': float(data['max_i']), 'khead': float(data['khead']),
+        }
     except (FileNotFoundError, KeyError, ValueError, TypeError, json.JSONDecodeError):
         return dict(DEFAULT_PID_GAINS)
 
@@ -432,11 +435,11 @@ class SearchAndRescue(Node):
     def _publish_pid_gains(self):
         msg = String()
         g = self.pid_gains
-        msg.data = f"KP={g['kp']:.4f},KI={g['ki']:.4f},MAXI={g['max_i']:.4f}"
+        msg.data = f"KP={g['kp']:.4f},KI={g['ki']:.4f},MAXI={g['max_i']:.4f},KHEAD={g['khead']:.4f}"
         self.pid_pub.publish(msg)
 
-    def set_pid_gains(self, kp: float, ki: float, max_i: float):
-        self.pid_gains = {'kp': kp, 'ki': ki, 'max_i': max_i}
+    def set_pid_gains(self, kp: float, ki: float, max_i: float, khead: float):
+        self.pid_gains = {'kp': kp, 'ki': ki, 'max_i': max_i, 'khead': khead}
         save_pid_gains(self.pid_gains)
         self._publish_pid_gains()
 
@@ -714,10 +717,11 @@ class SearchAndRescue(Node):
                 kp = float(data['kp'])
                 ki = float(data['ki'])
                 max_i = float(data['max_i'])
+                khead = float(data['khead'])
             except (TypeError, ValueError, KeyError):
-                return jsonify({'ok': False, 'error': 'expected JSON {kp, ki, max_i} as numbers'}), 400
-            node.set_pid_gains(kp, ki, max_i)
-            node.get_logger().info(f"PID gains updated via dashboard: Kp={kp} Ki={ki} MaxI={max_i}")
+                return jsonify({'ok': False, 'error': 'expected JSON {kp, ki, max_i, khead} as numbers'}), 400
+            node.set_pid_gains(kp, ki, max_i, khead)
+            node.get_logger().info(f"PID gains updated via dashboard: Kp={kp} Ki={ki} MaxI={max_i} Khead={khead}")
             return jsonify({'ok': True, 'pid_gains': node.pid_gains})
 
         @app.route('/video_feed_left')
@@ -908,6 +912,7 @@ HTML_PAGE = """<!doctype html>
           <label>Kp <input id="pidKp" type="number" step="0.1"></label>
           <label>Ki <input id="pidKi" type="number" step="0.05"></label>
           <label>Max I contribution <input id="pidMaxI" type="number" step="5"></label>
+          <label>Heading Kp (gyro) <input id="pidKhead" type="number" step="1"></label>
           <button id="pidPushBtn" onclick="pushPidGains()">Push to robot</button>
         </div>
         <div class="legend" id="pidStatus">
@@ -1048,17 +1053,18 @@ function pushPidGains() {
   const kp = parseFloat(document.getElementById('pidKp').value);
   const ki = parseFloat(document.getElementById('pidKi').value);
   const max_i = parseFloat(document.getElementById('pidMaxI').value);
-  if (!isFinite(kp) || !isFinite(ki) || !isFinite(max_i)) {
-    document.getElementById('pidStatus').innerText = 'enter valid numbers in all three fields first';
+  const khead = parseFloat(document.getElementById('pidKhead').value);
+  if (!isFinite(kp) || !isFinite(ki) || !isFinite(max_i) || !isFinite(khead)) {
+    document.getElementById('pidStatus').innerText = 'enter valid numbers in all four fields first';
     return;
   }
   fetch('/pid_gains', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ kp, ki, max_i }),
+    body: JSON.stringify({ kp, ki, max_i, khead }),
   }).then(r => r.json()).then(res => {
     document.getElementById('pidStatus').innerText = res.ok
-      ? `saved + pushed at ${new Date().toLocaleTimeString()} -- watch the diag panel above for KP/KI/MAXI to confirm the ESP32 picked it up`
+      ? `saved + pushed at ${new Date().toLocaleTimeString()} -- watch the diag panel above for KP/KI/MAXI/KHEAD to confirm the ESP32 picked it up`
       : (res.error || 'push failed');
   }).catch(() => {
     document.getElementById('pidStatus').innerText = 'push failed (dashboard unreachable?)';
@@ -1090,6 +1096,7 @@ function poll() {
       document.getElementById('pidKp').value = state.pid_gains.kp;
       document.getElementById('pidKi').value = state.pid_gains.ki;
       document.getElementById('pidMaxI').value = state.pid_gains.max_i;
+      document.getElementById('pidKhead').value = state.pid_gains.khead;
       pidFieldsInitialized = true;
     }
 

@@ -125,6 +125,20 @@
 #define MPU6050_REG_ACCEL_XOUT_H 0x3B  /* accel(6) + temp(2) + gyro(6) = 14B burst */
 #define IMU_READ_LEN 14
 
+/* --- Magnetometer (HMC5883L), added 2026-08-28 for the heading-drift fix ---
+ * Lives on the same I2C bus/pins as the MPU6050 above (shares SDA/SCL) -
+ * this is the compass chip on the new GY-86/GY-87-style board, added
+ * specifically to stop the gyro-only heading estimate from drifting
+ * forever (see README). Register order for the data burst is X, Z, Y -
+ * NOT X,Y,Z - confirmed against the HMC5883L datasheet, easy to get
+ * backwards. */
+#define HMC5883L_I2C_ADDR       0x1E
+#define HMC5883L_REG_CONFIG_A   0x00
+#define HMC5883L_REG_CONFIG_B   0x01
+#define HMC5883L_REG_MODE       0x02
+#define HMC5883L_REG_DATA_X_MSB 0x03
+#define HMC5883L_READ_LEN 6   /* X(2) + Z(2) + Y(2) */
+
 /* Forward-declared: defined below setup_pwm() (near the other setup_*
  * helpers), but called from uros_task() which appears EARLIER in this file.
  * Without this, the compiler hits the call site first, assumes an
@@ -135,6 +149,10 @@
  * first error line before assuming a fix is complete). */
 static bool imu_read_raw(int16_t *ax, int16_t *ay, int16_t *az,
                           int16_t *gx, int16_t *gy, int16_t *gz);
+
+/* Same forward-reference reason as imu_read_raw above - defined near
+ * setup_magnetometer() further down, called from uros_task() above that. */
+static bool mag_read_raw(int16_t *mx, int16_t *my, int16_t *mz);
 
 /* Moved up from near control_task() (2026-07-27): pid_step() needs this for
  * its dt calculation, but #define order matters in C - the compiler had
@@ -181,22 +199,39 @@ static volatile float g_ki = 0.2f;
  * tight for real load, hence live-tunable now too. */
 static volatile float g_max_i_contribution = 40.0f;
 
-/* Wheel sync: per-wheel PID keeps each wheel near TARGET_RPM independently,
- * but confirmed live (2026-07-27) that's not enough - robot pulls right,
- * would circle if left running. Small per-cycle differences between the two
- * (different motors, different overshoot/settling) add up over time into
- * real position drift. This trims each wheel's target RPM based on TOTAL
- * distance traveled so far (cumulative pulses, never reset), not just
- * instantaneous RPM - a wheel that's fallen behind gets sped up until it
- * actually catches up, not just "goes the same speed from now on".
- * KSYNC=0.05 is a conservative starting guess, same philosophy as Kp/Ki.
- * Gated 2026-07-27 (F5): only active while /cmd_vel's angular.z is near
- * zero (straight-line driving) - an intentional turn deliberately makes the
- * two wheels travel different distances, and without this gate the sync
- * logic would fight every turn command, trying to "correct" a difference
- * that was never a mistake. See STRAIGHT_ANGULAR_THRESHOLD below. */
-#define KSYNC 0.05f
-#define MAX_SYNC_TRIM 15.0f   /* clamp: don't let sync fighting dominate over the base target */
+/* --- Heading control, replaces the old encoder-distance "wheel sync" (2026-08-28) ---
+ * OLD approach: per-wheel PID kept each wheel near its own target RPM
+ * independently (two separate error/integral tracks), plus a separate trim
+ * based on comparing cumulative encoder PULSE COUNT between the two wheels.
+ * Confirmed live: this let each wheel's loop hunt independently against its
+ * own noisy/quantized encoder reading, and the sync trim itself was reacting
+ * to an indirect signal (accumulated pulse-count drift) rather than the
+ * actual physical thing that matters (is the robot actually rotating when it
+ * shouldn't be, or rotating at the wrong rate when it should).
+ *
+ * NEW approach: ONE shared speed PID drives an averaged target (see
+ * control_task below), and heading correction comes directly from the gyro -
+ * compare the COMMANDED turn rate (angular.z) against the MEASURED turn rate
+ * (imu_gz_rad_per_s_shared) every cycle, PROPORTIONAL only (no integral -
+ * matches this codebase's own "start simple" philosophy; add I later only if
+ * real testing shows a persistent steady-state heading error P alone can't
+ * close). This runs continuously and unconditionally - no more
+ * "only while going straight" gate, because rate-tracking naturally covers
+ * both cases: commanded rate 0 -> holds straight, commanded rate nonzero ->
+ * tracks the requested turn. Applied in the SIGNED target-RPM domain (before
+ * the left/right magnitude split), same slot in the math the old sync_trim
+ * used - verified this generalizes correctly to in-place turns (opposite-
+ * signed wheel targets), unlike a naive +/- on the final PWM magnitude,
+ * which cancels to zero net effect for that case (worked through the
+ * algebra before implementing this way - a simpler-looking version that
+ * applies the trim directly to PWM instead of signed RPM target would have
+ * silently broken in-place turns).
+ * Falls back to trim=0 (not the old encoder-based estimate) whenever the IMU
+ * read is invalid - same "never trust a dead/stale sensor" philosophy as
+ * imu_gz_valid_shared elsewhere in this file, safer than silently reverting
+ * to the noisier encoder-diff signal mid-drive. */
+static volatile float g_kheading = 15.0f;   /* RPM of trim per rad/s of heading-rate error - live-tunable, see pid_gains_callback */
+#define MAX_HEADING_TRIM_RPM 20.0f          /* clamp: don't let heading correction alone dominate the base speed target */
 
 /* --- F4: odometry (measured 2026-07-27: wheelbase 10cm; wheel diameter
  * re-measured 2026-08-26 as 6.7cm, corrected from the original 6cm) ---
@@ -221,12 +256,6 @@ static volatile float g_max_i_contribution = 40.0f;
  * "stop", never "keep going blind". Applies both before the first command
  * ever arrives AND if a live connection drops mid-drive. */
 #define CMD_VEL_TIMEOUT_US 1000000   /* 1s */
-
-/* Below this |angular.z|, treat the commanded motion as "going straight" for
- * wheel-sync purposes (see KSYNC comment above) - not exactly 0 because a
- * genuinely-straight command from ros2/Nav2 may carry tiny floating-point
- * noise rather than a clean 0.0. */
-#define STRAIGHT_ANGULAR_THRESHOLD 0.05f   /* rad/s */
 
 #define ODOM_PUBLISH_PERIOD_MS 100   /* 10 Hz */
 
@@ -274,6 +303,26 @@ static volatile float pwm_right_shared = 0.0f;
  * instead of blending in a stale/garbage gyro value. */
 static volatile float imu_gz_rad_per_s_shared = 0.0f;
 static volatile bool imu_gz_valid_shared = false;
+
+/* Magnetometer heading fusion (2026-08-28), same cross-task pattern as
+ * imu_gz_rad_per_s_shared above - written by uros_task's mag read, read by
+ * control_task. mag_heading_valid_shared false means "don't use this",
+ * same fail-safe philosophy as imu_gz_valid_shared. Value is already
+ * zero-referenced against wherever the robot was pointed at boot (see
+ * g_mag_calibrated in uros_task) - NOT a true compass bearing, doesn't need
+ * to be one, since this whole system's heading frame is relative/arbitrary
+ * (odom frame) to begin with. */
+static volatile float mag_heading_rad_shared = 0.0f;
+static volatile bool mag_heading_valid_shared = false;
+
+/* How strongly each 200ms control cycle nudges pose_theta_shared toward the
+ * compass heading. Deliberately small: the gyro should still dominate
+ * moment-to-moment (smooth, fast, low-noise), the compass only slowly
+ * drags the estimate back when the gyro has drifted - a standard
+ * complementary filter. Starting guess, same "start small" philosophy as
+ * Kp/Ki above - watch whether long-run drift is actually reduced before
+ * tuning this further. */
+#define MAG_FUSION_WEIGHT 0.02f
 
 /* MPU6050 power-on-reset default full-scale range: gyro +/-250deg/s at
  * 131 LSB/(deg/s) (same constant jetson/tools/process_imu_raw.py uses
@@ -462,8 +511,10 @@ static void control_task(void *arg) {
 
     uint32_t snapshot_left, snapshot_right;
     float applied_pwm_left = 0.0f, applied_pwm_right = 0.0f;
-    float integral_left = 0.0f, integral_right = 0.0f;
-    uint32_t total_pulses_left = 0, total_pulses_right = 0;
+    /* ONE shared integral now (was integral_left/integral_right) - see the
+     * "Heading control" comment block above g_kheading for why two
+     * independent per-wheel integrators were part of the jitter problem. */
+    float integral_speed = 0.0f;
     uint32_t stall_cycles_left = 0, stall_cycles_right = 0;
     /* F4 pose lives in pose_x_shared/pose_y_shared/pose_theta_shared now
      * (F5 needs uros_task to read it) - origin = wherever the robot is at
@@ -530,6 +581,21 @@ static void control_task(void *arg) {
         pose_x_shared += dist_center * cosf(theta_mid);
         pose_y_shared += dist_center * sinf(theta_mid);
         pose_theta_shared += dtheta;
+
+        /* Magnetometer fusion (2026-08-28): the gyro integration above
+         * accumulates drift forever with nothing to correct it. Whenever a
+         * valid compass heading is available, slowly drag pose_theta_shared
+         * back toward it - complementary filter, see MAG_FUSION_WEIGHT
+         * comment above. Angle-wrap-safe (compares the shortest way around
+         * the circle, not raw subtraction, so it can't get a bogus huge
+         * correction crossing the +/-180deg seam). */
+        if (mag_heading_valid_shared) {
+            float mag_diff = mag_heading_rad_shared - pose_theta_shared;
+            if (mag_diff > PI_F)  mag_diff -= 2.0f * PI_F;
+            if (mag_diff < -PI_F) mag_diff += 2.0f * PI_F;
+            pose_theta_shared += MAG_FUSION_WEIGHT * mag_diff;
+        }
+
         linear_vel_shared  = dist_center / dt;
         angular_vel_shared = dtheta / dt;
 
@@ -545,22 +611,27 @@ static void control_task(void *arg) {
         float target_rpm_left  = v_left_mps  / WHEEL_CIRCUMFERENCE_M * 60.0f;
         float target_rpm_right = v_right_mps / WHEEL_CIRCUMFERENCE_M * 60.0f;
 
-        /* Wheel sync, gated to straight-line motion only - see KSYNC and
-         * STRAIGHT_ANGULAR_THRESHOLD comments above. Positive diff = left
-         * has traveled further than right so far; trim left's target down /
-         * right's target up to close that gap. */
-        bool going_straight = fabsf(angular_z) < STRAIGHT_ANGULAR_THRESHOLD;
-        if (going_straight) {
-            total_pulses_left  += snapshot_left;
-            total_pulses_right += snapshot_right;
+        /* Heading trim, IMU-driven (2026-08-28, replaces the old encoder-
+         * distance sync trim - see the big comment above g_kheading for the
+         * full reasoning). Compare commanded turn rate to the gyro's
+         * MEASURED turn rate - unconditional, no "only while going
+         * straight" gate needed, since this naturally covers both: commanded
+         * 0 -> holds straight, commanded nonzero -> tracks the turn.
+         * Zero trim (not an encoder-based guess) whenever the IMU read is
+         * invalid - never correct off a signal we don't trust. Applied in
+         * the SIGNED target-RPM domain, same spot the old sync_trim used -
+         * this is what makes it generalize correctly to in-place turns
+         * (opposite-signed wheel targets). */
+        float heading_trim_rpm = 0.0f;
+        if (imu_gz_valid_shared) {
+            float heading_rate_error = angular_z - imu_gz_rad_per_s_shared;
+            heading_trim_rpm = g_kheading * heading_rate_error;
+            if (heading_trim_rpm > MAX_HEADING_TRIM_RPM)  heading_trim_rpm = MAX_HEADING_TRIM_RPM;
+            if (heading_trim_rpm < -MAX_HEADING_TRIM_RPM) heading_trim_rpm = -MAX_HEADING_TRIM_RPM;
         }
-        float sync_diff = (float)total_pulses_left - (float)total_pulses_right;
-        float sync_trim = going_straight ? KSYNC * sync_diff : 0.0f;
-        if (sync_trim > MAX_SYNC_TRIM)  sync_trim = MAX_SYNC_TRIM;
-        if (sync_trim < -MAX_SYNC_TRIM) sync_trim = -MAX_SYNC_TRIM;
 
-        float signed_target_left  = target_rpm_left  - sync_trim;
-        float signed_target_right = target_rpm_right + sync_trim;
+        float signed_target_left  = target_rpm_left  - heading_trim_rpm;
+        float signed_target_right = target_rpm_right + heading_trim_rpm;
 
         /* Direction pins, set every cycle from this cycle's target sign.
          * BUG FIXED 2026-08-26: these were only ever set ONCE at boot (see
@@ -582,8 +653,33 @@ static void control_task(void *arg) {
         gpio_set_level(BIN1_PIN, signed_target_right < 0.0f ? 1 : 0);
         gpio_set_level(BIN2_PIN, signed_target_right < 0.0f ? 0 : 1);
 
-        float target_pwm_left  = (float)pid_step(fabsf(signed_target_left),  rpm_left_shared,  &integral_left);
-        float target_pwm_right = (float)pid_step(fabsf(signed_target_right), rpm_right_shared, &integral_right);
+        /* Speed regulation, ONE shared PID on the AVERAGE of the two wheels
+         * (2026-08-28, replaces two independent per-wheel PID calls - see
+         * the comment above g_kheading for why running two separately was
+         * likely a real cause of the reported jitter: each wheel's loop
+         * hunting independently against its own noisy encoder reading, with
+         * no coordination between them). avg_target_rpm already has the
+         * heading trim baked in (via signed_target_left/right above), so
+         * the left/right split below still correctly reflects any commanded
+         * turn - it's just driven by one shared error/integral track instead
+         * of two competing ones. */
+        float avg_target_rpm = (fabsf(signed_target_left) + fabsf(signed_target_right)) / 2.0f;
+        float avg_actual_rpm = (rpm_left_shared + rpm_right_shared) / 2.0f;
+        float base_pwm = (float)pid_step(avg_target_rpm, avg_actual_rpm, &integral_speed);
+
+        /* Distribute the shared base_pwm between the two wheels, keeping
+         * the same left/right ratio their (trim-corrected) targets imply -
+         * e.g. an in-place turn wants both wheels at roughly equal
+         * magnitude, a gentle curve wants a small imbalance. Guarded
+         * against divide-by-zero when the robot is commanded to a stop
+         * (avg_target_rpm == 0, in which case pid_step already returns 0
+         * for base_pwm too, so the ratio doesn't matter). */
+        float left_ratio  = (avg_target_rpm > 0.01f) ? (fabsf(signed_target_left)  / avg_target_rpm) : 1.0f;
+        float right_ratio = (avg_target_rpm > 0.01f) ? (fabsf(signed_target_right) / avg_target_rpm) : 1.0f;
+        float target_pwm_left  = base_pwm * left_ratio;
+        float target_pwm_right = base_pwm * right_ratio;
+        if (target_pwm_left  > MAX_SAFE_PWM) target_pwm_left  = MAX_SAFE_PWM;
+        if (target_pwm_right > MAX_SAFE_PWM) target_pwm_right = MAX_SAFE_PWM;
 
         applied_pwm_left  = target_pwm_left;
         applied_pwm_right = target_pwm_right;
@@ -622,10 +718,10 @@ static void control_task(void *arg) {
          * echo /odom` / `ros2 topic pub /cmd_vel` on the Jetson instead.
          * Left in place since it's harmless and still useful for standalone
          * bring-up before uros_task's transport takes over. */
-        ESP_LOGI(TAG, "RPM L=%.1f R=%.1f  PWM L=%.0f R=%.0f  sync_diff=%.0f trim=%.1f  "
+        ESP_LOGI(TAG, "RPM L=%.1f R=%.1f  PWM L=%.0f R=%.0f  head_trim=%.1f  "
                       "pose x=%.3fm y=%.3fm theta=%.1fdeg",
                  rpm_left_shared, rpm_right_shared, applied_pwm_left, applied_pwm_right,
-                 sync_diff, sync_trim, pose_x_shared, pose_y_shared, pose_theta_shared * 180.0f / PI_F);
+                 heading_trim_rpm, pose_x_shared, pose_y_shared, pose_theta_shared * 180.0f / PI_F);
     }
 }
 
@@ -696,11 +792,12 @@ static void cmd_vel_callback(const void *msgin) {
  * - gains only change on an unambiguous full match, never partially. */
 static void pid_gains_callback(const void *msgin) {
     const std_msgs__msg__String *msg = (const std_msgs__msg__String *)msgin;
-    float kp, ki, max_i;
-    if (sscanf(msg->data.data, "KP=%f,KI=%f,MAXI=%f", &kp, &ki, &max_i) == 3) {
+    float kp, ki, max_i, khead;
+    if (sscanf(msg->data.data, "KP=%f,KI=%f,MAXI=%f,KHEAD=%f", &kp, &ki, &max_i, &khead) == 4) {
         g_kp = kp;
         g_ki = ki;
         g_max_i_contribution = max_i;
+        g_kheading = khead;
     }
 }
 
@@ -734,9 +831,9 @@ static void uros_task(void *arg) {
         std_msgs__msg__String diag_msg = {0};
         std_msgs__msg__String imu_msg = {0};
         char pid_gains_text[64];
-        char diag_text[160];   /* grown from 96/112 -- KP/KI/MAXI fields plus the existing
-                                 * RPM/PWM/I2C/WAKE fields plus g_i2c_scan_result's own 40-char
-                                 * worst case can exceed 112 */
+        char diag_text[200];   /* grown from 96/112/160 -- KP/KI/MAXI/KHEAD/MAG fields plus the
+                                 * existing RPM/PWM/I2C/WAKE fields plus g_i2c_scan_result's own
+                                 * 40-char worst case can exceed 160 */
         char imu_text[80];
 
         if (rclc_support_init(&support, 0, NULL, &allocator) != RCL_RET_OK) {
@@ -849,12 +946,13 @@ static void uros_task(void *arg) {
                  * idf.py monitor is unusable once this transport owns
                  * UART0 (see note above cmd_vel_callback). */
                 snprintf(diag_text, sizeof(diag_text),
-                         "reset=%s RPM L=%.1f R=%.1f PWM L=%.0f R=%.0f KP=%.2f KI=%.2f MAXI=%.1f I2C=%s WAKE=%d",
+                         "reset=%s RPM L=%.1f R=%.1f PWM L=%.0f R=%.0f KP=%.2f KI=%.2f MAXI=%.1f KHEAD=%.1f I2C=%s WAKE=%d MAG=%s",
                          reset_reason_str(g_reset_reason),
                          rpm_left_shared, rpm_right_shared,
                          pwm_left_shared, pwm_right_shared,
-                         g_kp, g_ki, g_max_i_contribution,
-                         g_i2c_scan_result, g_imu_wake_attempts);
+                         g_kp, g_ki, g_max_i_contribution, g_kheading,
+                         g_i2c_scan_result, g_imu_wake_attempts,
+                         mag_heading_valid_shared ? "ok" : "no-read");
                 diag_msg.data.size = strlen(diag_text);
 
                 if (rcl_publish(&diag_pub, &diag_msg, NULL) != RCL_RET_OK) {
@@ -887,6 +985,44 @@ static void uros_task(void *arg) {
                 imu_msg.data.size = strlen(imu_text);
                 if (rcl_publish(&imu_pub, &imu_msg, NULL) != RCL_RET_OK) {
                     agent_ok = false;
+                }
+
+                /* Magnetometer (2026-08-28): read alongside the existing
+                 * IMU read above, same "inline, no separate task" reasoning
+                 * (fast I2C transaction, no shared-state/ISR concerns).
+                 * "Calibration" here is deliberately the simple version Alex
+                 * asked for, not a full hard-iron spin calibration: take
+                 * ONE reading right after boot and treat it as heading-zero.
+                 * This works for this system specifically because nothing
+                 * here needs a TRUE compass bearing - pose_theta_shared is
+                 * already a relative/arbitrary reference (origin =
+                 * wherever the robot is at boot, same as the gyro-only
+                 * estimate always was), so a fixed, uncorrected hard-iron
+                 * offset doesn't cause drift - it just means "heading 0"
+                 * isn't true north, which nothing here depends on. Revisit
+                 * with a real spin calibration ONLY if live testing shows
+                 * the raw heading behaves inconsistently at different
+                 * physical headings (the actual symptom of un-compensated
+                 * hard-iron distortion) - see README.
+                 * NOTE: unlike gz's sign (empirically confirmed 2026-08-22),
+                 * this atan2f sign convention has NOT been verified on real
+                 * hardware yet - check whether a rising heading value here
+                 * actually matches "turning left" before trusting the fused
+                 * pose_theta_shared, may need a sign flip. */
+                int16_t mag_x, mag_y, mag_z;
+                if (mag_read_raw(&mag_x, &mag_y, &mag_z)) {
+                    float raw_heading = atan2f((float)mag_y, (float)mag_x);
+                    if (!g_mag_calibrated) {
+                        g_mag_heading_offset_rad = raw_heading;
+                        g_mag_calibrated = true;
+                    }
+                    float corrected = raw_heading - g_mag_heading_offset_rad;
+                    if (corrected > PI_F)  corrected -= 2.0f * PI_F;
+                    if (corrected < -PI_F) corrected += 2.0f * PI_F;
+                    mag_heading_rad_shared = corrected;
+                    mag_heading_valid_shared = true;
+                } else {
+                    mag_heading_valid_shared = false;
                 }
             }
 
@@ -967,6 +1103,17 @@ static void setup_pwm(void) {
  * ISR/task boundary and need portENTER_CRITICAL. */
 static i2c_master_dev_handle_t imu_dev = NULL;
 
+/* Magnetometer device handle, same lifecycle/threading rules as imu_dev
+ * above - set once by setup_magnetometer() (called from setup_imu(), see
+ * below), read-only afterward. g_mag_heading_offset_rad/g_mag_calibrated
+ * are only ever touched from within uros_task (the boot-time zero-reference
+ * "calibration", see the mag_read_raw() call site) - no cross-task sharing
+ * needed for those two, unlike mag_heading_rad_shared/mag_heading_valid_shared
+ * which control_task also reads. */
+static i2c_master_dev_handle_t mag_dev = NULL;
+static float g_mag_heading_offset_rad = 0.0f;
+static bool g_mag_calibrated = false;
+
 /* One-shot diagnostic: probe every valid 7-bit address (1-126) and record
  * which ones ACK. TEMPORARY debugging aid for the 2026-08-20 imu_read_failed
  * investigation (wiring/power/continuity all confirmed OK by hand, so the
@@ -990,6 +1137,35 @@ static void i2c_scan_bus(i2c_master_bus_handle_t bus_handle) {
     if (!found) {
         snprintf(g_i2c_scan_result, sizeof(g_i2c_scan_result), "none");
     }
+}
+
+/* Bring up the HMC5883L magnetometer on the same I2C bus as the MPU6050.
+ * Same soft-fail philosophy as setup_imu() below: a bad/unplugged compass
+ * should not take down the already-proven motor/encoder/odom path. Config
+ * values are the standard, widely-used HMC5883L init sequence: 8-sample
+ * averaging + 15Hz output (Config A), default +/-1.3 Ga gain (Config B),
+ * continuous-measurement mode (Mode) - the chip otherwise powers up in
+ * single-measurement mode, which would only ever return one reading. */
+static void setup_magnetometer(i2c_master_bus_handle_t bus_handle) {
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = HMC5883L_I2C_ADDR,
+        .scl_speed_hz = 100000,
+    };
+    if (i2c_master_bus_add_device(bus_handle, &dev_cfg, &mag_dev) != ESP_OK) {
+        mag_dev = NULL;
+        return;
+    }
+    uint8_t cfg_a[2] = { HMC5883L_REG_CONFIG_A, 0x70 };
+    uint8_t cfg_b[2] = { HMC5883L_REG_CONFIG_B, 0x20 };
+    uint8_t mode[2]  = { HMC5883L_REG_MODE,     0x00 };
+    if (i2c_master_transmit(mag_dev, cfg_a, sizeof(cfg_a), pdMS_TO_TICKS(100)) != ESP_OK ||
+        i2c_master_transmit(mag_dev, cfg_b, sizeof(cfg_b), pdMS_TO_TICKS(100)) != ESP_OK ||
+        i2c_master_transmit(mag_dev, mode,  sizeof(mode),  pdMS_TO_TICKS(100)) != ESP_OK) {
+        mag_dev = NULL;
+        return;
+    }
+    vTaskDelay(pdMS_TO_TICKS(10));  /* short settle time after the mode-register write */
 }
 
 /* Bring up the I2C bus + MPU6050 device and wake it from sleep.
@@ -1060,6 +1236,12 @@ static void setup_imu(void) {
         g_imu_wake_attempts = -1;
         imu_dev = NULL;  /* wiring/address wrong - don't let later reads run */
     }
+
+    /* Magnetometer (2026-08-28): separate I2C device on the same bus, wired
+     * on the new GY-86/87-style board alongside this same MPU6050. Tried
+     * unconditionally - it's a different chip at a different address, its
+     * fate isn't tied to whether the MPU6050 wake above succeeded. */
+    setup_magnetometer(bus_handle);
 }
 
 /* Burst-reads accel+temp+gyro (14 bytes from ACCEL_XOUT_H) and splits it
@@ -1104,6 +1286,34 @@ static bool imu_read_raw(int16_t *ax, int16_t *ay, int16_t *az,
     *gx = (int16_t)((data[8]  << 8) | data[9]);
     *gy = (int16_t)((data[10] << 8) | data[11]);
     *gz = (int16_t)((data[12] << 8) | data[13]);
+    return true;
+}
+
+/* Burst-reads 6 bytes starting at the X MSB register. HMC5883L's register
+ * order is X, Z, Y - not X,Y,Z, confirmed against the datasheet - so the
+ * parsing below deliberately doesn't follow the byte order line by line.
+ * Same fail-soft/give-up-after-N-failures pattern as imu_read_raw() above. */
+#define MAG_MAX_CONSECUTIVE_FAILURES 5
+
+static bool mag_read_raw(int16_t *mx, int16_t *my, int16_t *mz) {
+    static uint8_t consecutive_failures = 0;
+
+    if (mag_dev == NULL) {
+        return false;
+    }
+    uint8_t reg = HMC5883L_REG_DATA_X_MSB;
+    uint8_t data[HMC5883L_READ_LEN];
+    if (i2c_master_transmit_receive(mag_dev, &reg, 1, data, sizeof(data),
+                                     pdMS_TO_TICKS(100)) != ESP_OK) {
+        if (++consecutive_failures >= MAG_MAX_CONSECUTIVE_FAILURES) {
+            mag_dev = NULL;  /* bus likely wedged - stop paying the stall */
+        }
+        return false;
+    }
+    consecutive_failures = 0;
+    *mx = (int16_t)((data[0] << 8) | data[1]);
+    *mz = (int16_t)((data[2] << 8) | data[3]);
+    *my = (int16_t)((data[4] << 8) | data[5]);
     return true;
 }
 
