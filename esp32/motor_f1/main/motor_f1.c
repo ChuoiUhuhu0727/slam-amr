@@ -122,6 +122,8 @@
 #define IMU_SCL_PIN       GPIO_NUM_25
 #define MPU6050_I2C_ADDR  0x68
 #define MPU6050_REG_PWR_MGMT_1   0x6B
+#define MPU6050_REG_INT_PIN_CFG  0x37
+#define MPU6050_I2C_BYPASS_EN    0x02
 #define MPU6050_REG_ACCEL_XOUT_H 0x3B  /* accel(6) + temp(2) + gyro(6) = 14B burst */
 #define IMU_READ_LEN 14
 
@@ -956,12 +958,13 @@ static void uros_task(void *arg) {
                  * idf.py monitor is unusable once this transport owns
                  * UART0 (see note above cmd_vel_callback). */
                 snprintf(diag_text, sizeof(diag_text),
-                         "reset=%s RPM L=%.1f R=%.1f PWM L=%.0f R=%.0f KP=%.2f KI=%.2f MAXI=%.1f KHEAD=%.1f I2C=%s WAKE=%d MAG=%s",
+                         "reset=%s RPM L=%.1f R=%.1f PWM L=%.0f R=%.0f KP=%.2f KI=%.2f MAXI=%.1f KHEAD=%.1f I2C=%s WAKE=%d GZ=%s MAG=%s",
                          reset_reason_str(g_reset_reason),
                          rpm_left_shared, rpm_right_shared,
                          pwm_left_shared, pwm_right_shared,
                          g_kp, g_ki, g_max_i_contribution, g_kheading,
                          g_i2c_scan_result, g_imu_wake_attempts,
+                         imu_gz_valid_shared ? "ok" : "no-read",
                          mag_heading_valid_shared ? "ok" : "no-read");
                 diag_msg.data.size = strlen(diag_text);
 
@@ -1241,6 +1244,24 @@ static void setup_imu(void) {
     if (!wake_ok) {
         g_imu_wake_attempts = -1;
         imu_dev = NULL;  /* wiring/address wrong - don't let later reads run */
+    }
+
+    /* GY-86/87-style boards wire the magnetometer through the MPU6050's own
+     * AUX I2C bus, not straight onto the main SDA/SCL lines - confirmed
+     * 2026-08-28: a bus scan found the MPU6050 (0x68) and the barometer
+     * (0x77) directly, but NOTHING at the magnetometer's address, even
+     * though it's the same physical board/wiring. Without this, the
+     * compass is electrically invisible to the ESP32 no matter what
+     * address setup_magnetometer() probes. Setting I2C_BYPASS_EN makes the
+     * MPU6050 pass its aux bus straight through onto the main bus, so the
+     * magnetometer becomes directly addressable. Only meaningful if the
+     * MPU6050 itself is actually awake and responding. */
+    if (wake_ok) {
+        uint8_t bypass_cmd[2] = { MPU6050_REG_INT_PIN_CFG, MPU6050_I2C_BYPASS_EN };
+        i2c_master_transmit(imu_dev, bypass_cmd, sizeof(bypass_cmd), pdMS_TO_TICKS(100));
+        /* Not retried/checked - a failure here is already visible as
+         * MAG=no-read on the dashboard, same as any other magnetometer
+         * fault, no separate error path needed. */
     }
 
     /* Magnetometer (2026-08-28): separate I2C device on the same bus, wired
