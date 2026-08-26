@@ -1204,8 +1204,6 @@ static void setup_imu(void) {
         return;
     }
 
-    i2c_scan_bus(bus_handle);
-
     /* 2026-08-20: was 400000 (Fast Mode). Real writes (the PWR_MGMT_1 wake
      * command below) were failing while i2c_master_probe() - a much lighter
      * transaction - still ACKed fine at the same address. Classic breadboard
@@ -1263,6 +1261,16 @@ static void setup_imu(void) {
          * MAG=no-read on the dashboard, same as any other magnetometer
          * fault, no separate error path needed. */
     }
+
+    /* Scan moved here (2026-08-28, was right after i2c_new_master_bus above)
+     * - it used to run BEFORE the bypass write, so I2C=... on the dashboard
+     * could never confirm whether bypass actually exposed a new address; it
+     * was structurally incapable of answering that question. Now it runs
+     * after wake + bypass, so I2C=... reflects the TRUE post-bypass bus
+     * state - if the magnetometer still doesn't show up here, bypass mode
+     * isn't the fix (wrong address / different chip / real hardware fault),
+     * not a diagnostic blind spot. */
+    i2c_scan_bus(bus_handle);
 
     /* Magnetometer (2026-08-28): separate I2C device on the same bus, wired
      * on the new GY-86/87-style board alongside this same MPU6050. Tried
