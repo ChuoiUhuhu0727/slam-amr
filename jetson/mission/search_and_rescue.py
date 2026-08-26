@@ -175,6 +175,21 @@ CONTROL_PERIOD_S = 0.1   # 10 Hz control loop, navigation only -- camera grab +
                          # detection run on their own thread (see _vision_loop),
                          # paced naturally by how long YOLO takes, not this timer.
 
+# Manual drive/turn tester (2026-08-29) -- lets Alex "pretend to be the
+# Jetson" and send one isolated primitive at a time (drive N meters, turn
+# N degrees), completely outside the waypoint patrol -- for tuning the
+# ESP32 PID against controlled, repeatable motions, and for later checking
+# raw odometry accuracy (commanded distance/angle vs. what /odom reports).
+# "Turn" deliberately commands pure angular.z with linear.x=0 (in-place
+# spin, not a pivot) -- decouples heading change from position change,
+# same reasoning discussed with Alex for why in-place spin is the right
+# primitive here. "Drive forward" commands pure linear.x with angular.z=0
+# -- holding straight is entirely the ESP32's own gyro-based heading loop
+# doing its job; this script doesn't add any steering correction of its
+# own for this test mode, unlike _navigate_tick's continuous pursuit.
+MANUAL_MOVE_TIMEOUT_S = 30.0   # safety cutoff -- auto-stop if a target is
+                                # somehow never reached (e.g. odom stuck)
+
 # PID tuning box (2026-08-27) -- the ESP32's Kp/Ki/max-integral-contribution
 # used to be #define constants, needing a reflash to change. They're now
 # live-tunable over a new /pid_gains topic (see motor_f1.c pid_gains_callback)
@@ -297,6 +312,14 @@ class SearchAndRescue(Node):
         self.done = False
         self.started = False  # gated by the dashboard's Start button -- camera/
                                # detection run regardless, only driving waits
+
+        self.manual_move = None  # None, or a dict describing an in-progress
+                                  # manual drive/turn test -- see MANUAL_MOVE_
+                                  # TIMEOUT_S comment and _manual_move_tick.
+                                  # Mutually exclusive with patrol (self.started) --
+                                  # enforced at the /manual_move and /start routes,
+                                  # not here, so there's one obvious place each
+                                  # guard lives rather than duplicated checks.
 
         self.duck_sightings = []  # list of (world_x, world_y)
         self.report = None        # filled in once the loop finishes
@@ -464,6 +487,15 @@ class SearchAndRescue(Node):
         if not self.have_odom:
             return  # wait for first /odom message before doing anything
 
+        # Manual move takes priority over patrol -- checked first,
+        # unconditionally, so it works whether or not Start was ever
+        # clicked (the whole point: test motions without running a mission).
+        # Starting one while patrol is active is refused at the route level
+        # (see /manual_move), so in practice these two never overlap.
+        if self.manual_move is not None:
+            self._manual_move_tick()
+            return
+
         # Camera grab + detection run on their own background thread (see
         # _vision_loop) -- this callback is navigation-only now, so a slow
         # detection frame can never delay a cmd_vel update.
@@ -472,6 +504,74 @@ class SearchAndRescue(Node):
             return
 
         self._navigate_tick()
+
+    # -- manual drive/turn tester ---------------------------------------------
+
+    def _manual_move_tick(self):
+        m = self.manual_move
+        if time.time() - m['start_t'] > MANUAL_MOVE_TIMEOUT_S:
+            self.get_logger().warn(
+                f"Manual {m['type']} move timed out after {MANUAL_MOVE_TIMEOUT_S:.0f}s -- "
+                "stopping, target not reached (odometry stuck? PID not converging?)"
+            )
+            self.cmd_pub.publish(Twist())
+            self.manual_move = None
+            return
+
+        cmd = Twist()
+        if m['type'] == 'distance':
+            # Straight-line distance from where this move started -- valid as
+            # long as the robot is actually driving straight (angular.z=0
+            # commanded below, held by the ESP32's own gyro heading loop) -
+            # if it wanders, this would under-count real distance traveled,
+            # which is itself a useful signal something's off with heading
+            # hold, not just a measurement quirk to ignore.
+            traveled = math.hypot(self.x - m['start_x'], self.y - m['start_y'])
+            target = abs(m['value'])
+            if traveled >= target:
+                self.cmd_pub.publish(Twist())
+                self.get_logger().info(f"Manual move done: drove {traveled:.3f}m (target {target:.3f}m)")
+                self.manual_move = None
+                return
+            cmd.linear.x = MAX_LINEAR_SPEED if m['value'] >= 0 else -MAX_LINEAR_SPEED
+            cmd.angular.z = 0.0
+        else:  # 'turn'
+            # Accumulate small per-tick deltas rather than one wrapped
+            # comparison against the start heading -- correctly handles any
+            # target angle (including >180deg) without the +/-180deg wrap
+            # boundary causing a bogus "done" or "never done" result.
+            delta = wrap_angle(self.theta - m['last_theta'])
+            m['last_theta'] = self.theta
+            m['total_rotated'] += delta
+            target = abs(m['value'])
+            if abs(m['total_rotated']) >= target:
+                self.cmd_pub.publish(Twist())
+                self.get_logger().info(
+                    f"Manual move done: turned {math.degrees(m['total_rotated']):.1f}deg "
+                    f"(target {math.degrees(m['value']):.1f}deg)"
+                )
+                self.manual_move = None
+                return
+            # Pure in-place spin: angular.z only, linear.x=0 - see the
+            # MANUAL_MOVE_TIMEOUT_S comment above for why this primitive
+            # (not a pivot-on-one-wheel curve) is the deliberate choice.
+            # Positive value = positive angular.z = left turn, same
+            # convention as everywhere else in this file/the ESP32 firmware.
+            cmd.linear.x = 0.0
+            cmd.angular.z = MAX_ANGULAR_SPEED if m['value'] >= 0 else -MAX_ANGULAR_SPEED
+        self.cmd_pub.publish(cmd)
+
+    def _manual_move_status(self):
+        """JSON-friendly progress snapshot for the dashboard - None when no
+        manual move is active."""
+        m = self.manual_move
+        if m is None:
+            return None
+        if m['type'] == 'distance':
+            traveled = math.hypot(self.x - m['start_x'], self.y - m['start_y'])
+            return {'type': 'distance', 'target': m['value'], 'progress': traveled}
+        return {'type': 'turn', 'target_deg': math.degrees(m['value']),
+                'progress_deg': math.degrees(m['total_rotated'])}
 
     def _navigate_tick(self):
         goal_x, goal_y = WAYPOINTS[self.waypoint_idx]
@@ -723,6 +823,7 @@ class SearchAndRescue(Node):
                 'has_camera': not node.nav_only,
                 'target_waypoint': WAYPOINTS[node.waypoint_idx] if node.waypoint_idx < len(WAYPOINTS) else None,
                 'pid_gains': node.pid_gains,
+                'manual_move': node._manual_move_status(),
             })
 
         @app.route('/pid_gains', methods=['POST'])
@@ -756,9 +857,47 @@ class SearchAndRescue(Node):
 
         @app.route('/start', methods=['POST'])
         def start():
+            if node.manual_move is not None:
+                return jsonify({'started': False, 'error': 'a manual move is in progress -- cancel it first'}), 400
             node.started = True
             node.get_logger().info("Patrol STARTED (via dashboard)")
             return jsonify({'started': True})
+
+        @app.route('/manual_move', methods=['POST'])
+        def manual_move():
+            if node.started:
+                return jsonify({'ok': False, 'error': 'stop the patrol first'}), 400
+            if node.manual_move is not None:
+                return jsonify({'ok': False, 'error': 'a manual move is already in progress'}), 400
+            try:
+                data = request.get_json(force=True)
+                move_type = data['type']
+                value = float(data['value'])
+            except (TypeError, ValueError, KeyError):
+                return jsonify({'ok': False, 'error': 'expected JSON {type: "distance"|"turn", value: number}'}), 400
+            if move_type == 'distance':
+                node.manual_move = {
+                    'type': 'distance', 'value': value,
+                    'start_x': node.x, 'start_y': node.y,
+                    'start_t': time.time(),
+                }
+            elif move_type == 'turn':
+                node.manual_move = {
+                    'type': 'turn', 'value': math.radians(value),
+                    'last_theta': node.theta, 'total_rotated': 0.0,
+                    'start_t': time.time(),
+                }
+            else:
+                return jsonify({'ok': False, 'error': 'type must be "distance" or "turn"'}), 400
+            node.get_logger().info(f"Manual move started (via dashboard): {move_type}={value}")
+            return jsonify({'ok': True})
+
+        @app.route('/manual_move/cancel', methods=['POST'])
+        def manual_move_cancel():
+            node.manual_move = None
+            node.cmd_pub.publish(Twist())
+            node.get_logger().info("Manual move cancelled (via dashboard)")
+            return jsonify({'ok': True})
 
         @app.route('/stop', methods=['POST'])
         def stop():
@@ -779,6 +918,7 @@ class SearchAndRescue(Node):
             node.started = False
             node.done = False
             node.waypoint_idx = 0
+            node.manual_move = None
             node.duck_sightings = []
             node.latest_detection_left = None
             node.latest_detection_right = None
@@ -943,6 +1083,21 @@ HTML_PAGE = """<!doctype html>
           only applies while actually driving, never during a stop.
         </div>
       </div>
+      <div class="panel">
+        <div class="panel-title">Manual drive tester (bypasses mission Start)</div>
+        <div class="pid-row">
+          <label>Distance (m) <input id="manualDist" type="number" step="0.1" value="0.5"></label>
+          <button id="manualDriveBtn" onclick="manualMove('distance')">Drive Forward</button>
+        </div>
+        <div class="pid-row">
+          <label>Turn (deg, +left / -right) <input id="manualDeg" type="number" step="5" value="90"></label>
+          <button id="manualTurnBtn" onclick="manualMove('turn')">Turn</button>
+        </div>
+        <div class="pid-row">
+          <button id="manualCancelBtn" onclick="manualCancel()">Cancel</button>
+        </div>
+        <div class="legend" id="manualStatus">idle</div>
+      </div>
     </div>
     <div class="column">
       <div class="panel">
@@ -1098,6 +1253,28 @@ function pushPidGains() {
   });
 }
 
+function manualMove(type) {
+  const inputId = type === 'distance' ? 'manualDist' : 'manualDeg';
+  const value = parseFloat(document.getElementById(inputId).value);
+  if (!isFinite(value)) {
+    document.getElementById('manualStatus').innerText = 'enter a valid number first';
+    return;
+  }
+  fetch('/manual_move', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type, value }),
+  }).then(r => r.json()).then(res => {
+    if (!res.ok) document.getElementById('manualStatus').innerText = res.error || 'failed to start';
+  }).catch(() => {
+    document.getElementById('manualStatus').innerText = 'request failed (dashboard unreachable?)';
+  });
+}
+
+function manualCancel() {
+  fetch('/manual_move/cancel', { method: 'POST' }).catch(() => {});
+}
+
 function poll() {
   fetch('/state').then(r => r.json()).then(state => {
     draw(state);
@@ -1144,8 +1321,21 @@ function poll() {
         `(duck not seen by both cameras right now)</div>`;
     }
 
-    document.getElementById('startBtn').disabled = state.started || state.done;
+    document.getElementById('startBtn').disabled = state.started || state.done || !!state.manual_move;
     document.getElementById('stopBtn').disabled = !state.started;
+
+    const manualActive = !!state.manual_move;
+    document.getElementById('manualDriveBtn').disabled = state.started || manualActive;
+    document.getElementById('manualTurnBtn').disabled = state.started || manualActive;
+    document.getElementById('manualCancelBtn').disabled = !manualActive;
+    if (manualActive) {
+      const mm = state.manual_move;
+      document.getElementById('manualStatus').innerText = mm.type === 'distance'
+        ? `driving forward: ${mm.progress.toFixed(2)}m / ${mm.target.toFixed(2)}m`
+        : `turning: ${mm.progress_deg.toFixed(1)}deg / ${mm.target_deg.toFixed(1)}deg`;
+    } else {
+      document.getElementById('manualStatus').innerText = 'idle';
+    }
 
     const reportBox = document.getElementById('reportBox');
     if (state.report) {
