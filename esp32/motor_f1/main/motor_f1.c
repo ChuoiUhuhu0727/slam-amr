@@ -127,14 +127,23 @@
 #define MPU6050_REG_ACCEL_XOUT_H 0x3B  /* accel(6) + temp(2) + gyro(6) = 14B burst */
 #define IMU_READ_LEN 14
 
-/* --- Magnetometer (HMC5883L), added 2026-08-28 for the heading-drift fix ---
- * Lives on the same I2C bus/pins as the MPU6050 above (shares SDA/SCL) -
- * this is the compass chip on the new GY-86/GY-87-style board, added
- * specifically to stop the gyro-only heading estimate from drifting
- * forever (see README). Register order for the data burst is X, Z, Y -
- * NOT X,Y,Z - confirmed against the HMC5883L datasheet, easy to get
- * backwards. */
-#define HMC5883L_I2C_ADDR       0x1E
+/* --- Magnetometer, added 2026-08-28 for the heading-drift fix ---
+ * Lives on the MPU6050's AUX I2C bus (see MPU6050_I2C_BYPASS_EN below),
+ * exposed onto the main SDA/SCL bus once bypass mode is enabled - this is
+ * the compass chip on the new GY-86/GY-87-style board, added specifically
+ * to stop the gyro-only heading estimate from drifting forever (see
+ * README). Register map assumed HMC5883L-compatible (config A/B + mode +
+ * X,Z,Y data burst - NOT X,Y,Z order) since that's the standard chip on
+ * this class of board, but NOT independently confirmed - if MAG=ok but the
+ * fused heading still looks wrong, this register-map assumption is the
+ * first thing to re-check, not the address.
+ * ADDRESS: was 0x1E (textbook HMC5883L default) - changed 2026-08-28 to
+ * 0x2C after a live post-bypass I2C scan showed a real device newly
+ * appearing at 0x2C (not present in the pre-bypass scan), while nothing
+ * ever ACKed at 0x1E. Trusting the live scan over the datasheet default -
+ * this board's actual compass chip is evidently not a stock HMC5883L, or
+ * uses a non-default address strap. */
+#define HMC5883L_I2C_ADDR       0x2C
 #define HMC5883L_REG_CONFIG_A   0x00
 #define HMC5883L_REG_CONFIG_B   0x01
 #define HMC5883L_REG_MODE       0x02
