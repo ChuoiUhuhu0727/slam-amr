@@ -194,7 +194,7 @@ def save_pid_gains(gains):
     with open(PID_GAINS_PATH, 'w') as f:
         json.dump(gains, f)
 
-WEIGHTS_PATH = Path(__file__).resolve().parents[1] / "training/runs/detect/train-4/weights/best.pt"
+WEIGHTS_PATH = Path(__file__).resolve().parents[1] / "training/runs/detect/train-5/weights/best.pt"
 CALIB_PATH = Path(__file__).resolve().parents[2] / "stereo_calibration.npz"
 CONF_THRESHOLD = 0.3
 # Tried shrinking the image the model looks at (640 default -> 480 -> 384)
