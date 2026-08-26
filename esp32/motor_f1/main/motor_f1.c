@@ -315,6 +315,19 @@ static volatile float pwm_right_shared = 0.0f;
 static volatile float imu_gz_rad_per_s_shared = 0.0f;
 static volatile bool imu_gz_valid_shared = false;
 
+/* Gyro zero-rate bias, raw LSB units (same units as the int16 gz field
+ * imu_read_raw returns) - measured once at boot by calibrate_gyro_bias()
+ * (see setup_imu()), subtracted from every raw gz reading before converting
+ * to rad/s. MEMS gyros essentially never read exactly zero at rest - a
+ * typical uncorrected zero-rate offset is a degree or more per second,
+ * which integrates directly into the heading estimate every single cycle,
+ * gyro-only or fused. Declared here (before uros_task, which is the first
+ * user) for the same declaration-order reason as the other globals above -
+ * this file has been bitten by that mistake enough times this session to
+ * not risk it again. Only ever written once, at boot, before either task
+ * starts - no cross-task synchronization needed. */
+static float g_gyro_z_bias_raw = 0.0f;
+
 /* Magnetometer heading fusion (2026-08-28), same cross-task pattern as
  * imu_gz_rad_per_s_shared above - written by uros_task's mag read, read by
  * control_task. mag_heading_valid_shared false means "don't use this",
@@ -354,6 +367,12 @@ static bool g_mag_calibrated = false;
  * conceptually "belongs", to avoid the exact declaration-order bug this
  * file has been bitten by before (CONTROL_PERIOD_MS, 2026-07-27). */
 #define GYRO_RAW_TO_RAD_PER_S (PI_F / (180.0f * 131.0f))
+
+/* Number of samples averaged for the boot-time gyro bias calibration (see
+ * g_gyro_z_bias_raw / calibration loop in setup_imu()). 100 samples @ ~10ms
+ * apart is ~1s total - long enough to average out ordinary sample noise,
+ * short enough not to meaningfully delay boot. */
+#define GYRO_CAL_SAMPLES 100
 
 /* Spinlock used to make "read + reset" atomic (avoids the lost-pulse race
  * where a pulse arrives between reading the counter and zeroing it). */
@@ -852,9 +871,10 @@ static void uros_task(void *arg) {
         std_msgs__msg__String diag_msg = {0};
         std_msgs__msg__String imu_msg = {0};
         char pid_gains_text[64];
-        char diag_text[200];   /* grown from 96/112/160 -- KP/KI/MAXI/KHEAD/MAG fields plus the
-                                 * existing RPM/PWM/I2C/WAKE fields plus g_i2c_scan_result's own
-                                 * 40-char worst case can exceed 160 */
+        char diag_text[280];   /* grown from 96/112/160/200 -- added raw MX/MY/MZ + MAGHDG fields
+                                 * plus the existing RPM/PWM/KP/KI/MAXI/KHEAD/I2C/WAKE/GZ/MAG
+                                 * fields plus g_i2c_scan_result's own 40-char worst case can
+                                 * exceed 200 */
         char imu_text[80];
 
         if (rclc_support_init(&support, 0, NULL, &allocator) != RCL_RET_OK) {
@@ -962,25 +982,6 @@ static void uros_task(void *arg) {
                     agent_ok = false;
                 }
 
-                /* Rebuilt every cycle now (see comment above) - live
-                 * per-wheel RPM/PWM for hardware debugging, since
-                 * idf.py monitor is unusable once this transport owns
-                 * UART0 (see note above cmd_vel_callback). */
-                snprintf(diag_text, sizeof(diag_text),
-                         "reset=%s RPM L=%.1f R=%.1f PWM L=%.0f R=%.0f KP=%.2f KI=%.2f MAXI=%.1f KHEAD=%.1f I2C=%s WAKE=%d GZ=%s MAG=%s",
-                         reset_reason_str(g_reset_reason),
-                         rpm_left_shared, rpm_right_shared,
-                         pwm_left_shared, pwm_right_shared,
-                         g_kp, g_ki, g_max_i_contribution, g_kheading,
-                         g_i2c_scan_result, g_imu_wake_attempts,
-                         imu_gz_valid_shared ? "ok" : "no-read",
-                         mag_heading_valid_shared ? "ok" : "no-read");
-                diag_msg.data.size = strlen(diag_text);
-
-                if (rcl_publish(&diag_pub, &diag_msg, NULL) != RCL_RET_OK) {
-                    agent_ok = false;
-                }
-
                 /* IMU sanity-check read (2026-08-14) - done inline here
                  * rather than in its own task: I2C at 400kHz for 14 bytes
                  * is on the order of tens of microseconds, negligible next
@@ -997,8 +998,10 @@ static void uros_task(void *arg) {
                     /* gz <-> robot Z (yaw), empirically confirmed 2026-08-22:
                      * positive gz = turning left (CCW from above), matching
                      * control_task's existing encoder-differential dtheta
-                     * sign exactly - no sign flip needed. */
-                    imu_gz_rad_per_s_shared = (float)imu_gz * GYRO_RAW_TO_RAD_PER_S;
+                     * sign exactly - no sign flip needed. Bias-subtracted
+                     * (2026-08-28) - see g_gyro_z_bias_raw comment above for
+                     * why an uncorrected zero-rate offset matters here. */
+                    imu_gz_rad_per_s_shared = ((float)imu_gz - g_gyro_z_bias_raw) * GYRO_RAW_TO_RAD_PER_S;
                     imu_gz_valid_shared = true;
                 } else {
                     snprintf(imu_text, sizeof(imu_text), "imu_read_failed");
@@ -1031,7 +1034,7 @@ static void uros_task(void *arg) {
                  * hardware yet - check whether a rising heading value here
                  * actually matches "turning left" before trusting the fused
                  * pose_theta_shared, may need a sign flip. */
-                int16_t mag_x, mag_y, mag_z;
+                int16_t mag_x = 0, mag_y = 0, mag_z = 0;
                 if (mag_read_raw(&mag_x, &mag_y, &mag_z)) {
                     float raw_heading = atan2f((float)mag_y, (float)mag_x);
                     if (!g_mag_calibrated) {
@@ -1045,6 +1048,40 @@ static void uros_task(void *arg) {
                     mag_heading_valid_shared = true;
                 } else {
                     mag_heading_valid_shared = false;
+                }
+
+                /* Rebuilt every cycle now (see comment above) - live
+                 * per-wheel RPM/PWM for hardware debugging, since
+                 * idf.py monitor is unusable once this transport owns
+                 * UART0 (see note above cmd_vel_callback). Moved to AFTER
+                 * both the IMU and magnetometer reads above (2026-08-28,
+                 * was built earlier in this same function before either had
+                 * run) so it reports THIS cycle's values, not last cycle's -
+                 * and now includes raw MX/MY/MZ + the computed pre-fusion
+                 * compass heading (MAGHDG), added specifically to debug the
+                 * "heading keeps drifting back to ~17deg" report: this
+                 * shows directly whether the raw magnetometer values
+                 * actually change as the robot physically rotates (a real
+                 * sensor reading real world) or stay put regardless of
+                 * orientation (nearby magnetic interference - e.g. the
+                 * drive motors' permanent magnets - or a wrong axis in the
+                 * atan2f call swamping the real signal). */
+                snprintf(diag_text, sizeof(diag_text),
+                         "reset=%s RPM L=%.1f R=%.1f PWM L=%.0f R=%.0f KP=%.2f KI=%.2f MAXI=%.1f KHEAD=%.1f I2C=%s WAKE=%d GZ=%s GZBIAS=%.1f MAG=%s MX=%d MY=%d MZ=%d MAGHDG=%.1f",
+                         reset_reason_str(g_reset_reason),
+                         rpm_left_shared, rpm_right_shared,
+                         pwm_left_shared, pwm_right_shared,
+                         g_kp, g_ki, g_max_i_contribution, g_kheading,
+                         g_i2c_scan_result, g_imu_wake_attempts,
+                         imu_gz_valid_shared ? "ok" : "no-read",
+                         g_gyro_z_bias_raw / 131.0f,   /* raw LSB -> deg/s, human-readable */
+                         mag_heading_valid_shared ? "ok" : "no-read",
+                         mag_x, mag_y, mag_z,
+                         mag_heading_rad_shared * 180.0f / PI_F);
+                diag_msg.data.size = strlen(diag_text);
+
+                if (rcl_publish(&diag_pub, &diag_msg, NULL) != RCL_RET_OK) {
+                    agent_ok = false;
                 }
             }
 
@@ -1251,6 +1288,32 @@ static void setup_imu(void) {
     if (!wake_ok) {
         g_imu_wake_attempts = -1;
         imu_dev = NULL;  /* wiring/address wrong - don't let later reads run */
+    }
+
+    /* Gyro zero-rate bias calibration (2026-08-28) - see g_gyro_z_bias_raw
+     * comment above for the why. Runs once here, blocking, before either
+     * task starts - the robot MUST be stationary through this (nothing else
+     * is driving it yet at this point in boot, so that's already true).
+     * Averages GYRO_CAL_SAMPLES readings rather than trusting one, to
+     * average out ordinary per-sample sensor noise, not just the constant
+     * bias. Only meaningful if the IMU actually woke - a dead/absent IMU
+     * has nothing to calibrate, g_gyro_z_bias_raw stays at its 0.0f default
+     * (imu_gz_valid_shared will be false anyway in that case, so this
+     * bias is never even applied to anything). */
+    if (wake_ok) {
+        float bias_sum = 0.0f;
+        int good_samples = 0;
+        for (int i = 0; i < GYRO_CAL_SAMPLES; i++) {
+            int16_t cal_ax, cal_ay, cal_az, cal_gx, cal_gy, cal_gz;
+            if (imu_read_raw(&cal_ax, &cal_ay, &cal_az, &cal_gx, &cal_gy, &cal_gz)) {
+                bias_sum += (float)cal_gz;
+                good_samples++;
+            }
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
+        if (good_samples > 0) {
+            g_gyro_z_bias_raw = bias_sum / (float)good_samples;
+        }
     }
 
     /* GY-86/87-style boards wire the magnetometer through the MPU6050's own
