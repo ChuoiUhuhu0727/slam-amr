@@ -315,6 +315,16 @@ static volatile bool imu_gz_valid_shared = false;
 static volatile float mag_heading_rad_shared = 0.0f;
 static volatile bool mag_heading_valid_shared = false;
 
+/* Boot-time zero-reference "calibration" (see uros_task's mag_read_raw call
+ * site) - only ever touched from within uros_task itself, no cross-task
+ * sharing needed, unlike the two above. Declared here (before uros_task,
+ * which is the first user of them) for the same declaration-order reason as
+ * CONTROL_PERIOD_MS/GYRO_RAW_TO_RAD_PER_S above - this file has been bitten
+ * by using-before-declaring before, this is that same bug caught at
+ * compile time this round instead of shipping it. */
+static float g_mag_heading_offset_rad = 0.0f;
+static bool g_mag_calibrated = false;
+
 /* How strongly each 200ms control cycle nudges pose_theta_shared toward the
  * compass heading. Deliberately small: the gyro should still dominate
  * moment-to-moment (smooth, fast, low-noise), the compass only slowly
@@ -1105,14 +1115,10 @@ static i2c_master_dev_handle_t imu_dev = NULL;
 
 /* Magnetometer device handle, same lifecycle/threading rules as imu_dev
  * above - set once by setup_magnetometer() (called from setup_imu(), see
- * below), read-only afterward. g_mag_heading_offset_rad/g_mag_calibrated
- * are only ever touched from within uros_task (the boot-time zero-reference
- * "calibration", see the mag_read_raw() call site) - no cross-task sharing
- * needed for those two, unlike mag_heading_rad_shared/mag_heading_valid_shared
- * which control_task also reads. */
+ * below), read-only afterward. g_mag_heading_offset_rad/g_mag_calibrated are
+ * declared earlier in the file (near mag_heading_rad_shared) - see the
+ * comment there for why. */
 static i2c_master_dev_handle_t mag_dev = NULL;
-static float g_mag_heading_offset_rad = 0.0f;
-static bool g_mag_calibrated = false;
 
 /* One-shot diagnostic: probe every valid 7-bit address (1-126) and record
  * which ones ACK. TEMPORARY debugging aid for the 2026-08-20 imu_read_failed
