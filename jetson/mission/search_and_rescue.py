@@ -144,7 +144,18 @@ STEREO_MIN_DISPARITY_PX = 2.0
 STEREO_MAX_DISTANCE_M = 5.0
 
 GOAL_TOLERANCE_M = 0.10       # "close enough" to a waypoint
-TURN_IN_PLACE_THRESHOLD = 0.35  # rad (~20deg) -- above this, stop and turn first
+# Raised 2026-08-28 (was 0.35 rad / ~20deg): this threshold predates the
+# IMU-based heading PID on the ESP32 - back when heading correction while
+# driving was weak/noisy (encoder-only), stopping to pure-rotate below even
+# a small error was the safer choice. Now that heading correction while
+# actually driving is solid, a small error is better absorbed by that
+# continuous correction than by stopping - confirmed live as the cause of
+# the "stutters and stops to correct" symptom: every 100ms control tick,
+# ANY heading error over the old 20deg threshold triggered a full stop.
+# Raised to ~50deg - still stops for a genuinely large misalignment (a new
+# leg needing close to a 90deg turn), but lets smaller ongoing deviations
+# get corrected while still moving forward, not by halting.
+TURN_IN_PLACE_THRESHOLD = 0.9  # rad (~50deg) -- above this, stop and turn first
 # Raised 2026-08-26: PWM maxing at ~78/255 during live tests was traced to
 # these caps, not a weak PID -- target_rpm = v / WHEEL_CIRCUMFERENCE_M * 60,
 # so 0.15 m/s only ever asked for ~43 RPM, and the tiny WHEELBASE_M (0.10m)
@@ -175,17 +186,21 @@ CONTROL_PERIOD_S = 0.1   # 10 Hz control loop, navigation only -- camera grab +
 # needing a manual click every time.
 PID_GAINS_PATH = Path(__file__).resolve().parent / "pid_gains.json"
 PID_GAINS_REPUBLISH_PERIOD_S = 2.0
-# Must match motor_f1.c's g_kp/g_ki/g_max_i_contribution defaults -- these are
-# only the fallback used before any dashboard save has ever happened (or if
-# pid_gains.json is missing/corrupt).
-DEFAULT_PID_GAINS = {'kp': 3.0, 'ki': 0.2, 'max_i': 40.0}
+# Must match motor_f1.c's g_kp/g_ki/g_max_i_contribution/g_kheading/g_trim_left/
+# g_trim_right defaults -- these are only the fallback used before any dashboard
+# save has ever happened (or if pid_gains.json is missing/corrupt).
+DEFAULT_PID_GAINS = {'kp': 3.0, 'ki': 0.2, 'max_i': 40.0, 'khead': 15.0, 'trim_left': 0.0, 'trim_right': 0.0}
 
 
 def load_pid_gains():
     try:
         with open(PID_GAINS_PATH) as f:
             data = json.load(f)
-        return {'kp': float(data['kp']), 'ki': float(data['ki']), 'max_i': float(data['max_i'])}
+        return {
+            'kp': float(data['kp']), 'ki': float(data['ki']),
+            'max_i': float(data['max_i']), 'khead': float(data['khead']),
+            'trim_left': float(data['trim_left']), 'trim_right': float(data['trim_right']),
+        }
     except (FileNotFoundError, KeyError, ValueError, TypeError, json.JSONDecodeError):
         return dict(DEFAULT_PID_GAINS)
 
@@ -432,11 +447,14 @@ class SearchAndRescue(Node):
     def _publish_pid_gains(self):
         msg = String()
         g = self.pid_gains
-        msg.data = f"KP={g['kp']:.4f},KI={g['ki']:.4f},MAXI={g['max_i']:.4f}"
+        msg.data = (f"KP={g['kp']:.4f},KI={g['ki']:.4f},MAXI={g['max_i']:.4f},KHEAD={g['khead']:.4f},"
+                    f"TRIML={g['trim_left']:.4f},TRIMR={g['trim_right']:.4f}")
         self.pid_pub.publish(msg)
 
-    def set_pid_gains(self, kp: float, ki: float, max_i: float):
-        self.pid_gains = {'kp': kp, 'ki': ki, 'max_i': max_i}
+    def set_pid_gains(self, kp: float, ki: float, max_i: float, khead: float,
+                       trim_left: float, trim_right: float):
+        self.pid_gains = {'kp': kp, 'ki': ki, 'max_i': max_i, 'khead': khead,
+                           'trim_left': trim_left, 'trim_right': trim_right}
         save_pid_gains(self.pid_gains)
         self._publish_pid_gains()
 
@@ -714,10 +732,14 @@ class SearchAndRescue(Node):
                 kp = float(data['kp'])
                 ki = float(data['ki'])
                 max_i = float(data['max_i'])
+                khead = float(data['khead'])
+                trim_left = float(data['trim_left'])
+                trim_right = float(data['trim_right'])
             except (TypeError, ValueError, KeyError):
-                return jsonify({'ok': False, 'error': 'expected JSON {kp, ki, max_i} as numbers'}), 400
-            node.set_pid_gains(kp, ki, max_i)
-            node.get_logger().info(f"PID gains updated via dashboard: Kp={kp} Ki={ki} MaxI={max_i}")
+                return jsonify({'ok': False, 'error': 'expected JSON {kp, ki, max_i, khead, trim_left, trim_right} as numbers'}), 400
+            node.set_pid_gains(kp, ki, max_i, khead, trim_left, trim_right)
+            node.get_logger().info(f"PID gains updated via dashboard: Kp={kp} Ki={ki} MaxI={max_i} Khead={khead} "
+                                    f"TrimL={trim_left} TrimR={trim_right}")
             return jsonify({'ok': True, 'pid_gains': node.pid_gains})
 
         @app.route('/video_feed_left')
@@ -908,10 +930,17 @@ HTML_PAGE = """<!doctype html>
           <label>Kp <input id="pidKp" type="number" step="0.1"></label>
           <label>Ki <input id="pidKi" type="number" step="0.05"></label>
           <label>Max I contribution <input id="pidMaxI" type="number" step="5"></label>
+          <label>Heading Kp (gyro) <input id="pidKhead" type="number" step="1"></label>
           <button id="pidPushBtn" onclick="pushPidGains()">Push to robot</button>
         </div>
+        <div class="pid-row">
+          <label>Trim left (PWM) <input id="pidTrimL" type="number" step="1"></label>
+          <label>Trim right (PWM) <input id="pidTrimR" type="number" step="1"></label>
+        </div>
         <div class="legend" id="pidStatus">
-          re-pushed automatically every 2s, so an ESP32 reboot picks the saved values back up on its own
+          re-pushed automatically every 2s, so an ESP32 reboot picks the saved values back up on its own.
+          Trim = a flat PWM offset added on top of the PID output, for balancing a mechanically weaker motor -
+          only applies while actually driving, never during a stop.
         </div>
       </div>
     </div>
@@ -1048,17 +1077,21 @@ function pushPidGains() {
   const kp = parseFloat(document.getElementById('pidKp').value);
   const ki = parseFloat(document.getElementById('pidKi').value);
   const max_i = parseFloat(document.getElementById('pidMaxI').value);
-  if (!isFinite(kp) || !isFinite(ki) || !isFinite(max_i)) {
-    document.getElementById('pidStatus').innerText = 'enter valid numbers in all three fields first';
+  const khead = parseFloat(document.getElementById('pidKhead').value);
+  const trim_left = parseFloat(document.getElementById('pidTrimL').value);
+  const trim_right = parseFloat(document.getElementById('pidTrimR').value);
+  if (!isFinite(kp) || !isFinite(ki) || !isFinite(max_i) || !isFinite(khead) ||
+      !isFinite(trim_left) || !isFinite(trim_right)) {
+    document.getElementById('pidStatus').innerText = 'enter valid numbers in all six fields first';
     return;
   }
   fetch('/pid_gains', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ kp, ki, max_i }),
+    body: JSON.stringify({ kp, ki, max_i, khead, trim_left, trim_right }),
   }).then(r => r.json()).then(res => {
     document.getElementById('pidStatus').innerText = res.ok
-      ? `saved + pushed at ${new Date().toLocaleTimeString()} -- watch the diag panel above for KP/KI/MAXI to confirm the ESP32 picked it up`
+      ? `saved + pushed at ${new Date().toLocaleTimeString()} -- watch the diag panel above for KP/KI/MAXI/KHEAD/TRIML/TRIMR to confirm the ESP32 picked it up`
       : (res.error || 'push failed');
   }).catch(() => {
     document.getElementById('pidStatus').innerText = 'push failed (dashboard unreachable?)';
@@ -1090,6 +1123,9 @@ function poll() {
       document.getElementById('pidKp').value = state.pid_gains.kp;
       document.getElementById('pidKi').value = state.pid_gains.ki;
       document.getElementById('pidMaxI').value = state.pid_gains.max_i;
+      document.getElementById('pidKhead').value = state.pid_gains.khead;
+      document.getElementById('pidTrimL').value = state.pid_gains.trim_left;
+      document.getElementById('pidTrimR').value = state.pid_gains.trim_right;
       pidFieldsInitialized = true;
     }
 

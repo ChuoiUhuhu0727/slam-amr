@@ -5,3 +5,5 @@ managed_components/
 *.elf
 *.bin
 .claude/
+.DS_Store
+jetson/mission/pid_gains.json
