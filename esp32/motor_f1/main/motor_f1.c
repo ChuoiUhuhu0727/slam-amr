@@ -210,37 +210,24 @@ static volatile float g_ki = 0.2f;
  * tight for real load, hence live-tunable now too. */
 static volatile float g_max_i_contribution = 40.0f;
 
-/* --- Heading control, replaces the old encoder-distance "wheel sync" (2026-08-28) ---
- * OLD approach: per-wheel PID kept each wheel near its own target RPM
- * independently (two separate error/integral tracks), plus a separate trim
- * based on comparing cumulative encoder PULSE COUNT between the two wheels.
- * Confirmed live: this let each wheel's loop hunt independently against its
- * own noisy/quantized encoder reading, and the sync trim itself was reacting
- * to an indirect signal (accumulated pulse-count drift) rather than the
- * actual physical thing that matters (is the robot actually rotating when it
- * shouldn't be, or rotating at the wrong rate when it should).
+/* --- Heading control ---
+ * Speed regulation is two INDEPENDENT per-wheel PID loops (see control_task)
+ * - each wheel converges to its own target from its own measured RPM, with
+ * its own integrator, so a real hardware asymmetry (e.g. more friction on
+ * one motor) gets corrected at its actual source instead of being inferred
+ * indirectly from rotation.
  *
- * NEW approach: ONE shared speed PID drives an averaged target (see
- * control_task below), and heading correction comes directly from the gyro -
- * compare the COMMANDED turn rate (angular.z) against the MEASURED turn rate
- * (imu_gz_rad_per_s_shared) every cycle, PROPORTIONAL only (no integral -
- * matches this codebase's own "start simple" philosophy; add I later only if
- * real testing shows a persistent steady-state heading error P alone can't
- * close). This runs continuously and unconditionally - no more
- * "only while going straight" gate, because rate-tracking naturally covers
- * both cases: commanded rate 0 -> holds straight, commanded rate nonzero ->
- * tracks the requested turn. Applied in the SIGNED target-RPM domain (before
- * the left/right magnitude split), same slot in the math the old sync_trim
- * used - verified this generalizes correctly to in-place turns (opposite-
- * signed wheel targets), unlike a naive +/- on the final PWM magnitude,
- * which cancels to zero net effect for that case (worked through the
- * algebra before implementing this way - a simpler-looking version that
- * applies the trim directly to PWM instead of signed RPM target would have
- * silently broken in-place turns).
- * Falls back to trim=0 (not the old encoder-based estimate) whenever the IMU
- * read is invalid - same "never trust a dead/stale sensor" philosophy as
- * imu_gz_valid_shared elsewhere in this file, safer than silently reverting
- * to the noisier encoder-diff signal mid-drive. */
+ * Heading correction comes from the gyro, layered on TOP of that: compare
+ * the desired turn rate (angular.z, or the heading-lock setpoint below when
+ * not actively told to turn) against the MEASURED turn rate
+ * (imu_gz_rad_per_s_shared), PROPORTIONAL only (no integral - matches this
+ * codebase's own "start simple" philosophy). This shifts each wheel's
+ * TARGET (added to one, subtracted from the other, in RPM units - same
+ * domain as target_rpm_left/right, so it composes by plain addition), not
+ * its PID gain - Kp/Ki only ever affect how hard a wheel's own loop chases
+ * its own error, heading correction only ever affects what that target IS.
+ * Falls back to trim=0 whenever the IMU read is invalid - never correct off
+ * a signal we don't trust. */
 static volatile float g_kheading = 15.0f;   /* RPM of trim per rad/s of heading-rate error - live-tunable, see pid_gains_callback */
 /* Ceiling on heading_trim_rpm - was a fixed #define (20.0f), too tight once
  * live testing (2026-08-27) showed it silently capping the correction well
@@ -250,6 +237,24 @@ static volatile float g_kheading = 15.0f;   /* RPM of trim per rad/s of heading-
  * heading error needs more authority than the old fixed ceiling allowed. */
 static volatile float g_max_heading_trim_rpm = 20.0f;
 
+/* Heading LOCK (position, not rate): g_kheading/g_max_heading_trim_rpm above
+ * only correct a RATE mismatch (commanded turn speed vs measured turn
+ * speed) - once the robot stops rotating it stops correcting, even if it's
+ * now pointed the wrong way. This adds the missing angle term: whenever the
+ * commanded angular.z is ~0 (straight driving, or sitting still after a
+ * turn), latch the current heading as a target and keep computing a virtual
+ * "turn rate" proportional to how far off that target the robot drifts -
+ * this virtual rate feeds into the same g_kheading rate loop above (see
+ * control_task), reusing it instead of adding a second output path. */
+static volatile float g_kheading_lock = 2.0f;          /* virtual rad/s per rad of heading error */
+static volatile float g_max_heading_lock_rate = 0.6f;  /* rad/s ceiling on that virtual rate */
+/* volatile: written by control_task, read by uros_task for the diag string
+ * (same cross-task pattern as pose_theta_shared etc. above). */
+static volatile float g_target_heading_rad = 0.0f;
+static volatile bool  g_heading_lock_active = false;
+#define HEADING_LOCK_DEADBAND_RAD (0.5f * 3.14159265f / 180.0f)  /* ~0.5deg - don't hunt on sensor noise */
+#define ANGZ_TURN_DEADBAND 0.02f  /* rad/s - below this, cmd_vel counts as "not turning" */
+
 /* Manual per-wheel PWM trim (2026-08-28) - a flat PWM offset added on top of
  * everything the PID/heading loops already decided, for compensating a
  * mechanically weaker motor (different friction/torque between the two
@@ -257,8 +262,8 @@ static volatile float g_max_heading_trim_rpm = 20.0f;
  * fix, since it's a per-wheel hardware asymmetry, not an error signal).
  * Live-tunable via the same /pid_gains mechanism as Kp/Ki/etc (see
  * pid_gains_callback) - deliberately NOT touched by pid_step's target==0
- * safety bypass (see the avg_target_rpm > 0.01f gate at its application
- * site below): a commanded stop must still mean PWM=0, trim included -
+ * safety bypass (see the commanded_to_move gate at its application site
+ * below): a commanded stop must still mean PWM=0, trim included -
  * otherwise a stale/lost /cmd_vel would leave one wheel creeping instead of
  * actually stopping, defeating the whole point of that safety bypass. */
 static volatile float g_trim_left = 0.0f;
@@ -287,6 +292,12 @@ static volatile bool g_reset_odom_requested = false;
 #define PI_F 3.14159265f   /* not relying on M_PI - not guaranteed defined by every libc without _USE_MATH_DEFINES */
 #define WHEEL_CIRCUMFERENCE_M (PI_F * WHEEL_DIAMETER_M)
 #define DISTANCE_PER_PULSE_M (WHEEL_CIRCUMFERENCE_M / SLOTS_PER_REV)
+
+static inline float wrap_angle_rad(float a) {
+    while (a > PI_F)  a -= 2.0f * PI_F;
+    while (a < -PI_F) a += 2.0f * PI_F;
+    return a;
+}
 
 /* --- F5: /cmd_vel in, /odom out (2026-07-27) ---
  * Safety default: if no /cmd_vel received within this long (agent crash,
@@ -579,10 +590,10 @@ static void control_task(void *arg) {
 
     uint32_t snapshot_left, snapshot_right;
     float applied_pwm_left = 0.0f, applied_pwm_right = 0.0f;
-    /* ONE shared integral now (was integral_left/integral_right) - see the
-     * "Heading control" comment block above g_kheading for why two
-     * independent per-wheel integrators were part of the jitter problem. */
-    float integral_speed = 0.0f;
+    /* Independent per-wheel integrators (restored) - see the speed
+     * regulation block below for why this and IMU-based heading trim don't
+     * fight each other the way a single shared-average loop did. */
+    float integral_left = 0.0f, integral_right = 0.0f;
     uint32_t stall_cycles_left = 0, stall_cycles_right = 0;
     /* F4 pose lives in pose_x_shared/pose_y_shared/pose_theta_shared now
      * (F5 needs uros_task to read it) - origin = wherever the robot is at
@@ -620,6 +631,7 @@ static void control_task(void *arg) {
             pose_x_shared = 0.0f;
             pose_y_shared = 0.0f;
             pose_theta_shared = 0.0f;
+            g_heading_lock_active = false;   /* re-latch fresh against the new zero below */
             g_reset_odom_requested = false;
         }
 
@@ -692,28 +704,41 @@ static void control_task(void *arg) {
         float target_rpm_left  = v_left_mps  / WHEEL_CIRCUMFERENCE_M * 60.0f;
         float target_rpm_right = v_right_mps / WHEEL_CIRCUMFERENCE_M * 60.0f;
 
-        /* Heading trim, IMU-driven (2026-08-28, replaces the old encoder-
-         * distance sync trim - see the big comment above g_kheading for the
-         * full reasoning). Compare commanded turn rate to the gyro's
-         * MEASURED turn rate - unconditional, no "only while going
-         * straight" gate needed, since this naturally covers both: commanded
-         * 0 -> holds straight, commanded nonzero -> tracks the turn.
-         * Zero trim (not an encoder-based guess) whenever the IMU read is
-         * invalid - never correct off a signal we don't trust. Applied in
-         * the SIGNED target-RPM domain, same spot the old sync_trim used -
-         * this is what makes it generalize correctly to in-place turns
-         * (opposite-signed wheel targets).
-         *
-         * Gated on actually being commanded to move (2026-08-27 fix): with
-         * no gate, heading_trim_rpm was computed off gyro noise even at a
-         * commanded stop (target=0 vs a few deg/s of real sensor noise),
-         * which is enough to make signed_target_left/right nonzero and drive
-         * a real, audible twitch on both wheels while just sitting idle -
-         * chasing noise, not a real heading error worth correcting. */
+        /* Heading lock: latch a target heading the instant we're not being
+         * told to actively turn, then keep computing a virtual turn-rate
+         * setpoint toward it every cycle - this is what makes the robot
+         * fight back against drift/inertia slip even after cmd_vel goes to
+         * (0,0), not just while a nonzero command is live. */
+        bool commanding_turn = fabsf(angular_z) > ANGZ_TURN_DEADBAND;
+        if (commanding_turn) {
+            g_heading_lock_active = false;
+        } else if (!g_heading_lock_active) {
+            g_target_heading_rad = pose_theta_shared;
+            g_heading_lock_active = true;
+        }
+
+        float angular_z_setpoint = angular_z;
+        if (g_heading_lock_active) {
+            float heading_error = wrap_angle_rad(g_target_heading_rad - pose_theta_shared);
+            if (fabsf(heading_error) > HEADING_LOCK_DEADBAND_RAD) {
+                angular_z_setpoint = g_kheading_lock * heading_error;
+                if (angular_z_setpoint > g_max_heading_lock_rate)  angular_z_setpoint = g_max_heading_lock_rate;
+                if (angular_z_setpoint < -g_max_heading_lock_rate) angular_z_setpoint = -g_max_heading_lock_rate;
+            } else {
+                angular_z_setpoint = 0.0f;
+            }
+        }
+
+        /* Heading trim, in RPM units - shifts each wheel's OWN target below,
+         * same domain as target_rpm_left/right so it composes with them by
+         * plain addition. Computed the same way as before (rate loop vs the
+         * IMU, fed by the position-lock setpoint above); what changed is
+         * only where it lands - onto two independent per-wheel targets
+         * instead of a shared averaged one. */
         float heading_trim_rpm = 0.0f;
-        bool commanded_to_move = (fabsf(linear_x) > 0.001f) || (fabsf(angular_z) > 0.001f);
+        bool commanded_to_move = (fabsf(linear_x) > 0.001f) || (fabsf(angular_z_setpoint) > 0.001f);
         if (imu_gz_valid_shared && commanded_to_move) {
-            float heading_rate_error = angular_z - imu_gz_rad_per_s_shared;
+            float heading_rate_error = angular_z_setpoint - imu_gz_rad_per_s_shared;
             heading_trim_rpm = g_kheading * heading_rate_error;
             if (heading_trim_rpm > g_max_heading_trim_rpm)  heading_trim_rpm = g_max_heading_trim_rpm;
             if (heading_trim_rpm < -g_max_heading_trim_rpm) heading_trim_rpm = -g_max_heading_trim_rpm;
@@ -722,61 +747,42 @@ static void control_task(void *arg) {
         float signed_target_left  = target_rpm_left  - heading_trim_rpm;
         float signed_target_right = target_rpm_right + heading_trim_rpm;
 
-        /* Direction pins, set every cycle from this cycle's target sign.
-         * BUG FIXED 2026-08-26: these were only ever set ONCE at boot (see
-         * app_main), always to forward, and never updated here. PID/PWM
-         * only ever computes a MAGNITUDE (the single-channel encoders can't
-         * report direction either, so actual_rpm is always >=0 too) -
-         * direction is a separate concern that has to be set explicitly.
-         * Any command needing a wheel to reverse (e.g. an in-place turn,
-         * where the inner wheel's target goes negative) was silently
-         * clamped to PWM=0 by pid_step's MIN_SAFE_PWM floor instead of
-         * actually reversing - that wheel was completely dead the whole
-         * time, which is why in-place turns couldn't move the (heavy)
-         * robot even with PWM ramping up on the other wheel: it was trying
-         * to drag the whole chassis around a single stationary wheel using
-         * only one motor. AIN1=0/AIN2=1 (BIN1=0/BIN2=1) = forward, per the
-         * flipped convention set in app_main - reverse is the opposite pair. */
+        /* Direction pins, set every cycle from this cycle's target sign -
+         * PID/PWM below only ever computes a MAGNITUDE (the single-channel
+         * encoders can't report direction either, so actual_rpm is always
+         * >=0 too), so direction has to be decided separately, from the
+         * signed target above. AIN1=0/AIN2=1 (BIN1=0/BIN2=1) = forward, per
+         * the flipped convention set in app_main - reverse is the opposite
+         * pair. */
         gpio_set_level(AIN1_PIN, signed_target_left  < 0.0f ? 1 : 0);
         gpio_set_level(AIN2_PIN, signed_target_left  < 0.0f ? 0 : 1);
         gpio_set_level(BIN1_PIN, signed_target_right < 0.0f ? 1 : 0);
         gpio_set_level(BIN2_PIN, signed_target_right < 0.0f ? 0 : 1);
 
-        /* Speed regulation, ONE shared PID on the AVERAGE of the two wheels
-         * (2026-08-28, replaces two independent per-wheel PID calls - see
-         * the comment above g_kheading for why running two separately was
-         * likely a real cause of the reported jitter: each wheel's loop
-         * hunting independently against its own noisy encoder reading, with
-         * no coordination between them). avg_target_rpm already has the
-         * heading trim baked in (via signed_target_left/right above), so
-         * the left/right split below still correctly reflects any commanded
-         * turn - it's just driven by one shared error/integral track instead
-         * of two competing ones. */
-        float avg_target_rpm = (fabsf(signed_target_left) + fabsf(signed_target_right)) / 2.0f;
-        float avg_actual_rpm = (rpm_left_shared + rpm_right_shared) / 2.0f;
-        float base_pwm = (float)pid_step(avg_target_rpm, avg_actual_rpm, &integral_speed);
-
-        /* Distribute the shared base_pwm between the two wheels, keeping
-         * the same left/right ratio their (trim-corrected) targets imply -
-         * e.g. an in-place turn wants both wheels at roughly equal
-         * magnitude, a gentle curve wants a small imbalance. Guarded
-         * against divide-by-zero when the robot is commanded to a stop
-         * (avg_target_rpm == 0, in which case pid_step already returns 0
-         * for base_pwm too, so the ratio doesn't matter). */
-        float left_ratio  = (avg_target_rpm > 0.01f) ? (fabsf(signed_target_left)  / avg_target_rpm) : 1.0f;
-        float right_ratio = (avg_target_rpm > 0.01f) ? (fabsf(signed_target_right) / avg_target_rpm) : 1.0f;
-        float target_pwm_left  = base_pwm * left_ratio;
-        float target_pwm_right = base_pwm * right_ratio;
+        /* Speed regulation: INDEPENDENT per-wheel PID (restored) - each
+         * wheel converges to its OWN (heading-trimmed) target from its OWN
+         * measured RPM, with its own integrator. This is what actually
+         * fixes the Kp/Kheading coupling a shared-average loop had: Kp/Ki
+         * only ever affect how hard a wheel's own loop chases ITS OWN
+         * error, and heading correction only ever affects what that target
+         * IS (via signed_target_left/right above) - there's no shared
+         * output magnitude for the two to fight over, and no ratio-split
+         * multiplication that lets Kp inadvertently scale heading
+         * authority. A genuine hardware asymmetry (e.g. one motor with more
+         * internal friction) is corrected at its actual source too: that
+         * wheel's own PID sees its own RPM undershoot and pushes its own
+         * PWM harder, independent of the other wheel entirely. */
+        float target_pwm_left  = (float)pid_step(fabsf(signed_target_left),  rpm_left_shared,  &integral_left);
+        float target_pwm_right = (float)pid_step(fabsf(signed_target_right), rpm_right_shared, &integral_right);
 
         /* Manual trim, added last - only while actually commanded to move
-         * (same avg_target_rpm > 0.01f condition as the ratio split above),
-         * so a commanded/watchdog stop still means true PWM=0 on both
-         * wheels, trim included. Clamped both ends now (not just the top) -
-         * trim didn't exist when the original MAX_SAFE_PWM-only clamp was
-         * written, and a negative trim could otherwise push this below 0
-         * before the uint32_t cast a few lines down, wrapping into a huge
-         * PWM value instead of a small negative one. */
-        if (avg_target_rpm > 0.01f) {
+         * (real target or heading-lock correction, not a genuine stop), so
+         * a commanded/watchdog stop still means true PWM=0 on both wheels
+         * once heading error is also resolved, trim included. Clamped both
+         * ends - trim could otherwise push this below 0 before the
+         * uint32_t cast a few lines down, wrapping into a huge PWM value
+         * instead of a small negative one. */
+        if (commanded_to_move) {
             target_pwm_left  += g_trim_left;
             target_pwm_right += g_trim_right;
         }
@@ -905,9 +911,9 @@ static void pid_gains_callback(const void *msgin) {
         g_reset_odom_requested = true;
         return;
     }
-    float kp, ki, max_i, khead, trim_l, trim_r, max_head;
-    if (sscanf(msg->data.data, "KP=%f,KI=%f,MAXI=%f,KHEAD=%f,TRIML=%f,TRIMR=%f,MAXHEAD=%f",
-               &kp, &ki, &max_i, &khead, &trim_l, &trim_r, &max_head) == 7) {
+    float kp, ki, max_i, khead, trim_l, trim_r, max_head, klock, max_lock;
+    if (sscanf(msg->data.data, "KP=%f,KI=%f,MAXI=%f,KHEAD=%f,TRIML=%f,TRIMR=%f,MAXHEAD=%f,KLOCK=%f,MAXLOCK=%f",
+               &kp, &ki, &max_i, &khead, &trim_l, &trim_r, &max_head, &klock, &max_lock) == 9) {
         g_kp = kp;
         g_ki = ki;
         g_max_i_contribution = max_i;
@@ -915,6 +921,8 @@ static void pid_gains_callback(const void *msgin) {
         g_trim_left = trim_l;
         g_trim_right = trim_r;
         g_max_heading_trim_rpm = max_head;
+        g_kheading_lock = klock;
+        g_max_heading_lock_rate = max_lock;
     }
 }
 
@@ -956,7 +964,7 @@ static void uros_task(void *arg) {
                                      * sscanf match -- no gain change reaches the firmware,
                                      * with no error anywhere. Sized with real headroom this
                                      * time so adding one more field later doesn't repeat this. */
-        char diag_text[320];   /* grown from 96/112/160/200/280 -- added TRIML/TRIMR fields plus
+        char diag_text[400];   /* grown from 96/112/160/200/280/320 -- added TRIML/TRIMR fields plus
                                  * the existing RPM/PWM/KP/KI/MAXI/KHEAD/I2C/WAKE/GZ/MAG/MX/MY/MZ/
                                  * MAGHDG fields plus g_i2c_scan_result's own 40-char worst case can
                                  * exceed 200 */
@@ -1152,11 +1160,15 @@ static void uros_task(void *arg) {
                  * drive motors' permanent magnets - or a wrong axis in the
                  * atan2f call swamping the real signal). */
                 snprintf(diag_text, sizeof(diag_text),
-                         "reset=%s RPM L=%.1f R=%.1f PWM L=%.0f R=%.0f KP=%.2f KI=%.2f MAXI=%.1f KHEAD=%.1f MAXHEAD=%.1f TRIML=%.1f TRIMR=%.1f I2C=%s WAKE=%d GZ=%s GZBIAS=%.1f MAG=%s MX=%d MY=%d MZ=%d MAGHDG=%.1f",
+                         "reset=%s RPM L=%.1f R=%.1f PWM L=%.0f R=%.0f KP=%.2f KI=%.2f MAXI=%.1f KHEAD=%.1f MAXHEAD=%.1f TRIML=%.1f TRIMR=%.1f KLOCK=%.2f MAXLOCK=%.2f LOCK=%s TGT=%.1f HDGERR=%.1f I2C=%s WAKE=%d GZ=%s GZBIAS=%.1f MAG=%s MX=%d MY=%d MZ=%d MAGHDG=%.1f",
                          reset_reason_str(g_reset_reason),
                          rpm_left_shared, rpm_right_shared,
                          pwm_left_shared, pwm_right_shared,
                          g_kp, g_ki, g_max_i_contribution, g_kheading, g_max_heading_trim_rpm, g_trim_left, g_trim_right,
+                         g_kheading_lock, g_max_heading_lock_rate,
+                         g_heading_lock_active ? "on" : "off",
+                         g_target_heading_rad * 180.0f / PI_F,
+                         wrap_angle_rad(g_target_heading_rad - pose_theta_shared) * 180.0f / PI_F,
                          g_i2c_scan_result, g_imu_wake_attempts,
                          imu_gz_valid_shared ? "ok" : "no-read",
                          g_gyro_z_bias_raw / 131.0f,   /* raw LSB -> deg/s, human-readable */

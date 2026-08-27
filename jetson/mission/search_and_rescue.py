@@ -224,7 +224,8 @@ PID_GAINS_REPUBLISH_PERIOD_S = 2.0
 # the fallback used before any dashboard save has ever happened (or if
 # pid_gains.json is missing/corrupt).
 DEFAULT_PID_GAINS = {'kp': 3.0, 'ki': 0.2, 'max_i': 40.0, 'khead': 15.0,
-                      'max_head_trim': 20.0, 'trim_left': 0.0, 'trim_right': 0.0}
+                      'max_head_trim': 20.0, 'trim_left': 0.0, 'trim_right': 0.0,
+                      'klock': 2.0, 'max_lock': 0.6}
 
 
 def load_pid_gains():
@@ -236,6 +237,11 @@ def load_pid_gains():
             'max_i': float(data['max_i']), 'khead': float(data['khead']),
             'max_head_trim': float(data['max_head_trim']),
             'trim_left': float(data['trim_left']), 'trim_right': float(data['trim_right']),
+            # .get(), not data[...] -- an existing pid_gains.json saved before
+            # heading-lock existed won't have these keys; fall back to the
+            # defaults for just these two instead of resetting every gain.
+            'klock': float(data.get('klock', DEFAULT_PID_GAINS['klock'])),
+            'max_lock': float(data.get('max_lock', DEFAULT_PID_GAINS['max_lock'])),
         }
     except (FileNotFoundError, KeyError, ValueError, TypeError, json.JSONDecodeError):
         return dict(DEFAULT_PID_GAINS)
@@ -492,14 +498,17 @@ class SearchAndRescue(Node):
         msg = String()
         g = self.pid_gains
         msg.data = (f"KP={g['kp']:.4f},KI={g['ki']:.4f},MAXI={g['max_i']:.4f},KHEAD={g['khead']:.4f},"
-                    f"TRIML={g['trim_left']:.4f},TRIMR={g['trim_right']:.4f},MAXHEAD={g['max_head_trim']:.4f}")
+                    f"TRIML={g['trim_left']:.4f},TRIMR={g['trim_right']:.4f},MAXHEAD={g['max_head_trim']:.4f},"
+                    f"KLOCK={g['klock']:.4f},MAXLOCK={g['max_lock']:.4f}")
         self.pid_pub.publish(msg)
 
     def set_pid_gains(self, kp: float, ki: float, max_i: float, khead: float,
-                       trim_left: float, trim_right: float, max_head_trim: float):
+                       trim_left: float, trim_right: float, max_head_trim: float,
+                       klock: float, max_lock: float):
         self.pid_gains = {'kp': kp, 'ki': ki, 'max_i': max_i, 'khead': khead,
                            'trim_left': trim_left, 'trim_right': trim_right,
-                           'max_head_trim': max_head_trim}
+                           'max_head_trim': max_head_trim,
+                           'klock': klock, 'max_lock': max_lock}
         save_pid_gains(self.pid_gains)
         self._publish_pid_gains()
 
@@ -878,11 +887,14 @@ class SearchAndRescue(Node):
                 trim_left = float(data['trim_left'])
                 trim_right = float(data['trim_right'])
                 max_head_trim = float(data['max_head_trim'])
+                klock = float(data['klock'])
+                max_lock = float(data['max_lock'])
             except (TypeError, ValueError, KeyError):
-                return jsonify({'ok': False, 'error': 'expected JSON {kp, ki, max_i, khead, trim_left, trim_right, max_head_trim} as numbers'}), 400
-            node.set_pid_gains(kp, ki, max_i, khead, trim_left, trim_right, max_head_trim)
+                return jsonify({'ok': False, 'error': 'expected JSON {kp, ki, max_i, khead, trim_left, trim_right, max_head_trim, klock, max_lock} as numbers'}), 400
+            node.set_pid_gains(kp, ki, max_i, khead, trim_left, trim_right, max_head_trim, klock, max_lock)
             node.get_logger().info(f"PID gains updated via dashboard: Kp={kp} Ki={ki} MaxI={max_i} Khead={khead} "
-                                    f"TrimL={trim_left} TrimR={trim_right} MaxHeadTrim={max_head_trim}")
+                                    f"TrimL={trim_left} TrimR={trim_right} MaxHeadTrim={max_head_trim} "
+                                    f"Klock={klock} MaxLock={max_lock}")
             return jsonify({'ok': True, 'pid_gains': node.pid_gains})
 
         @app.route('/video_feed_left')
@@ -1132,12 +1144,19 @@ HTML_PAGE = """<!doctype html>
           <label>Trim left (PWM) <input id="pidTrimL" type="number" step="1"></label>
           <label>Trim right (PWM) <input id="pidTrimR" type="number" step="1"></label>
         </div>
+        <div class="pid-row">
+          <label>Heading lock Kp <input id="pidKlock" type="number" step="0.5"></label>
+          <label>Max lock rate (rad/s) <input id="pidMaxLock" type="number" step="0.1"></label>
+        </div>
         <div class="legend" id="pidStatus">
           re-pushed automatically every 2s, so an ESP32 reboot picks the saved values back up on its own.
           Trim = a flat PWM offset added on top of the PID output, for balancing a mechanically weaker motor -
           only applies while actually driving, never during a stop.
           Max heading trim = the ceiling on how hard heading correction can push the wheels apart -- set it
           very high for effectively no ceiling.
+          Heading lock = holds whatever heading the robot is pointed at whenever it's not actively told to turn
+          (straight driving, or sitting still after a turn) -- Kp is how hard it corrects a heading error,
+          max lock rate caps how fast it's allowed to spin the robot while doing that correction.
         </div>
       </div>
       <div class="panel">
@@ -1293,18 +1312,21 @@ function pushPidGains() {
   const max_head_trim = parseFloat(document.getElementById('pidMaxHeadTrim').value);
   const trim_left = parseFloat(document.getElementById('pidTrimL').value);
   const trim_right = parseFloat(document.getElementById('pidTrimR').value);
+  const klock = parseFloat(document.getElementById('pidKlock').value);
+  const max_lock = parseFloat(document.getElementById('pidMaxLock').value);
   if (!isFinite(kp) || !isFinite(ki) || !isFinite(max_i) || !isFinite(khead) ||
-      !isFinite(max_head_trim) || !isFinite(trim_left) || !isFinite(trim_right)) {
+      !isFinite(max_head_trim) || !isFinite(trim_left) || !isFinite(trim_right) ||
+      !isFinite(klock) || !isFinite(max_lock)) {
     document.getElementById('pidStatus').innerText = 'enter valid numbers in all fields first';
     return;
   }
   fetch('/pid_gains', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ kp, ki, max_i, khead, trim_left, trim_right, max_head_trim }),
+    body: JSON.stringify({ kp, ki, max_i, khead, trim_left, trim_right, max_head_trim, klock, max_lock }),
   }).then(r => r.json()).then(res => {
     document.getElementById('pidStatus').innerText = res.ok
-      ? `saved + pushed at ${new Date().toLocaleTimeString()} -- watch the diag panel above for KP/KI/MAXI/KHEAD/MAXHEAD/TRIML/TRIMR to confirm the ESP32 picked it up`
+      ? `saved + pushed at ${new Date().toLocaleTimeString()} -- watch the diag panel above for KP/KI/MAXI/KHEAD/MAXHEAD/TRIML/TRIMR/KLOCK/MAXLOCK/LOCK to confirm the ESP32 picked it up`
       : (res.error || 'push failed');
   }).catch(() => {
     document.getElementById('pidStatus').innerText = 'push failed (dashboard unreachable?)';
@@ -1362,6 +1384,8 @@ function poll() {
       document.getElementById('pidMaxHeadTrim').value = state.pid_gains.max_head_trim;
       document.getElementById('pidTrimL').value = state.pid_gains.trim_left;
       document.getElementById('pidTrimR').value = state.pid_gains.trim_right;
+      document.getElementById('pidKlock').value = state.pid_gains.klock;
+      document.getElementById('pidMaxLock').value = state.pid_gains.max_lock;
       pidFieldsInitialized = true;
     }
 
