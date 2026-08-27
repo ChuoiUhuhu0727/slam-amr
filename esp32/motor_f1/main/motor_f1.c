@@ -175,15 +175,15 @@ static bool mag_read_raw(int16_t *mx, int16_t *my, int16_t *mz);
  * older binary rather than the code we thought we were testing.
  *
  * Original context for the value itself: shorter window = coarser RPM
- * resolution with only 20 slots/rev. Raised 50ms -> 200ms (2026-07-27):
- * at 50ms, 1 pulse = 60 RPM/step, and a since-changed 30 RPM test target
- * sat exactly BETWEEN two measurable levels - the controller could never
- * read "at target". At 200ms, 1 pulse = 15 RPM/step - finer, though RPM
- * itself no longer depends on this window at all now (see last_interval_us
- * / RPM_STALE_US further down - period measurement replaced pulse
- * counting for the actual RPM value). This constant now only sets how
- * often PID/sync/PWM update, not measurement resolution. */
-#define CONTROL_PERIOD_MS 200   /* 5 Hz */
+ * resolution with only 20 slots/rev, back when RPM was computed by
+ * counting pulses per window. That's no longer how RPM is measured (see
+ * last_interval_us / RPM_STALE_US further down - period-based timing
+ * replaced pulse counting), so this constant only sets how often PID/PWM
+ * update, not measurement resolution - free to lower without reintroducing
+ * the old quantization problem. Lowered 200ms -> 50ms (2026-08-27) for
+ * tighter speed-loop response; control_task itself has no I2C/blocking
+ * calls, plenty of headroom on the ESP32 at this rate. */
+#define CONTROL_PERIOD_MS 50   /* 20 Hz */
 
 /* --- F3: PI velocity control (Kd deliberately skipped, see KI comment below) --- */
 /* TARGET_RPM (hardcoded 30, then 60) retired 2026-07-27 now that F5 wires
@@ -307,7 +307,17 @@ static inline float wrap_angle_rad(float a) {
  * ever arrives AND if a live connection drops mid-drive. */
 #define CMD_VEL_TIMEOUT_US 1000000   /* 1s */
 
-#define ODOM_PUBLISH_PERIOD_MS 100   /* 10 Hz */
+/* Also gates the IMU/magnetometer reads in uros_task (same block, see
+ * below) - lowered 100ms -> 50ms (2026-08-27) alongside CONTROL_PERIOD_MS
+ * so the gyro rate feeding heading correction refreshes every control
+ * cycle instead of every other one. Each I2C read is on the order of ~1-2ms
+ * at this bus speed, cheap against a 50ms budget. Not pushed lower than
+ * this: uros_task's outer loop already has an unconditional 20ms
+ * vTaskDelay per iteration (see the end of the agent_ok while-loop below),
+ * so a period much under ~40-50ms wouldn't reliably be hit anyway - the
+ * outer loop's own cadence would become the real bottleneck, not this
+ * constant. */
+#define ODOM_PUBLISH_PERIOD_MS 50   /* 20 Hz */
 
 static const char *TAG = "control_task";
 
@@ -576,15 +586,6 @@ static uint32_t pid_step(float target_rpm, float actual_rpm, float *integral) {
  * the ~50ms/pulse interval expected near TARGET_RPM=60. */
 #define RPM_STALE_US 500000
 
-/* Silent-failure guard: if PWM is clearly high enough to move the wheel but
- * pulse count stays 0 for this many consecutive cycles, the encoder is
- * almost certainly dead (misaligned, unglued, wiring fault) rather than the
- * wheel legitimately being stopped. 20 cycles = 4s at 5Hz (was 1s at the old
- * 20Hz) — one slot alone only needs ~100ms at TARGET_RPM, so this still has
- * generous margin against false positives from startup transients. */
-#define STALL_PWM_THRESHOLD 30.0f
-#define STALL_CYCLE_LIMIT   20
-
 static void control_task(void *arg) {
     encoder_gpio_init();
 
@@ -594,7 +595,6 @@ static void control_task(void *arg) {
      * regulation block below for why this and IMU-based heading trim don't
      * fight each other the way a single shared-average loop did. */
     float integral_left = 0.0f, integral_right = 0.0f;
-    uint32_t stall_cycles_left = 0, stall_cycles_right = 0;
     /* F4 pose lives in pose_x_shared/pose_y_shared/pose_theta_shared now
      * (F5 needs uros_task to read it) - origin = wherever the robot is at
      * boot/flash, all initialized 0 at file scope. */
@@ -800,28 +800,6 @@ static void control_task(void *arg) {
         ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_0);
         ledc_set_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1, (uint32_t)applied_pwm_right);
         ledc_update_duty(LEDC_HIGH_SPEED_MODE, LEDC_CHANNEL_1);
-
-        /* Stall watch, left wheel */
-        if (applied_pwm_left > STALL_PWM_THRESHOLD && snapshot_left == 0) {
-            stall_cycles_left++;
-            if (stall_cycles_left == STALL_CYCLE_LIMIT) {
-                ESP_LOGW(TAG, "LEFT encoder stall suspected: PWM=%.0f but 0 pulses for %ds",
-                         applied_pwm_left, STALL_CYCLE_LIMIT * CONTROL_PERIOD_MS / 1000);
-            }
-        } else {
-            stall_cycles_left = 0;
-        }
-
-        /* Stall watch, right wheel */
-        if (applied_pwm_right > STALL_PWM_THRESHOLD && snapshot_right == 0) {
-            stall_cycles_right++;
-            if (stall_cycles_right == STALL_CYCLE_LIMIT) {
-                ESP_LOGW(TAG, "RIGHT encoder stall suspected: PWM=%.0f but 0 pulses for %ds",
-                         applied_pwm_right, STALL_CYCLE_LIMIT * CONTROL_PERIOD_MS / 1000);
-            }
-        } else {
-            stall_cycles_right = 0;
-        }
 
         /* NOTE (F5): once uros_task's custom transport claims UART0, this
          * won't show up on idf.py monitor anymore - debug via `ros2 topic
