@@ -190,6 +190,24 @@ CONTROL_PERIOD_S = 0.1   # 10 Hz control loop, navigation only -- camera grab +
 MANUAL_MOVE_TIMEOUT_S = 30.0   # safety cutoff -- auto-stop if a target is
                                 # somehow never reached (e.g. odom stuck)
 
+# Manual turn ramp-down (2026-08-27) -- the manual turn primitive used to
+# command a constant MAX_ANGULAR_SPEED right up until the target was crossed,
+# then cut to 0 (bang-bang). At 1.5 rad/s (~86deg/s) the combined lag of
+# /odom's 10Hz publish, this node's own 10Hz control_tick, and the motors
+# coasting (no active brake -- PWM=0 just stops driving them, it doesn't stop
+# them) turned into pure overshoot: confirmed live, a commanded 90deg turn was
+# landing around 144deg. _navigate_tick already avoids this for patrol driving
+# by commanding angular.z proportional to heading error (KP_HEADING) instead
+# of a constant -- same fix applied here. Ramping down as the remaining angle
+# shrinks means the robot is moving slowly by the time it actually crosses the
+# target, so that same lag becomes a small error instead of tens of degrees.
+KP_TURN = 2.0                    # rad/s commanded per rad of remaining angle
+MIN_TURN_ANGULAR_SPEED = 0.3     # rad/s -- floor so the P term doesn't decay
+                                  # below what the motors can actually turn at
+                                  # (deadband/static friction) and stall short
+TURN_DONE_TOLERANCE = math.radians(2.0)  # good enough -- don't chase the
+                                          # last fraction of a degree forever
+
 # PID tuning box (2026-08-27) -- the ESP32's Kp/Ki/max-integral-contribution
 # used to be #define constants, needing a reflash to change. They're now
 # live-tunable over a new /pid_gains topic (see motor_f1.c pid_gains_callback)
@@ -556,8 +574,11 @@ class SearchAndRescue(Node):
             delta = wrap_angle(self.theta - m['last_theta'])
             m['last_theta'] = self.theta
             m['total_rotated'] += delta
-            target = abs(m['value'])
-            if abs(m['total_rotated']) >= target:
+            # Signed remaining angle (not abs()) -- shrinks from m['value']
+            # toward 0 as the turn progresses, same shape as _navigate_tick's
+            # heading_error, so the same clamp(KP * error) pattern applies.
+            remaining = m['value'] - m['total_rotated']
+            if abs(remaining) <= TURN_DONE_TOLERANCE:
                 self.cmd_pub.publish(Twist())
                 self.get_logger().info(
                     f"Manual move done: turned {math.degrees(m['total_rotated']):.1f}deg "
@@ -570,8 +591,15 @@ class SearchAndRescue(Node):
             # (not a pivot-on-one-wheel curve) is the deliberate choice.
             # Positive value = positive angular.z = left turn, same
             # convention as everywhere else in this file/the ESP32 firmware.
+            # Proportional ramp-down (see KP_TURN comment above), floored at
+            # MIN_TURN_ANGULAR_SPEED so it doesn't stall out approaching zero.
+            speed = KP_TURN * remaining
+            if speed >= 0:
+                speed = max(MIN_TURN_ANGULAR_SPEED, min(MAX_ANGULAR_SPEED, speed))
+            else:
+                speed = min(-MIN_TURN_ANGULAR_SPEED, max(-MAX_ANGULAR_SPEED, speed))
             cmd.linear.x = 0.0
-            cmd.angular.z = MAX_ANGULAR_SPEED if m['value'] >= 0 else -MAX_ANGULAR_SPEED
+            cmd.angular.z = speed
         self.cmd_pub.publish(cmd)
 
     def _manual_move_status(self):
