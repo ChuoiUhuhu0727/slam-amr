@@ -902,7 +902,13 @@ static void uros_task(void *arg) {
         nav_msgs__msg__Odometry odom_msg = {0};
         std_msgs__msg__String diag_msg = {0};
         std_msgs__msg__String imu_msg = {0};
-        char pid_gains_text[64];
+        char pid_gains_text[128];  /* was 64 -- too small once KHEAD/TRIML/TRIMR were added
+                                     * to the KP/KI/MAXI format (2026-08-27): the full 6-field
+                                     * string is already ~72 bytes even at small values, so
+                                     * every /pid_gains update was silently truncated and
+                                     * failing pid_gains_callback's exact 6-field sscanf match
+                                     * -- no gain change (not just Khead/Trim) was ever
+                                     * actually reaching the firmware. */
         char diag_text[320];   /* grown from 96/112/160/200/280 -- added TRIML/TRIMR fields plus
                                  * the existing RPM/PWM/KP/KI/MAXI/KHEAD/I2C/WAKE/GZ/MAG/MX/MY/MZ/
                                  * MAGHDG fields plus g_i2c_scan_result's own 40-char worst case can
