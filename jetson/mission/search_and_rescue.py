@@ -73,6 +73,7 @@ import argparse
 import json
 import math
 import statistics
+import subprocess
 import threading
 import time
 from collections import deque
@@ -1203,7 +1204,34 @@ poll();
 """
 
 
+def _print_git_info():
+    """Prints which branch/commit is actually running, first thing on startup --
+    added 2026-08-27 after a real incident where the Jetson had been left
+    checked out on a teammate's feature branch (motor/PID work), and the
+    resulting "why doesn't the dashboard show distance" investigation cost
+    real time before anyone thought to check `git status` by hand. Two
+    people share this one physical Jetson and switch branches on it for
+    hardware-dependent testing -- that's normal and fine, but which branch
+    is active needs to be visible without remembering to check, not
+    something you only discover after debugging symptoms."""
+    repo_dir = Path(__file__).resolve().parents[2]
+    try:
+        branch = subprocess.check_output(
+            ['git', 'rev-parse', '--abbrev-ref', 'HEAD'], cwd=repo_dir, stderr=subprocess.DEVNULL
+        ).decode().strip()
+        commit = subprocess.check_output(
+            ['git', 'rev-parse', '--short', 'HEAD'], cwd=repo_dir, stderr=subprocess.DEVNULL
+        ).decode().strip()
+        dirty = subprocess.run(
+            ['git', 'diff', '--quiet'], cwd=repo_dir, stderr=subprocess.DEVNULL
+        ).returncode != 0
+        print(f"[git] running from branch '{branch}' @ {commit}{' (uncommitted local changes)' if dirty else ''}")
+    except Exception as e:
+        print(f"[git] could not determine git branch/commit: {e}")
+
+
 def main():
+    _print_git_info()
     parser = argparse.ArgumentParser()
     parser.add_argument('--nav-only', action='store_true')
     args = parser.parse_args()
