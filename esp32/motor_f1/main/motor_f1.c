@@ -675,9 +675,17 @@ static void control_task(void *arg) {
          * invalid - never correct off a signal we don't trust. Applied in
          * the SIGNED target-RPM domain, same spot the old sync_trim used -
          * this is what makes it generalize correctly to in-place turns
-         * (opposite-signed wheel targets). */
+         * (opposite-signed wheel targets).
+         *
+         * Gated on actually being commanded to move (2026-08-27 fix): with
+         * no gate, heading_trim_rpm was computed off gyro noise even at a
+         * commanded stop (target=0 vs a few deg/s of real sensor noise),
+         * which is enough to make signed_target_left/right nonzero and drive
+         * a real, audible twitch on both wheels while just sitting idle -
+         * chasing noise, not a real heading error worth correcting. */
         float heading_trim_rpm = 0.0f;
-        if (imu_gz_valid_shared) {
+        bool commanded_to_move = (fabsf(linear_x) > 0.001f) || (fabsf(angular_z) > 0.001f);
+        if (imu_gz_valid_shared && commanded_to_move) {
             float heading_rate_error = angular_z - imu_gz_rad_per_s_shared;
             heading_trim_rpm = g_kheading * heading_rate_error;
             if (heading_trim_rpm > MAX_HEADING_TRIM_RPM)  heading_trim_rpm = MAX_HEADING_TRIM_RPM;
