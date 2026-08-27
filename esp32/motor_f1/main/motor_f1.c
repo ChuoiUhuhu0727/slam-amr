@@ -242,7 +242,13 @@ static volatile float g_max_i_contribution = 40.0f;
  * imu_gz_valid_shared elsewhere in this file, safer than silently reverting
  * to the noisier encoder-diff signal mid-drive. */
 static volatile float g_kheading = 15.0f;   /* RPM of trim per rad/s of heading-rate error - live-tunable, see pid_gains_callback */
-#define MAX_HEADING_TRIM_RPM 20.0f          /* clamp: don't let heading correction alone dominate the base speed target */
+/* Ceiling on heading_trim_rpm - was a fixed #define (20.0f), too tight once
+ * live testing (2026-08-27) showed it silently capping the correction well
+ * below what a real heading error needed, with no way to see that from the
+ * dashboard. Now live-tunable same as everything else above - set it high
+ * (or very high, effectively "off") from the dashboard if a real, sustained
+ * heading error needs more authority than the old fixed ceiling allowed. */
+static volatile float g_max_heading_trim_rpm = 20.0f;
 
 /* Manual per-wheel PWM trim (2026-08-28) - a flat PWM offset added on top of
  * everything the PID/heading loops already decided, for compensating a
@@ -257,6 +263,14 @@ static volatile float g_kheading = 15.0f;   /* RPM of trim per rad/s of heading-
  * actually stopping, defeating the whole point of that safety bypass. */
 static volatile float g_trim_left = 0.0f;
 static volatile float g_trim_right = 0.0f;
+
+/* Odometry reset request (2026-08-27) - set by pid_gains_callback on the
+ * "RESET_ODOM" sentinel command (see below), cleared by control_task once
+ * actioned. A plain bool flag between the two tasks, same pattern as the
+ * other cross-task shared vars in this file - no lock needed, one writer
+ * (uros_task), one reader (control_task), and a torn read of a single bool
+ * isn't a real hazard the way the paired pulse-count/timestamp fields are. */
+static volatile bool g_reset_odom_requested = false;
 
 /* --- F4: odometry (measured 2026-07-27: wheelbase 10cm; wheel diameter
  * re-measured 2026-08-26 as 6.7cm, corrected from the original 6cm) ---
@@ -596,6 +610,19 @@ static void control_task(void *arg) {
         interval_right   = last_interval_us_right;
         portEXIT_CRITICAL(&encoder_mux);
 
+        /* Odometry reset, requested from the dashboard's Reset All button
+         * (2026-08-27) - previously the only way to zero the ESP32's own
+         * (x,y,theta) was a physical reset. Zeroed here, before this cycle's
+         * pose math runs, so the reset takes effect immediately rather than
+         * one cycle's worth of stale delta being added to a nonzero base
+         * first. */
+        if (g_reset_odom_requested) {
+            pose_x_shared = 0.0f;
+            pose_y_shared = 0.0f;
+            pose_theta_shared = 0.0f;
+            g_reset_odom_requested = false;
+        }
+
         /* RPM from time between pulses, not pulses-per-window - see
          * last_interval_us / RPM_STALE_US comments above for why. */
         rpm_left_shared = (interval_left == 0 || (now - last_edge_left) > RPM_STALE_US)
@@ -688,8 +715,8 @@ static void control_task(void *arg) {
         if (imu_gz_valid_shared && commanded_to_move) {
             float heading_rate_error = angular_z - imu_gz_rad_per_s_shared;
             heading_trim_rpm = g_kheading * heading_rate_error;
-            if (heading_trim_rpm > MAX_HEADING_TRIM_RPM)  heading_trim_rpm = MAX_HEADING_TRIM_RPM;
-            if (heading_trim_rpm < -MAX_HEADING_TRIM_RPM) heading_trim_rpm = -MAX_HEADING_TRIM_RPM;
+            if (heading_trim_rpm > g_max_heading_trim_rpm)  heading_trim_rpm = g_max_heading_trim_rpm;
+            if (heading_trim_rpm < -g_max_heading_trim_rpm) heading_trim_rpm = -g_max_heading_trim_rpm;
         }
 
         float signed_target_left  = target_rpm_left  - heading_trim_rpm;
@@ -869,15 +896,25 @@ static void cmd_vel_callback(const void *msgin) {
  * - gains only change on an unambiguous full match, never partially. */
 static void pid_gains_callback(const void *msgin) {
     const std_msgs__msg__String *msg = (const std_msgs__msg__String *)msgin;
-    float kp, ki, max_i, khead, trim_l, trim_r;
-    if (sscanf(msg->data.data, "KP=%f,KI=%f,MAXI=%f,KHEAD=%f,TRIML=%f,TRIMR=%f",
-               &kp, &ki, &max_i, &khead, &trim_l, &trim_r) == 6) {
+    /* Odometry-reset command shares this same already-proven channel rather
+     * than adding a whole new subscription/entity for one rare button click
+     * - same reasoning as this file's choice of plain text over a dynamic-
+     * array message type above. Checked before the gains parse below so it
+     * can never be mistaken for a (malformed) gains string. */
+    if (strcmp(msg->data.data, "RESET_ODOM") == 0) {
+        g_reset_odom_requested = true;
+        return;
+    }
+    float kp, ki, max_i, khead, trim_l, trim_r, max_head;
+    if (sscanf(msg->data.data, "KP=%f,KI=%f,MAXI=%f,KHEAD=%f,TRIML=%f,TRIMR=%f,MAXHEAD=%f",
+               &kp, &ki, &max_i, &khead, &trim_l, &trim_r, &max_head) == 7) {
         g_kp = kp;
         g_ki = ki;
         g_max_i_contribution = max_i;
         g_kheading = khead;
         g_trim_left = trim_l;
         g_trim_right = trim_r;
+        g_max_heading_trim_rpm = max_head;
     }
 }
 
@@ -910,13 +947,15 @@ static void uros_task(void *arg) {
         nav_msgs__msg__Odometry odom_msg = {0};
         std_msgs__msg__String diag_msg = {0};
         std_msgs__msg__String imu_msg = {0};
-        char pid_gains_text[128];  /* was 64 -- too small once KHEAD/TRIML/TRIMR were added
-                                     * to the KP/KI/MAXI format (2026-08-27): the full 6-field
-                                     * string is already ~72 bytes even at small values, so
-                                     * every /pid_gains update was silently truncated and
-                                     * failing pid_gains_callback's exact 6-field sscanf match
-                                     * -- no gain change (not just Khead/Trim) was ever
-                                     * actually reaching the firmware. */
+        char pid_gains_text[160];  /* was 64, then 128 -- too small once KHEAD/TRIML/TRIMR
+                                     * (and now MAXHEAD, plus RESET_ODOM) were added to the
+                                     * KP/KI/MAXI format (2026-08-27): the full field string
+                                     * is already ~72+ bytes even at small values, so a too-
+                                     * small buffer here means every /pid_gains update gets
+                                     * silently truncated and fails pid_gains_callback's exact
+                                     * sscanf match -- no gain change reaches the firmware,
+                                     * with no error anywhere. Sized with real headroom this
+                                     * time so adding one more field later doesn't repeat this. */
         char diag_text[320];   /* grown from 96/112/160/200/280 -- added TRIML/TRIMR fields plus
                                  * the existing RPM/PWM/KP/KI/MAXI/KHEAD/I2C/WAKE/GZ/MAG/MX/MY/MZ/
                                  * MAGHDG fields plus g_i2c_scan_result's own 40-char worst case can
@@ -1113,11 +1152,11 @@ static void uros_task(void *arg) {
                  * drive motors' permanent magnets - or a wrong axis in the
                  * atan2f call swamping the real signal). */
                 snprintf(diag_text, sizeof(diag_text),
-                         "reset=%s RPM L=%.1f R=%.1f PWM L=%.0f R=%.0f KP=%.2f KI=%.2f MAXI=%.1f KHEAD=%.1f TRIML=%.1f TRIMR=%.1f I2C=%s WAKE=%d GZ=%s GZBIAS=%.1f MAG=%s MX=%d MY=%d MZ=%d MAGHDG=%.1f",
+                         "reset=%s RPM L=%.1f R=%.1f PWM L=%.0f R=%.0f KP=%.2f KI=%.2f MAXI=%.1f KHEAD=%.1f MAXHEAD=%.1f TRIML=%.1f TRIMR=%.1f I2C=%s WAKE=%d GZ=%s GZBIAS=%.1f MAG=%s MX=%d MY=%d MZ=%d MAGHDG=%.1f",
                          reset_reason_str(g_reset_reason),
                          rpm_left_shared, rpm_right_shared,
                          pwm_left_shared, pwm_right_shared,
-                         g_kp, g_ki, g_max_i_contribution, g_kheading, g_trim_left, g_trim_right,
+                         g_kp, g_ki, g_max_i_contribution, g_kheading, g_max_heading_trim_rpm, g_trim_left, g_trim_right,
                          g_i2c_scan_result, g_imu_wake_attempts,
                          imu_gz_valid_shared ? "ok" : "no-read",
                          g_gyro_z_bias_raw / 131.0f,   /* raw LSB -> deg/s, human-readable */

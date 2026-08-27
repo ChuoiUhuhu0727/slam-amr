@@ -201,10 +201,12 @@ MANUAL_MOVE_TIMEOUT_S = 30.0   # safety cutoff -- auto-stop if a target is
 # needing a manual click every time.
 PID_GAINS_PATH = Path(__file__).resolve().parent / "pid_gains.json"
 PID_GAINS_REPUBLISH_PERIOD_S = 2.0
-# Must match motor_f1.c's g_kp/g_ki/g_max_i_contribution/g_kheading/g_trim_left/
-# g_trim_right defaults -- these are only the fallback used before any dashboard
-# save has ever happened (or if pid_gains.json is missing/corrupt).
-DEFAULT_PID_GAINS = {'kp': 3.0, 'ki': 0.2, 'max_i': 40.0, 'khead': 15.0, 'trim_left': 0.0, 'trim_right': 0.0}
+# Must match motor_f1.c's g_kp/g_ki/g_max_i_contribution/g_kheading/
+# g_max_heading_trim_rpm/g_trim_left/g_trim_right defaults -- these are only
+# the fallback used before any dashboard save has ever happened (or if
+# pid_gains.json is missing/corrupt).
+DEFAULT_PID_GAINS = {'kp': 3.0, 'ki': 0.2, 'max_i': 40.0, 'khead': 15.0,
+                      'max_head_trim': 20.0, 'trim_left': 0.0, 'trim_right': 0.0}
 
 
 def load_pid_gains():
@@ -214,6 +216,7 @@ def load_pid_gains():
         return {
             'kp': float(data['kp']), 'ki': float(data['ki']),
             'max_i': float(data['max_i']), 'khead': float(data['khead']),
+            'max_head_trim': float(data['max_head_trim']),
             'trim_left': float(data['trim_left']), 'trim_right': float(data['trim_right']),
         }
     except (FileNotFoundError, KeyError, ValueError, TypeError, json.JSONDecodeError):
@@ -471,15 +474,25 @@ class SearchAndRescue(Node):
         msg = String()
         g = self.pid_gains
         msg.data = (f"KP={g['kp']:.4f},KI={g['ki']:.4f},MAXI={g['max_i']:.4f},KHEAD={g['khead']:.4f},"
-                    f"TRIML={g['trim_left']:.4f},TRIMR={g['trim_right']:.4f}")
+                    f"TRIML={g['trim_left']:.4f},TRIMR={g['trim_right']:.4f},MAXHEAD={g['max_head_trim']:.4f}")
         self.pid_pub.publish(msg)
 
     def set_pid_gains(self, kp: float, ki: float, max_i: float, khead: float,
-                       trim_left: float, trim_right: float):
+                       trim_left: float, trim_right: float, max_head_trim: float):
         self.pid_gains = {'kp': kp, 'ki': ki, 'max_i': max_i, 'khead': khead,
-                           'trim_left': trim_left, 'trim_right': trim_right}
+                           'trim_left': trim_left, 'trim_right': trim_right,
+                           'max_head_trim': max_head_trim}
         save_pid_gains(self.pid_gains)
         self._publish_pid_gains()
+
+    def reset_odom(self):
+        """Tells the ESP32 to zero its own (x,y,theta) - see motor_f1.c's
+        pid_gains_callback RESET_ODOM sentinel. Reuses the /pid_gains channel
+        rather than adding a new topic, same reasoning as the gains format
+        itself."""
+        msg = String()
+        msg.data = "RESET_ODOM"
+        self.pid_pub.publish(msg)
 
     # -- main loop ------------------------------------------------------------
 
@@ -836,11 +849,12 @@ class SearchAndRescue(Node):
                 khead = float(data['khead'])
                 trim_left = float(data['trim_left'])
                 trim_right = float(data['trim_right'])
+                max_head_trim = float(data['max_head_trim'])
             except (TypeError, ValueError, KeyError):
-                return jsonify({'ok': False, 'error': 'expected JSON {kp, ki, max_i, khead, trim_left, trim_right} as numbers'}), 400
-            node.set_pid_gains(kp, ki, max_i, khead, trim_left, trim_right)
+                return jsonify({'ok': False, 'error': 'expected JSON {kp, ki, max_i, khead, trim_left, trim_right, max_head_trim} as numbers'}), 400
+            node.set_pid_gains(kp, ki, max_i, khead, trim_left, trim_right, max_head_trim)
             node.get_logger().info(f"PID gains updated via dashboard: Kp={kp} Ki={ki} MaxI={max_i} Khead={khead} "
-                                    f"TrimL={trim_left} TrimR={trim_right}")
+                                    f"TrimL={trim_left} TrimR={trim_right} MaxHeadTrim={max_head_trim}")
             return jsonify({'ok': True, 'pid_gains': node.pid_gains})
 
         @app.route('/video_feed_left')
@@ -908,13 +922,14 @@ class SearchAndRescue(Node):
 
         @app.route('/reset', methods=['POST'])
         def reset():
-            # Resets the MISSION state only (waypoint progress, duck sightings,
-            # start/done flags) -- NOT the robot's actual (x,y,theta), which
-            # comes from the ESP32's own odometry and only zeroes when the
-            # ESP32 itself reboots. If you physically move the robot back to
-            # the start corner between test runs, the position number won't
-            # go back to 0 just from clicking this -- that needs an ESP32
-            # reset (unplug/replug, or the board's reset button).
+            # Resets mission state (waypoint progress, duck sightings,
+            # start/done flags) AND tells the ESP32 to zero its own
+            # (x,y,theta) (2026-08-27, see Node.reset_odom) -- previously the
+            # odometry half needed an actual ESP32 reset (unplug/replug or
+            # the board's button) since there was no software path to it.
+            # self.x/y/theta here still update from the next /odom message
+            # as usual, so there's a brief lag (one message) before the
+            # dashboard shows 0,0,0 -- not instant, but no manual step needed.
             node.started = False
             node.done = False
             node.waypoint_idx = 0
@@ -925,7 +940,8 @@ class SearchAndRescue(Node):
             node.latest_stereo_reading = None
             node.report = None
             node.cmd_pub.publish(Twist())
-            node.get_logger().info("Dashboard: RESET (mission state cleared)")
+            node.reset_odom()
+            node.get_logger().info("Dashboard: RESET (mission state cleared + ESP32 odometry reset requested)")
             return jsonify({'reset': True})
 
         thread = threading.Thread(
@@ -983,8 +999,14 @@ HTML_PAGE = """<!doctype html>
   }
   h1 { font-size: 1.2rem; font-weight: 600; margin: 0 0 16px; color: #9fd3ff; }
   .column { display: flex; flex-direction: column; gap: 16px; }
-  .layout { display: grid; grid-template-columns: minmax(300px, 460px) minmax(300px, 1fr); gap: 16px; align-items: start; }
-  @media (max-width: 860px) { .layout { grid-template-columns: 1fr; } }
+  /* Three logical groups side by side (overview, tuning, vision) instead of
+     one narrow column doing all the control panels and one wide column
+     mostly empty below the camera feeds -- uses the available horizontal
+     width instead of stacking everything tall on a small screen's worth of
+     column. Degrades to 2 then 1 column as the window narrows. */
+  .layout { display: grid; grid-template-columns: repeat(3, minmax(320px, 1fr)); gap: 16px; align-items: start; }
+  @media (max-width: 1400px) { .layout { grid-template-columns: repeat(2, minmax(320px, 1fr)); } }
+  @media (max-width: 700px) { .layout { grid-template-columns: 1fr; } }
   .panel {
     background: #1b1f27; border: 1px solid #2a2f3a; border-radius: 10px;
     padding: 14px;
@@ -1060,6 +1082,8 @@ HTML_PAGE = """<!doctype html>
         <div class="panel-title">Robot / mission status</div>
         <div class="status-line" id="navStatus">connecting...</div>
       </div>
+    </div>
+    <div class="column">
       <div class="panel">
         <div class="panel-title">ESP32 diagnostics (PID / encoder)</div>
         <div class="status-line" id="diagStatus" style="font-size:0.78rem;">connecting...</div>
@@ -1070,7 +1094,10 @@ HTML_PAGE = """<!doctype html>
           <label>Kp <input id="pidKp" type="number" step="0.1"></label>
           <label>Ki <input id="pidKi" type="number" step="0.05"></label>
           <label>Max I contribution <input id="pidMaxI" type="number" step="5"></label>
+        </div>
+        <div class="pid-row">
           <label>Heading Kp (gyro) <input id="pidKhead" type="number" step="1"></label>
+          <label>Max heading trim (RPM) <input id="pidMaxHeadTrim" type="number" step="5"></label>
           <button id="pidPushBtn" onclick="pushPidGains()">Push to robot</button>
         </div>
         <div class="pid-row">
@@ -1081,6 +1108,8 @@ HTML_PAGE = """<!doctype html>
           re-pushed automatically every 2s, so an ESP32 reboot picks the saved values back up on its own.
           Trim = a flat PWM offset added on top of the PID output, for balancing a mechanically weaker motor -
           only applies while actually driving, never during a stop.
+          Max heading trim = the ceiling on how hard heading correction can push the wheels apart -- set it
+          very high for effectively no ceiling.
         </div>
       </div>
       <div class="panel">
@@ -1233,20 +1262,21 @@ function pushPidGains() {
   const ki = parseFloat(document.getElementById('pidKi').value);
   const max_i = parseFloat(document.getElementById('pidMaxI').value);
   const khead = parseFloat(document.getElementById('pidKhead').value);
+  const max_head_trim = parseFloat(document.getElementById('pidMaxHeadTrim').value);
   const trim_left = parseFloat(document.getElementById('pidTrimL').value);
   const trim_right = parseFloat(document.getElementById('pidTrimR').value);
   if (!isFinite(kp) || !isFinite(ki) || !isFinite(max_i) || !isFinite(khead) ||
-      !isFinite(trim_left) || !isFinite(trim_right)) {
-    document.getElementById('pidStatus').innerText = 'enter valid numbers in all six fields first';
+      !isFinite(max_head_trim) || !isFinite(trim_left) || !isFinite(trim_right)) {
+    document.getElementById('pidStatus').innerText = 'enter valid numbers in all fields first';
     return;
   }
   fetch('/pid_gains', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ kp, ki, max_i, khead, trim_left, trim_right }),
+    body: JSON.stringify({ kp, ki, max_i, khead, trim_left, trim_right, max_head_trim }),
   }).then(r => r.json()).then(res => {
     document.getElementById('pidStatus').innerText = res.ok
-      ? `saved + pushed at ${new Date().toLocaleTimeString()} -- watch the diag panel above for KP/KI/MAXI/KHEAD/TRIML/TRIMR to confirm the ESP32 picked it up`
+      ? `saved + pushed at ${new Date().toLocaleTimeString()} -- watch the diag panel above for KP/KI/MAXI/KHEAD/MAXHEAD/TRIML/TRIMR to confirm the ESP32 picked it up`
       : (res.error || 'push failed');
   }).catch(() => {
     document.getElementById('pidStatus').innerText = 'push failed (dashboard unreachable?)';
@@ -1301,6 +1331,7 @@ function poll() {
       document.getElementById('pidKi').value = state.pid_gains.ki;
       document.getElementById('pidMaxI').value = state.pid_gains.max_i;
       document.getElementById('pidKhead').value = state.pid_gains.khead;
+      document.getElementById('pidMaxHeadTrim').value = state.pid_gains.max_head_trim;
       document.getElementById('pidTrimL').value = state.pid_gains.trim_left;
       document.getElementById('pidTrimR').value = state.pid_gains.trim_right;
       pidFieldsInitialized = true;
