@@ -219,6 +219,39 @@ CONTROL_PERIOD_S = 0.1   # 10 Hz control loop, navigation only -- camera grab +
                          # detection run on their own thread (see _vision_loop),
                          # paced naturally by how long YOLO takes, not this timer.
 
+# Manual drive/turn tester (2026-08-29) -- lets Alex "pretend to be the
+# Jetson" and send one isolated primitive at a time (drive N meters, turn
+# N degrees), completely outside the waypoint patrol -- for tuning the
+# ESP32 PID against controlled, repeatable motions, and for later checking
+# raw odometry accuracy (commanded distance/angle vs. what /odom reports).
+# "Turn" deliberately commands pure angular.z with linear.x=0 (in-place
+# spin, not a pivot) -- decouples heading change from position change,
+# same reasoning discussed with Alex for why in-place spin is the right
+# primitive here. "Drive forward" commands pure linear.x with angular.z=0
+# -- holding straight is entirely the ESP32's own gyro-based heading loop
+# doing its job; this script doesn't add any steering correction of its
+# own for this test mode, unlike _navigate_tick's continuous pursuit.
+MANUAL_MOVE_TIMEOUT_S = 30.0   # safety cutoff -- auto-stop if a target is
+                                # somehow never reached (e.g. odom stuck)
+
+# Manual turn ramp-down (2026-08-27) -- the manual turn primitive used to
+# command a constant MAX_ANGULAR_SPEED right up until the target was crossed,
+# then cut to 0 (bang-bang). At 1.5 rad/s (~86deg/s) the combined lag of
+# /odom's 10Hz publish, this node's own 10Hz control_tick, and the motors
+# coasting (no active brake -- PWM=0 just stops driving them, it doesn't stop
+# them) turned into pure overshoot: confirmed live, a commanded 90deg turn was
+# landing around 144deg. _navigate_tick already avoids this for patrol driving
+# by commanding angular.z proportional to heading error (KP_HEADING) instead
+# of a constant -- same fix applied here. Ramping down as the remaining angle
+# shrinks means the robot is moving slowly by the time it actually crosses the
+# target, so that same lag becomes a small error instead of tens of degrees.
+KP_TURN = 2.0                    # rad/s commanded per rad of remaining angle
+MIN_TURN_ANGULAR_SPEED = 0.3     # rad/s -- floor so the P term doesn't decay
+                                  # below what the motors can actually turn at
+                                  # (deadband/static friction) and stall short
+TURN_DONE_TOLERANCE = math.radians(2.0)  # good enough -- don't chase the
+                                          # last fraction of a degree forever
+
 # PID tuning box (2026-08-27) -- the ESP32's Kp/Ki/max-integral-contribution
 # used to be #define constants, needing a reflash to change. They're now
 # live-tunable over a new /pid_gains topic (see motor_f1.c pid_gains_callback)
@@ -230,10 +263,13 @@ CONTROL_PERIOD_S = 0.1   # 10 Hz control loop, navigation only -- camera grab +
 # needing a manual click every time.
 PID_GAINS_PATH = Path(__file__).resolve().parent / "pid_gains.json"
 PID_GAINS_REPUBLISH_PERIOD_S = 2.0
-# Must match motor_f1.c's g_kp/g_ki/g_max_i_contribution/g_kheading/g_trim_left/
-# g_trim_right defaults -- these are only the fallback used before any dashboard
-# save has ever happened (or if pid_gains.json is missing/corrupt).
-DEFAULT_PID_GAINS = {'kp': 3.0, 'ki': 0.2, 'max_i': 40.0, 'khead': 15.0, 'trim_left': 0.0, 'trim_right': 0.0}
+# Must match motor_f1.c's g_kp/g_ki/g_max_i_contribution/g_kheading/
+# g_max_heading_trim_rpm/g_trim_left/g_trim_right defaults -- these are only
+# the fallback used before any dashboard save has ever happened (or if
+# pid_gains.json is missing/corrupt).
+DEFAULT_PID_GAINS = {'kp': 3.0, 'ki': 0.2, 'max_i': 40.0, 'khead': 15.0,
+                      'max_head_trim': 20.0, 'trim_left': 0.0, 'trim_right': 0.0,
+                      'klock': 2.0, 'max_lock': 0.6}
 
 
 def load_pid_gains():
@@ -243,7 +279,13 @@ def load_pid_gains():
         return {
             'kp': float(data['kp']), 'ki': float(data['ki']),
             'max_i': float(data['max_i']), 'khead': float(data['khead']),
+            'max_head_trim': float(data['max_head_trim']),
             'trim_left': float(data['trim_left']), 'trim_right': float(data['trim_right']),
+            # .get(), not data[...] -- an existing pid_gains.json saved before
+            # heading-lock existed won't have these keys; fall back to the
+            # defaults for just these two instead of resetting every gain.
+            'klock': float(data.get('klock', DEFAULT_PID_GAINS['klock'])),
+            'max_lock': float(data.get('max_lock', DEFAULT_PID_GAINS['max_lock'])),
         }
     except (FileNotFoundError, KeyError, ValueError, TypeError, json.JSONDecodeError):
         return dict(DEFAULT_PID_GAINS)
@@ -341,6 +383,14 @@ class SearchAndRescue(Node):
         self.done = False
         self.started = False  # gated by the dashboard's Start button -- camera/
                                # detection run regardless, only driving waits
+
+        self.manual_move = None  # None, or a dict describing an in-progress
+                                  # manual drive/turn test -- see MANUAL_MOVE_
+                                  # TIMEOUT_S comment and _manual_move_tick.
+                                  # Mutually exclusive with patrol (self.started) --
+                                  # enforced at the /manual_move and /start routes,
+                                  # not here, so there's one obvious place each
+                                  # guard lives rather than duplicated checks.
 
         self.duck_sightings = []  # list of (world_x, world_y)
         self.report = None        # filled in once the loop finishes
@@ -498,21 +548,43 @@ class SearchAndRescue(Node):
         msg = String()
         g = self.pid_gains
         msg.data = (f"KP={g['kp']:.4f},KI={g['ki']:.4f},MAXI={g['max_i']:.4f},KHEAD={g['khead']:.4f},"
-                    f"TRIML={g['trim_left']:.4f},TRIMR={g['trim_right']:.4f}")
+                    f"TRIML={g['trim_left']:.4f},TRIMR={g['trim_right']:.4f},MAXHEAD={g['max_head_trim']:.4f},"
+                    f"KLOCK={g['klock']:.4f},MAXLOCK={g['max_lock']:.4f}")
         self.pid_pub.publish(msg)
 
     def set_pid_gains(self, kp: float, ki: float, max_i: float, khead: float,
-                       trim_left: float, trim_right: float):
+                       trim_left: float, trim_right: float, max_head_trim: float,
+                       klock: float, max_lock: float):
         self.pid_gains = {'kp': kp, 'ki': ki, 'max_i': max_i, 'khead': khead,
-                           'trim_left': trim_left, 'trim_right': trim_right}
+                           'trim_left': trim_left, 'trim_right': trim_right,
+                           'max_head_trim': max_head_trim,
+                           'klock': klock, 'max_lock': max_lock}
         save_pid_gains(self.pid_gains)
         self._publish_pid_gains()
+
+    def reset_odom(self):
+        """Tells the ESP32 to zero its own (x,y,theta) - see motor_f1.c's
+        pid_gains_callback RESET_ODOM sentinel. Reuses the /pid_gains channel
+        rather than adding a new topic, same reasoning as the gains format
+        itself."""
+        msg = String()
+        msg.data = "RESET_ODOM"
+        self.pid_pub.publish(msg)
 
     # -- main loop ------------------------------------------------------------
 
     def control_tick(self):
         if not self.have_odom:
             return  # wait for first /odom message before doing anything
+
+        # Manual move takes priority over patrol -- checked first,
+        # unconditionally, so it works whether or not Start was ever
+        # clicked (the whole point: test motions without running a mission).
+        # Starting one while patrol is active is refused at the route level
+        # (see /manual_move), so in practice these two never overlap.
+        if self.manual_move is not None:
+            self._manual_move_tick()
+            return
 
         # Camera grab + detection run on their own background thread (see
         # _vision_loop) -- this callback is navigation-only now, so a slow
@@ -522,6 +594,84 @@ class SearchAndRescue(Node):
             return
 
         self._navigate_tick()
+
+    # -- manual drive/turn tester ---------------------------------------------
+
+    def _manual_move_tick(self):
+        m = self.manual_move
+        if time.time() - m['start_t'] > MANUAL_MOVE_TIMEOUT_S:
+            self.get_logger().warn(
+                f"Manual {m['type']} move timed out after {MANUAL_MOVE_TIMEOUT_S:.0f}s -- "
+                "stopping, target not reached (odometry stuck? PID not converging?)"
+            )
+            self.cmd_pub.publish(Twist())
+            self.manual_move = None
+            return
+
+        cmd = Twist()
+        if m['type'] == 'distance':
+            # Straight-line distance from where this move started -- valid as
+            # long as the robot is actually driving straight (angular.z=0
+            # commanded below, held by the ESP32's own gyro heading loop) -
+            # if it wanders, this would under-count real distance traveled,
+            # which is itself a useful signal something's off with heading
+            # hold, not just a measurement quirk to ignore.
+            traveled = math.hypot(self.x - m['start_x'], self.y - m['start_y'])
+            target = abs(m['value'])
+            if traveled >= target:
+                self.cmd_pub.publish(Twist())
+                self.get_logger().info(f"Manual move done: drove {traveled:.3f}m (target {target:.3f}m)")
+                self.manual_move = None
+                return
+            cmd.linear.x = MAX_LINEAR_SPEED if m['value'] >= 0 else -MAX_LINEAR_SPEED
+            cmd.angular.z = 0.0
+        else:  # 'turn'
+            # Accumulate small per-tick deltas rather than one wrapped
+            # comparison against the start heading -- correctly handles any
+            # target angle (including >180deg) without the +/-180deg wrap
+            # boundary causing a bogus "done" or "never done" result.
+            delta = wrap_angle(self.theta - m['last_theta'])
+            m['last_theta'] = self.theta
+            m['total_rotated'] += delta
+            # Signed remaining angle (not abs()) -- shrinks from m['value']
+            # toward 0 as the turn progresses, same shape as _navigate_tick's
+            # heading_error, so the same clamp(KP * error) pattern applies.
+            remaining = m['value'] - m['total_rotated']
+            if abs(remaining) <= TURN_DONE_TOLERANCE:
+                self.cmd_pub.publish(Twist())
+                self.get_logger().info(
+                    f"Manual move done: turned {math.degrees(m['total_rotated']):.1f}deg "
+                    f"(target {math.degrees(m['value']):.1f}deg)"
+                )
+                self.manual_move = None
+                return
+            # Pure in-place spin: angular.z only, linear.x=0 - see the
+            # MANUAL_MOVE_TIMEOUT_S comment above for why this primitive
+            # (not a pivot-on-one-wheel curve) is the deliberate choice.
+            # Positive value = positive angular.z = left turn, same
+            # convention as everywhere else in this file/the ESP32 firmware.
+            # Proportional ramp-down (see KP_TURN comment above), floored at
+            # MIN_TURN_ANGULAR_SPEED so it doesn't stall out approaching zero.
+            speed = KP_TURN * remaining
+            if speed >= 0:
+                speed = max(MIN_TURN_ANGULAR_SPEED, min(MAX_ANGULAR_SPEED, speed))
+            else:
+                speed = min(-MIN_TURN_ANGULAR_SPEED, max(-MAX_ANGULAR_SPEED, speed))
+            cmd.linear.x = 0.0
+            cmd.angular.z = speed
+        self.cmd_pub.publish(cmd)
+
+    def _manual_move_status(self):
+        """JSON-friendly progress snapshot for the dashboard - None when no
+        manual move is active."""
+        m = self.manual_move
+        if m is None:
+            return None
+        if m['type'] == 'distance':
+            traveled = math.hypot(self.x - m['start_x'], self.y - m['start_y'])
+            return {'type': 'distance', 'target': m['value'], 'progress': traveled}
+        return {'type': 'turn', 'target_deg': math.degrees(m['value']),
+                'progress_deg': math.degrees(m['total_rotated'])}
 
     def _navigate_tick(self):
         goal_x, goal_y = WAYPOINTS[self.waypoint_idx]
@@ -795,6 +945,7 @@ class SearchAndRescue(Node):
                 'has_camera': not node.nav_only,
                 'target_waypoint': WAYPOINTS[node.waypoint_idx] if node.waypoint_idx < len(WAYPOINTS) else None,
                 'pid_gains': node.pid_gains,
+                'manual_move': node._manual_move_status(),
             })
 
         @app.route('/pid_gains', methods=['POST'])
@@ -807,11 +958,15 @@ class SearchAndRescue(Node):
                 khead = float(data['khead'])
                 trim_left = float(data['trim_left'])
                 trim_right = float(data['trim_right'])
+                max_head_trim = float(data['max_head_trim'])
+                klock = float(data['klock'])
+                max_lock = float(data['max_lock'])
             except (TypeError, ValueError, KeyError):
-                return jsonify({'ok': False, 'error': 'expected JSON {kp, ki, max_i, khead, trim_left, trim_right} as numbers'}), 400
-            node.set_pid_gains(kp, ki, max_i, khead, trim_left, trim_right)
+                return jsonify({'ok': False, 'error': 'expected JSON {kp, ki, max_i, khead, trim_left, trim_right, max_head_trim, klock, max_lock} as numbers'}), 400
+            node.set_pid_gains(kp, ki, max_i, khead, trim_left, trim_right, max_head_trim, klock, max_lock)
             node.get_logger().info(f"PID gains updated via dashboard: Kp={kp} Ki={ki} MaxI={max_i} Khead={khead} "
-                                    f"TrimL={trim_left} TrimR={trim_right}")
+                                    f"TrimL={trim_left} TrimR={trim_right} MaxHeadTrim={max_head_trim} "
+                                    f"Klock={klock} MaxLock={max_lock}")
             return jsonify({'ok': True, 'pid_gains': node.pid_gains})
 
         @app.route('/video_feed_left')
@@ -828,9 +983,47 @@ class SearchAndRescue(Node):
 
         @app.route('/start', methods=['POST'])
         def start():
+            if node.manual_move is not None:
+                return jsonify({'started': False, 'error': 'a manual move is in progress -- cancel it first'}), 400
             node.started = True
             node.get_logger().info("Patrol STARTED (via dashboard)")
             return jsonify({'started': True})
+
+        @app.route('/manual_move', methods=['POST'])
+        def manual_move():
+            if node.started:
+                return jsonify({'ok': False, 'error': 'stop the patrol first'}), 400
+            if node.manual_move is not None:
+                return jsonify({'ok': False, 'error': 'a manual move is already in progress'}), 400
+            try:
+                data = request.get_json(force=True)
+                move_type = data['type']
+                value = float(data['value'])
+            except (TypeError, ValueError, KeyError):
+                return jsonify({'ok': False, 'error': 'expected JSON {type: "distance"|"turn", value: number}'}), 400
+            if move_type == 'distance':
+                node.manual_move = {
+                    'type': 'distance', 'value': value,
+                    'start_x': node.x, 'start_y': node.y,
+                    'start_t': time.time(),
+                }
+            elif move_type == 'turn':
+                node.manual_move = {
+                    'type': 'turn', 'value': math.radians(value),
+                    'last_theta': node.theta, 'total_rotated': 0.0,
+                    'start_t': time.time(),
+                }
+            else:
+                return jsonify({'ok': False, 'error': 'type must be "distance" or "turn"'}), 400
+            node.get_logger().info(f"Manual move started (via dashboard): {move_type}={value}")
+            return jsonify({'ok': True})
+
+        @app.route('/manual_move/cancel', methods=['POST'])
+        def manual_move_cancel():
+            node.manual_move = None
+            node.cmd_pub.publish(Twist())
+            node.get_logger().info("Manual move cancelled (via dashboard)")
+            return jsonify({'ok': True})
 
         @app.route('/stop', methods=['POST'])
         def stop():
@@ -841,16 +1034,18 @@ class SearchAndRescue(Node):
 
         @app.route('/reset', methods=['POST'])
         def reset():
-            # Resets the MISSION state only (waypoint progress, duck sightings,
-            # start/done flags) -- NOT the robot's actual (x,y,theta), which
-            # comes from the ESP32's own odometry and only zeroes when the
-            # ESP32 itself reboots. If you physically move the robot back to
-            # the start corner between test runs, the position number won't
-            # go back to 0 just from clicking this -- that needs an ESP32
-            # reset (unplug/replug, or the board's reset button).
+            # Resets mission state (waypoint progress, duck sightings,
+            # start/done flags) AND tells the ESP32 to zero its own
+            # (x,y,theta) (2026-08-27, see Node.reset_odom) -- previously the
+            # odometry half needed an actual ESP32 reset (unplug/replug or
+            # the board's button) since there was no software path to it.
+            # self.x/y/theta here still update from the next /odom message
+            # as usual, so there's a brief lag (one message) before the
+            # dashboard shows 0,0,0 -- not instant, but no manual step needed.
             node.started = False
             node.done = False
             node.waypoint_idx = 0
+            node.manual_move = None
             node.duck_sightings = []
             node.latest_detection_left = None
             node.latest_detection_right = None
@@ -858,7 +1053,8 @@ class SearchAndRescue(Node):
             node.stereo_distance_history.clear()
             node.report = None
             node.cmd_pub.publish(Twist())
-            node.get_logger().info("Dashboard: RESET (mission state cleared)")
+            node.reset_odom()
+            node.get_logger().info("Dashboard: RESET (mission state cleared + ESP32 odometry reset requested)")
             return jsonify({'reset': True})
 
         thread = threading.Thread(
@@ -929,8 +1125,14 @@ HTML_PAGE = """<!doctype html>
   }
   h1 { font-size: 1.2rem; font-weight: 600; margin: 0 0 16px; color: #9fd3ff; }
   .column { display: flex; flex-direction: column; gap: 16px; }
-  .layout { display: grid; grid-template-columns: minmax(300px, 460px) minmax(300px, 1fr); gap: 16px; align-items: start; }
-  @media (max-width: 860px) { .layout { grid-template-columns: 1fr; } }
+  /* Three logical groups side by side (overview, tuning, vision) instead of
+     one narrow column doing all the control panels and one wide column
+     mostly empty below the camera feeds -- uses the available horizontal
+     width instead of stacking everything tall on a small screen's worth of
+     column. Degrades to 2 then 1 column as the window narrows. */
+  .layout { display: grid; grid-template-columns: repeat(3, minmax(320px, 1fr)); gap: 16px; align-items: start; }
+  @media (max-width: 1400px) { .layout { grid-template-columns: repeat(2, minmax(320px, 1fr)); } }
+  @media (max-width: 700px) { .layout { grid-template-columns: 1fr; } }
   .panel {
     background: #1b1f27; border: 1px solid #2a2f3a; border-radius: 10px;
     padding: 14px;
@@ -1006,6 +1208,8 @@ HTML_PAGE = """<!doctype html>
         <div class="panel-title">Robot / mission status</div>
         <div class="status-line" id="navStatus">connecting...</div>
       </div>
+    </div>
+    <div class="column">
       <div class="panel">
         <div class="panel-title">ESP32 diagnostics (PID / encoder)</div>
         <div class="status-line" id="diagStatus" style="font-size:0.78rem;">connecting...</div>
@@ -1016,18 +1220,45 @@ HTML_PAGE = """<!doctype html>
           <label>Kp <input id="pidKp" type="number" step="0.1"></label>
           <label>Ki <input id="pidKi" type="number" step="0.05"></label>
           <label>Max I contribution <input id="pidMaxI" type="number" step="5"></label>
+        </div>
+        <div class="pid-row">
           <label>Heading Kp (gyro) <input id="pidKhead" type="number" step="1"></label>
+          <label>Max heading trim (RPM) <input id="pidMaxHeadTrim" type="number" step="5"></label>
           <button id="pidPushBtn" onclick="pushPidGains()">Push to robot</button>
         </div>
         <div class="pid-row">
           <label>Trim left (PWM) <input id="pidTrimL" type="number" step="1"></label>
           <label>Trim right (PWM) <input id="pidTrimR" type="number" step="1"></label>
         </div>
+        <div class="pid-row">
+          <label>Heading lock Kp <input id="pidKlock" type="number" step="0.5"></label>
+          <label>Max lock rate (rad/s) <input id="pidMaxLock" type="number" step="0.1"></label>
+        </div>
         <div class="legend" id="pidStatus">
           re-pushed automatically every 2s, so an ESP32 reboot picks the saved values back up on its own.
           Trim = a flat PWM offset added on top of the PID output, for balancing a mechanically weaker motor -
           only applies while actually driving, never during a stop.
+          Max heading trim = the ceiling on how hard heading correction can push the wheels apart -- set it
+          very high for effectively no ceiling.
+          Heading lock = holds whatever heading the robot is pointed at whenever it's not actively told to turn
+          (straight driving, or sitting still after a turn) -- Kp is how hard it corrects a heading error,
+          max lock rate caps how fast it's allowed to spin the robot while doing that correction.
         </div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">Manual drive tester (bypasses mission Start)</div>
+        <div class="pid-row">
+          <label>Distance (m) <input id="manualDist" type="number" step="0.1" value="0.5"></label>
+          <button id="manualDriveBtn" onclick="manualMove('distance')">Drive Forward</button>
+        </div>
+        <div class="pid-row">
+          <label>Turn (deg, +left / -right) <input id="manualDeg" type="number" step="5" value="90"></label>
+          <button id="manualTurnBtn" onclick="manualMove('turn')">Turn</button>
+        </div>
+        <div class="pid-row">
+          <button id="manualCancelBtn" onclick="manualCancel()">Cancel</button>
+        </div>
+        <div class="legend" id="manualStatus">idle</div>
       </div>
     </div>
     <div class="column">
@@ -1164,24 +1395,50 @@ function pushPidGains() {
   const ki = parseFloat(document.getElementById('pidKi').value);
   const max_i = parseFloat(document.getElementById('pidMaxI').value);
   const khead = parseFloat(document.getElementById('pidKhead').value);
+  const max_head_trim = parseFloat(document.getElementById('pidMaxHeadTrim').value);
   const trim_left = parseFloat(document.getElementById('pidTrimL').value);
   const trim_right = parseFloat(document.getElementById('pidTrimR').value);
+  const klock = parseFloat(document.getElementById('pidKlock').value);
+  const max_lock = parseFloat(document.getElementById('pidMaxLock').value);
   if (!isFinite(kp) || !isFinite(ki) || !isFinite(max_i) || !isFinite(khead) ||
-      !isFinite(trim_left) || !isFinite(trim_right)) {
-    document.getElementById('pidStatus').innerText = 'enter valid numbers in all six fields first';
+      !isFinite(max_head_trim) || !isFinite(trim_left) || !isFinite(trim_right) ||
+      !isFinite(klock) || !isFinite(max_lock)) {
+    document.getElementById('pidStatus').innerText = 'enter valid numbers in all fields first';
     return;
   }
   fetch('/pid_gains', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ kp, ki, max_i, khead, trim_left, trim_right }),
+    body: JSON.stringify({ kp, ki, max_i, khead, trim_left, trim_right, max_head_trim, klock, max_lock }),
   }).then(r => r.json()).then(res => {
     document.getElementById('pidStatus').innerText = res.ok
-      ? `saved + pushed at ${new Date().toLocaleTimeString()} -- watch the diag panel above for KP/KI/MAXI/KHEAD/TRIML/TRIMR to confirm the ESP32 picked it up`
+      ? `saved + pushed at ${new Date().toLocaleTimeString()} -- watch the diag panel above for KP/KI/MAXI/KHEAD/MAXHEAD/TRIML/TRIMR/KLOCK/MAXLOCK/LOCK to confirm the ESP32 picked it up`
       : (res.error || 'push failed');
   }).catch(() => {
     document.getElementById('pidStatus').innerText = 'push failed (dashboard unreachable?)';
   });
+}
+
+function manualMove(type) {
+  const inputId = type === 'distance' ? 'manualDist' : 'manualDeg';
+  const value = parseFloat(document.getElementById(inputId).value);
+  if (!isFinite(value)) {
+    document.getElementById('manualStatus').innerText = 'enter a valid number first';
+    return;
+  }
+  fetch('/manual_move', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type, value }),
+  }).then(r => r.json()).then(res => {
+    if (!res.ok) document.getElementById('manualStatus').innerText = res.error || 'failed to start';
+  }).catch(() => {
+    document.getElementById('manualStatus').innerText = 'request failed (dashboard unreachable?)';
+  });
+}
+
+function manualCancel() {
+  fetch('/manual_move/cancel', { method: 'POST' }).catch(() => {});
 }
 
 function poll() {
@@ -1210,8 +1467,11 @@ function poll() {
       document.getElementById('pidKi').value = state.pid_gains.ki;
       document.getElementById('pidMaxI').value = state.pid_gains.max_i;
       document.getElementById('pidKhead').value = state.pid_gains.khead;
+      document.getElementById('pidMaxHeadTrim').value = state.pid_gains.max_head_trim;
       document.getElementById('pidTrimL').value = state.pid_gains.trim_left;
       document.getElementById('pidTrimR').value = state.pid_gains.trim_right;
+      document.getElementById('pidKlock').value = state.pid_gains.klock;
+      document.getElementById('pidMaxLock').value = state.pid_gains.max_lock;
       pidFieldsInitialized = true;
     }
 
@@ -1235,8 +1495,21 @@ function poll() {
         `(duck not seen by both cameras right now)</div>`;
     }
 
-    document.getElementById('startBtn').disabled = state.started || state.done;
+    document.getElementById('startBtn').disabled = state.started || state.done || !!state.manual_move;
     document.getElementById('stopBtn').disabled = !state.started;
+
+    const manualActive = !!state.manual_move;
+    document.getElementById('manualDriveBtn').disabled = state.started || manualActive;
+    document.getElementById('manualTurnBtn').disabled = state.started || manualActive;
+    document.getElementById('manualCancelBtn').disabled = !manualActive;
+    if (manualActive) {
+      const mm = state.manual_move;
+      document.getElementById('manualStatus').innerText = mm.type === 'distance'
+        ? `driving forward: ${mm.progress.toFixed(2)}m / ${mm.target.toFixed(2)}m`
+        : `turning: ${mm.progress_deg.toFixed(1)}deg / ${mm.target_deg.toFixed(1)}deg`;
+    } else {
+      document.getElementById('manualStatus').innerText = 'idle';
+    }
 
     const reportBox = document.getElementById('reportBox');
     if (state.report) {
