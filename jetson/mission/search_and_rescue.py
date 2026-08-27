@@ -72,8 +72,10 @@ subscribed to /cmd_vel) -- this node doesn't manage that.
 import argparse
 import json
 import math
+import statistics
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 import numpy as np
@@ -142,6 +144,19 @@ STEREO_MIN_DISPARITY_PX = 2.0
 # Sanity ceiling on computed distance (m). Room is 2x2m (diagonal ~2.83m) --
 # anything past this is treated as a bad stereo match, not a real reading.
 STEREO_MAX_DISTANCE_M = 5.0
+
+# Rolling-median smoothing window for the live distance readout (2026-08-27,
+# see ruler benchmark: raw single-frame distance swung 1.2-1.7m at a 1.5m
+# ground truth). Root cause: distance = fx*baseline/disparity is a 1/x
+# relationship -- at longer range disparity is already small, so the same
+# few-px bounding-box jitter swings the computed distance much harder than
+# it does up close. Median (not mean) specifically to reject the occasional
+# badly-localized box outright rather than let it drag an average around.
+# 5-8 frames chosen over the 10-20 a commercial camera might use internally
+# -- this loop only runs ~TARGET_DETECT_HZ=5Hz, so 20 frames would be 4s of
+# lag; the mission's robot moves slowly during the demo so 5-8 frames
+# (~1-1.6s) trades off jitter-rejection against staying responsive.
+STEREO_SMOOTHING_WINDOW = 8
 
 GOAL_TOLERANCE_M = 0.10       # "close enough" to a waypoint
 # Raised 2026-08-28 (was 0.35 rad / ~20deg): this threshold predates the
@@ -310,6 +325,12 @@ class SearchAndRescue(Node):
         self.latest_stereo_reading = None   # {'distance_m','bearing_deg','disparity_px','t'} -- for
                                              # a live "distance right now" readout, useful for a
                                              # ruler accuracy check without reading terminal logs
+        self.stereo_distance_history = deque(maxlen=STEREO_SMOOTHING_WINDOW)  # raw distance_m
+                                             # readings, most recent last -- rolling median of this
+                                             # is the smoothed distance (see STEREO_SMOOTHING_WINDOW
+                                             # comment). Kept separate from latest_stereo_reading
+                                             # (raw) deliberately -- both shown on the dashboard so
+                                             # the raw jitter is still visible, not hidden by smoothing.
 
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.pid_pub = self.create_publisher(String, '/pid_gains', 10)
@@ -642,6 +663,7 @@ class SearchAndRescue(Node):
             'disparity_px': disparity_px,
             't': time.time(),
         }
+        self.stereo_distance_history.append(distance)
 
         world_x = self.x + distance * math.cos(self.theta + CAMERA_BEARING_OFFSET_RAD + bearing)
         world_y = self.y + distance * math.sin(self.theta + CAMERA_BEARING_OFFSET_RAD + bearing)
@@ -719,6 +741,11 @@ class SearchAndRescue(Node):
                 'duck_sightings': node.duck_sightings,
                 'duck_estimate': node.duck_estimate(),
                 'latest_stereo': node.latest_stereo_reading,
+                'stereo_distance_smoothed_m': (
+                    statistics.median(node.stereo_distance_history)
+                    if node.stereo_distance_history else None
+                ),
+                'stereo_smoothing_window': STEREO_SMOOTHING_WINDOW,
                 'report': node.report,
                 'has_camera': not node.nav_only,
                 'target_waypoint': WAYPOINTS[node.waypoint_idx] if node.waypoint_idx < len(WAYPOINTS) else None,
@@ -783,6 +810,7 @@ class SearchAndRescue(Node):
             node.latest_detection_left = None
             node.latest_detection_right = None
             node.latest_stereo_reading = None
+            node.stereo_distance_history.clear()
             node.report = None
             node.cmd_pub.publish(Twist())
             node.get_logger().info("Dashboard: RESET (mission state cleared)")
@@ -1136,8 +1164,13 @@ function poll() {
 
     const stereoBox = document.getElementById('stereoBox');
     if (stereoFresh) {
+      const smoothed = state.stereo_distance_smoothed_m;
+      const smoothedTxt = smoothed !== null
+        ? ` / <b>${smoothed.toFixed(2)}m</b> smoothed (median of last ${state.stereo_smoothing_window})`
+        : '';
       stereoBox.innerHTML = `<div class="stat-highlight">distance to duck now: ` +
-        `<b>${state.latest_stereo.distance_m.toFixed(2)}m</b> @ ${state.latest_stereo.bearing_deg.toFixed(1)}&deg; ` +
+        `<b>${state.latest_stereo.distance_m.toFixed(2)}m</b> raw${smoothedTxt} ` +
+        `@ ${state.latest_stereo.bearing_deg.toFixed(1)}&deg; ` +
         `<span style="color:#8a94a6;">(disparity ${state.latest_stereo.disparity_px.toFixed(0)}px)</span></div>`;
     } else {
       stereoBox.innerHTML = `<div class="stat-highlight stale">no current stereo lock ` +
