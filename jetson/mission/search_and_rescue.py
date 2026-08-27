@@ -916,9 +916,31 @@ class SearchAndRescue(Node):
         app = Flask(__name__)
         node = self
 
+        @app.after_request
+        def _no_cache(response):
+            # 2026-08-27: found the root cause of the dashboard's stale
+            # "no current stereo lock" bug -- pollCount/tickCount kept
+            # incrementing on a healthy 400ms cadence while the fetched
+            # /state payload itself stayed stuck on an old reading, even
+            # though the backend was independently confirmed fresh
+            # (<0.1s old) at that exact moment. That's the signature of a
+            # cached response being served instead of a live one, not a
+            # slow backend or a throttled tab. `fetch(..., {cache:
+            # 'no-store'})` on the client stops the BROWSER from doing
+            # this; this header stops anything on the network path
+            # (a WiFi router/proxy) from doing the same thing, since a
+            # client-side fetch option alone can't control what a
+            # caching proxy in between does.
+            response.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+            return response
+
         @app.route('/')
         def index():
             return HTML_PAGE
+
+        @app.route('/vision')
+        def vision_debug():
+            return VISION_HTML_PAGE
 
         @app.route('/state')
         def state():
@@ -1442,7 +1464,7 @@ function manualCancel() {
 }
 
 function poll() {
-  fetch('/state').then(r => r.json()).then(state => {
+  fetch('/state', { cache: 'no-store' }).then(r => r.json()).then(state => {
     draw(state);
 
     let statusBadge;
@@ -1528,6 +1550,135 @@ function poll() {
 
 setInterval(poll, 400);
 poll();
+</script>
+</body>
+</html>
+"""
+
+
+# Minimal, dedicated vision/stereo debug page -- deliberately separate from
+# HTML_PAGE above (2026-08-27). That page has accreted a lot of PID-tuning
+# UI from Alex's work that's irrelevant to the stereo-distance display bug,
+# making it hard to tell "is this a real data problem" from "is this buried
+# in 400 lines of shared JS". This page reuses the exact same /state JSON
+# and /video_feed_left /video_feed_right routes (no new backend needed) but
+# renders almost nothing else -- just the two camera feeds, the distance
+# readout, and a live diagnostic strip that answers the open staleness
+# question at a glance: pollCount/clockTick tick on their own 100ms timer
+# independent of the 400ms /state fetch, so if the BROWSER TAB itself is
+# throttled (e.g. backgrounded on a phone), this whole strip visibly
+# freezes; if only the fetch stops getting fresh data, the strip keeps
+# ticking smoothly while "state age" grows unbounded -- two different bugs,
+# now visually distinguishable without opening devtools.
+VISION_HTML_PAGE = """<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Vision debug -- stereo duck distance</title>
+<style>
+  :root { color-scheme: dark; }
+  body {
+    background: #12151a; color: #e6e6e6;
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    margin: 0; padding: 16px;
+  }
+  h1 { font-size: 1.1rem; font-weight: 600; margin: 0 0 12px; color: #9fd3ff; }
+  .video-row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+  .video-cell { flex: 1 1 300px; }
+  .video-cell img { width: 100%; border-radius: 6px; background: #000; display: block; }
+  .video-cell .label { font-size: 0.7rem; color: #8a94a6; margin-bottom: 4px; }
+  .stat-highlight {
+    font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 1.15rem;
+    padding: 10px 12px; margin-bottom: 12px; border-radius: 8px;
+    background: #10201c; border: 1px solid #1c4d2b; color: #9fe6ae;
+  }
+  .stat-highlight.stale { background: #201c10; border-color: #4a3f18; color: #8a94a6; }
+  .diag {
+    font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 0.78rem;
+    color: #8a94a6; background: #1b1f27; border: 1px solid #2a2f3a; border-radius: 8px;
+    padding: 8px 10px; margin-bottom: 12px; line-height: 1.6;
+  }
+  .diag b { color: #c8ccd4; }
+  pre {
+    background: #0e1116; border: 1px solid #2a2f3a; border-radius: 8px;
+    padding: 10px; font-size: 0.75rem; overflow-x: auto; max-height: 300px;
+  }
+</style>
+</head>
+<body>
+  <h1>Vision debug -- stereo duck distance (separate from the main patrol dashboard)</h1>
+  <div class="video-row">
+    <div class="video-cell">
+      <div class="label">left camera</div>
+      <img src="/video_feed_left">
+    </div>
+    <div class="video-cell">
+      <div class="label">right camera</div>
+      <img src="/video_feed_right">
+    </div>
+  </div>
+  <div id="stereoBox" class="stat-highlight">connecting...</div>
+  <div id="diagBox" class="diag">-</div>
+  <pre id="rawJson">-</pre>
+
+<script>
+let lastState = null;
+let lastFetchAt = 0;
+let pollCount = 0;
+let tickCount = 0;
+
+function poll() {
+  fetch('/state', { cache: 'no-store' }).then(r => r.json()).then(state => {
+    lastState = state;
+    lastFetchAt = Date.now();
+    pollCount++;
+    document.getElementById('rawJson').innerText = JSON.stringify(
+      { latest_stereo: state.latest_stereo,
+        stereo_distance_smoothed_m: state.stereo_distance_smoothed_m,
+        has_camera: state.has_camera },
+      null, 2
+    );
+  }).catch(err => {
+    document.getElementById('diagBox').innerHTML =
+      '<b>fetch error:</b> ' + err + ' (backend unreachable, not a staleness issue)';
+  });
+}
+
+function tick() {
+  tickCount++;
+  const now = Date.now();
+  const sinceFetchMs = lastFetchAt ? (now - lastFetchAt) : null;
+  const stereoFresh = lastState && lastState.latest_stereo &&
+    (now / 1000 - lastState.latest_stereo.t) < 2.0;
+
+  const stereoBox = document.getElementById('stereoBox');
+  if (stereoFresh) {
+    const s = lastState.latest_stereo;
+    const smoothed = lastState.stereo_distance_smoothed_m;
+    const smoothedTxt = smoothed !== null && smoothed !== undefined
+      ? ` / <b>${smoothed.toFixed(2)}m</b> smoothed` : '';
+    stereoBox.className = 'stat-highlight';
+    stereoBox.innerHTML = `distance to duck now: <b>${s.distance_m.toFixed(2)}m</b> raw${smoothedTxt} ` +
+      `@ ${s.bearing_deg.toFixed(1)}&deg; (disparity ${s.disparity_px.toFixed(0)}px)`;
+  } else {
+    stereoBox.className = 'stat-highlight stale';
+    stereoBox.innerHTML = 'no current stereo lock (duck not seen by both cameras right now)';
+  }
+
+  const ageTxt = lastState && lastState.latest_stereo
+    ? (now / 1000 - lastState.latest_stereo.t).toFixed(2) + 's'
+    : 'n/a (no reading yet)';
+  document.getElementById('diagBox').innerHTML =
+    `<b>tickCount</b>: ${tickCount} (100ms timer -- freezing this means the BROWSER TAB is throttled, not a data bug)<br>` +
+    `<b>pollCount</b>: ${pollCount} (400ms /state fetches completed)<br>` +
+    `<b>time since last successful /state fetch</b>: ${sinceFetchMs !== null ? sinceFetchMs + 'ms' : 'n/a'}<br>` +
+    `<b>latest_stereo.t age</b>: ${ageTxt} (backend-reported freshness of the last duck sighting)`;
+}
+
+setInterval(poll, 400);
+setInterval(tick, 100);
+poll();
+tick();
 </script>
 </body>
 </html>
