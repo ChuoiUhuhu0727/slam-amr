@@ -158,6 +158,34 @@ STEREO_MAX_DISTANCE_M = 5.0
 # (~1-1.6s) trades off jitter-rejection against staying responsive.
 STEREO_SMOOTHING_WINDOW = 8
 
+# Duck's real physical height, measured 2026-08-24 (same constant the old
+# monocular backup script used as DUCK_HEIGHT_M -- see
+# search_and_rescue_monocular_backup.py).
+DUCK_HEIGHT_M = 0.13
+
+# Size-sanity gate (2026-08-27): given distance + box height in pixels, the
+# implied real-world height (pinhole projection: real = px * distance / f)
+# should land near DUCK_HEIGHT_M. Catches the class of bad reading seen live
+# where disparity/distance come out wildly wrong (e.g. 0.13-0.15m readings
+# from ~500-590px disparity, right in the known-unreliable <13cm zone) --
+# those imply a real height nowhere near an actual duck's. Root-causes the
+# false-positive/bad-match problem without touching the model or retraining
+# (see project memory: retraining risks whack-a-mole regressions; this is a
+# pure additive filter, trivially disabled by setting ENABLE_DUCK_SIZE_CHECK
+# to False if it turns out to reject good sightings instead).
+# Tolerance deliberately wide and asymmetric, not a tight fit: a partially-
+# occluded detection (e.g. only the duck's head boxed, seen live 2026-08-27)
+# under-reports height, so the floor is generous (0.4x) to avoid rejecting
+# real partial detections; ceiling (2.5x) is looser than the floor because
+# an oversized box from a bad L/R pairing has no such legitimate case to
+# protect against. NOT validated against real logged data yet (the box
+# height wasn't in the log format that surfaced this idea) -- the
+# 'implied_height_m' field added to the log line below is specifically so
+# the next live run can be checked before trusting this gate blindly.
+ENABLE_DUCK_SIZE_CHECK = True
+DUCK_SIZE_MIN_RATIO = 0.4
+DUCK_SIZE_MAX_RATIO = 2.5
+
 GOAL_TOLERANCE_M = 0.10       # "close enough" to a waypoint
 # Raised 2026-08-28 (was 0.35 rad / ~20deg): this threshold predates the
 # IMU-based heading PID on the ESP32 - back when heading correction while
@@ -645,6 +673,20 @@ class SearchAndRescue(Node):
             )
             return
 
+        # Size-sanity gate -- see ENABLE_DUCK_SIZE_CHECK comment above.
+        # Averages left+right box height rather than trusting either alone,
+        # same reasoning as averaging disparity from both cameras elsewhere.
+        avg_height_px = ((ly2 - ly1) + (ry2 - ry1)) / 2.0
+        implied_height_m = avg_height_px * distance / self.fx_rect
+        size_ratio = implied_height_m / DUCK_HEIGHT_M
+        if ENABLE_DUCK_SIZE_CHECK and not (DUCK_SIZE_MIN_RATIO <= size_ratio <= DUCK_SIZE_MAX_RATIO):
+            self.get_logger().warn(
+                f"Duck stereo distance={distance:.2f}m + box height={avg_height_px:.0f}px implies "
+                f"real height={implied_height_m:.2f}m ({size_ratio:.1f}x expected {DUCK_HEIGHT_M}m) "
+                "-- outside sanity range, skipping sighting"
+            )
+            return
+
         # Pixel offset from image center -> bearing angle, using the LEFT
         # (reference) rectified camera, same convention as the old monocular
         # code. Camera rig has ~0 x/y offset from base_link, just faces a
@@ -661,6 +703,7 @@ class SearchAndRescue(Node):
             'distance_m': distance,
             'bearing_deg': math.degrees(bearing),
             'disparity_px': disparity_px,
+            'implied_height_m': implied_height_m,
             't': time.time(),
         }
         self.stereo_distance_history.append(distance)
@@ -671,7 +714,8 @@ class SearchAndRescue(Node):
         self.duck_sightings.append((world_x, world_y))
         self.get_logger().info(
             f"Duck seen (stereo): disparity={disparity_px:.1f}px dist={distance:.2f}m "
-            f"bearing={math.degrees(bearing):.1f}deg -> estimated world ({world_x:.2f}, {world_y:.2f})"
+            f"bearing={math.degrees(bearing):.1f}deg implied_height={implied_height_m:.2f}m "
+            f"({size_ratio:.1f}x) -> estimated world ({world_x:.2f}, {world_y:.2f})"
         )
 
     def duck_estimate(self):
@@ -852,7 +896,20 @@ def _mjpeg_generator(node, side):
             ok, buf = cv2.imencode('.jpg', display)
             if ok:
                 yield (b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n')
-            time.sleep(0.1)
+            # Lowered from 0.1s (10fps) 2026-08-27 -- hypothesis for a live-observed
+            # multi-second dashboard lag: two of these generators (one per camera)
+            # each JPEG-encoding a frame every 100ms on Flask's threaded dev server
+            # is real CPU work competing with YOLO + ROS spin on the same Jetson
+            # cores, worse than it looks since the overlaid box only actually
+            # changes at TARGET_DETECT_HZ=5Hz anyway -- streaming faster than that
+            # buys smoother raw video at the cost of CPU, not more useful detection
+            # info. NOT yet confirmed as the actual cause (see the "Vision loop: XHz"
+            # log, which stayed near target throughout the lag -- so the bottleneck
+            # was in streaming/serving, not detection) -- revert to 0.1 if this
+            # doesn't help and the real cause turns out to be something else
+            # (e.g. leaked generator threads from unclosed browser tabs -- check
+            # "video client connected" vs "disconnected" counts in the terminal).
+            time.sleep(0.2)
     finally:
         node.get_logger().info(f"Dashboard: {side} video client disconnected")
 
