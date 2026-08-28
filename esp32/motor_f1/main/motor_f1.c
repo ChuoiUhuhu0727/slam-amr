@@ -277,6 +277,18 @@ static volatile float g_trim_right = 0.0f;
  * isn't a real hazard the way the paired pulse-count/timestamp fields are. */
 static volatile bool g_reset_odom_requested = false;
 
+/* Motor kill switch (2026-08-28) - live toggle for tuning convenience, set
+ * by pid_gains_callback on "MOTOR_OFF"/"MOTOR_ON" (same channel/pattern as
+ * RESET_ODOM above). STBY is pulled LOW/HIGH immediately in the callback
+ * itself, not just next control_task cycle - the TB6612FNG ignores PWM/DIR
+ * entirely while in standby, so this is a real power cut, not a commanded-
+ * zero-speed workaround the PID loop could fight. control_task also forces
+ * PWM=0 and clears both integrators while this is set (see its use below),
+ * so the diag panel's PWM readout stays honest and re-enabling doesn't slam
+ * the wheels with windup built up while the loop chased a target it
+ * physically couldn't reach. */
+static volatile bool g_motor_killed = false;
+
 /* --- F4: odometry (measured 2026-07-27: wheelbase 10cm; wheel diameter
  * re-measured 2026-08-26 as 6.7cm, corrected from the original 6cm) ---
  * distance per pulse = wheel circumference / slots per rev - converts a raw
@@ -418,10 +430,27 @@ static bool g_mag_calibrated = false;
 #define GYRO_RAW_TO_RAD_PER_S (PI_F / (180.0f * 131.0f))
 
 /* Number of samples averaged for the boot-time gyro bias calibration (see
- * g_gyro_z_bias_raw / calibration loop in setup_imu()). 100 samples @ ~10ms
- * apart is ~1s total - long enough to average out ordinary sample noise,
- * short enough not to meaningfully delay boot. */
-#define GYRO_CAL_SAMPLES 100
+ * g_gyro_z_bias_raw / calibration loop in setup_imu()). Bumped 100->400
+ * (2026-08-28) for better real accuracy - random sample noise averages down
+ * with the square root of sample count, so 4x the samples is roughly 2x
+ * less noise in the final number. Deliberately NOT paired with a settle
+ * delay or any change to when sampling starts (see the calibration loop's
+ * own comment) - that combination is what caused the earlier regression;
+ * this only runs the same already-proven averaging loop longer. 400 @
+ * ~10ms apart is ~4s total, a one-time boot cost. */
+#define GYRO_CAL_SAMPLES 400
+
+/* Number of independent samples averaged for the boot-time compass
+ * heading-zero calibration (see g_mag_heading_offset_rad / the calibration
+ * loop at the end of setup_imu()). NOT spaced the same as GYRO_CAL_SAMPLES
+ * above - the HMC5883L is configured for a 15Hz data output rate (CONFIG_A
+ * = 0x70 in setup_magnetometer), so reading faster than ~67ms apart would
+ * just re-read the same cached register value repeatedly, averaging
+ * multiple copies of one sample instead of actually reducing noise. 30
+ * samples @ 70ms apart is ~2.1s - genuinely independent readings, still a
+ * small one-time boot cost. */
+#define MAG_CAL_SAMPLES 30
+#define MAG_CAL_SAMPLE_PERIOD_MS 70
 
 /* Spinlock used to make "read + reset" atomic (avoids the lost-pulse race
  * where a pulse arrives between reading the counter and zeroing it). */
@@ -791,6 +820,18 @@ static void control_task(void *arg) {
         if (target_pwm_left  > MAX_SAFE_PWM) target_pwm_left  = MAX_SAFE_PWM;
         if (target_pwm_right > MAX_SAFE_PWM) target_pwm_right = MAX_SAFE_PWM;
 
+        /* Motor kill switch - STBY is already LOW by this point (see
+         * pid_gains_callback), so the TB6612FNG is physically ignoring these
+         * values regardless; this just keeps the software side consistent
+         * with that instead of quietly windup-ing against an unreachable
+         * target. */
+        if (g_motor_killed) {
+            target_pwm_left  = 0.0f;
+            target_pwm_right = 0.0f;
+            integral_left = 0.0f;
+            integral_right = 0.0f;
+        }
+
         applied_pwm_left  = target_pwm_left;
         applied_pwm_right = target_pwm_right;
         pwm_left_shared  = applied_pwm_left;
@@ -889,6 +930,19 @@ static void pid_gains_callback(const void *msgin) {
         g_reset_odom_requested = true;
         return;
     }
+    /* Motor kill switch - toggle STBY right here, not in control_task, so
+     * it takes effect the instant the message arrives rather than waiting
+     * up to one control period. */
+    if (strcmp(msg->data.data, "MOTOR_OFF") == 0) {
+        g_motor_killed = true;
+        gpio_set_level(STBY_PIN, 0);
+        return;
+    }
+    if (strcmp(msg->data.data, "MOTOR_ON") == 0) {
+        g_motor_killed = false;
+        gpio_set_level(STBY_PIN, 1);
+        return;
+    }
     float kp, ki, max_i, khead, trim_l, trim_r, max_head, klock, max_lock;
     if (sscanf(msg->data.data, "KP=%f,KI=%f,MAXI=%f,KHEAD=%f,TRIML=%f,TRIMR=%f,MAXHEAD=%f,KLOCK=%f,MAXLOCK=%f",
                &kp, &ki, &max_i, &khead, &trim_l, &trim_r, &max_head, &klock, &max_lock) == 9) {
@@ -945,7 +999,8 @@ static void uros_task(void *arg) {
         char diag_text[400];   /* grown from 96/112/160/200/280/320 -- added TRIML/TRIMR fields plus
                                  * the existing RPM/PWM/KP/KI/MAXI/KHEAD/I2C/WAKE/GZ/MAG/MX/MY/MZ/
                                  * MAGHDG fields plus g_i2c_scan_result's own 40-char worst case can
-                                 * exceed 200 */
+                                 * exceed 200. MOTOR (2026-08-28, kill switch) fit within this
+                                 * existing headroom, no resize needed. */
         char imu_text[80];
 
         if (rclc_support_init(&support, 0, NULL, &allocator) != RCL_RET_OK) {
@@ -1138,8 +1193,9 @@ static void uros_task(void *arg) {
                  * drive motors' permanent magnets - or a wrong axis in the
                  * atan2f call swamping the real signal). */
                 snprintf(diag_text, sizeof(diag_text),
-                         "reset=%s RPM L=%.1f R=%.1f PWM L=%.0f R=%.0f KP=%.2f KI=%.2f MAXI=%.1f KHEAD=%.1f MAXHEAD=%.1f TRIML=%.1f TRIMR=%.1f KLOCK=%.2f MAXLOCK=%.2f LOCK=%s TGT=%.1f HDGERR=%.1f I2C=%s WAKE=%d GZ=%s GZBIAS=%.1f MAG=%s MX=%d MY=%d MZ=%d MAGHDG=%.1f",
+                         "reset=%s MOTOR=%s RPM L=%.1f R=%.1f PWM L=%.0f R=%.0f KP=%.2f KI=%.2f MAXI=%.1f KHEAD=%.1f MAXHEAD=%.1f TRIML=%.1f TRIMR=%.1f KLOCK=%.2f MAXLOCK=%.2f LOCK=%s TGT=%.1f HDGERR=%.1f I2C=%s WAKE=%d GZ=%s GZBIAS=%.1f MAG=%s MX=%d MY=%d MZ=%d MAGHDG=%.1f",
                          reset_reason_str(g_reset_reason),
+                         g_motor_killed ? "off" : "on",
                          rpm_left_shared, rpm_right_shared,
                          pwm_left_shared, pwm_right_shared,
                          g_kp, g_ki, g_max_i_contribution, g_kheading, g_max_heading_trim_rpm, g_trim_left, g_trim_right,
@@ -1365,16 +1421,29 @@ static void setup_imu(void) {
         imu_dev = NULL;  /* wiring/address wrong - don't let later reads run */
     }
 
-    /* Gyro zero-rate bias calibration (2026-08-28) - see g_gyro_z_bias_raw
-     * comment above for the why. Runs once here, blocking, before either
-     * task starts - the robot MUST be stationary through this (nothing else
-     * is driving it yet at this point in boot, so that's already true).
-     * Averages GYRO_CAL_SAMPLES readings rather than trusting one, to
-     * average out ordinary per-sample sensor noise, not just the constant
-     * bias. Only meaningful if the IMU actually woke - a dead/absent IMU
-     * has nothing to calibrate, g_gyro_z_bias_raw stays at its 0.0f default
-     * (imu_gz_valid_shared will be false anyway in that case, so this
-     * bias is never even applied to anything). */
+    /* Gyro zero-rate bias calibration (2026-08-28, reverted 2026-08-28) - see
+     * g_gyro_z_bias_raw comment above for the why. Runs once here, blocking,
+     * before either task starts - the robot MUST be stationary through this
+     * (nothing else is driving it yet at this point in boot, so that's
+     * already true). Only meaningful if the IMU actually woke - a dead/
+     * absent IMU has nothing to calibrate, g_gyro_z_bias_raw stays at its
+     * 0.0f default (imu_gz_valid_shared will be false anyway in that case,
+     * so this bias is never even applied to anything).
+     *
+     * A same-day attempt at "improving" this (a 60ms post-wake settle delay
+     * before the first sample, plus two-pass outlier rejection) made the
+     * real-hardware result WORSE, not better - confirmed live: ~1.8-1.9deg/s
+     * with this plain version below, ~3.8deg/s with the settle-delay
+     * version, on the same physical setup. Best guess, not confirmed: the
+     * MPU6050's zero-rate output isn't actually stable immediately after
+     * wake - it can drift for a bit as the internal oscillator/die
+     * temperature settles - and shifting WHEN the sampling window starts
+     * (even by 60ms) likely moved it into a worse part of that transient
+     * rather than past it. Reverted rather than guessing again with no way
+     * to verify on real hardware from here - simple immediate averaging is
+     * the version with actual evidence behind it. If this needs revisiting,
+     * the settle time would need to be verified empirically (try several
+     * delay values against a known-good reading), not just picked. */
     if (wake_ok) {
         float bias_sum = 0.0f;
         int good_samples = 0;
@@ -1424,6 +1493,41 @@ static void setup_imu(void) {
      * unconditionally - it's a different chip at a different address, its
      * fate isn't tied to whether the MPU6050 wake above succeeded. */
     setup_magnetometer(bus_handle);
+
+    /* Compass heading-zero calibration (2026-08-28) - previously "heading
+     * zero" was just whatever the FIRST successful read happened to be,
+     * lazily captured on uros_task's first control cycle (see the
+     * g_mag_calibrated check there) - a single noisy sample, same class of
+     * problem the gyro bias calibration above already solved for the gyro.
+     * Same fix here: average many samples instead of trusting one - but
+     * average the raw X/Y VECTOR components first and take atan2f only
+     * once at the end, not the angles themselves (averaging angles needs
+     * care around the +/-180deg wrap boundary; averaging the underlying
+     * vector sidesteps that entirely and is the mathematically correct way
+     * to average a direction anyway). Robot MUST be stationary through
+     * this, same requirement as the gyro cal - already true this early in
+     * boot. On success, g_mag_calibrated is set true here, so uros_task's
+     * own first-good-read fallback below never fires; it's left in place
+     * purely as a safety net for the case this loop gets zero good samples
+     * (e.g. magnetometer not answering yet at boot but recovering later). */
+    {
+        float mx_sum = 0.0f, my_sum = 0.0f;
+        int good_samples = 0;
+        for (int i = 0; i < MAG_CAL_SAMPLES; i++) {
+            int16_t cal_mx, cal_my, cal_mz;
+            if (mag_read_raw(&cal_mx, &cal_my, &cal_mz)) {
+                mx_sum += (float)cal_mx;
+                my_sum += (float)cal_my;
+                good_samples++;
+            }
+            vTaskDelay(pdMS_TO_TICKS(MAG_CAL_SAMPLE_PERIOD_MS));
+        }
+        if (good_samples > 0) {
+            g_mag_heading_offset_rad = atan2f(my_sum / (float)good_samples,
+                                               mx_sum / (float)good_samples);
+            g_mag_calibrated = true;
+        }
+    }
 }
 
 /* Burst-reads accel+temp+gyro (14 bytes from ACCEL_XOUT_H) and splits it
