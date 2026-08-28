@@ -997,6 +997,20 @@ class SearchAndRescue(Node):
         # to the box AFTER reprojecting instead, below.
         disparity = self.stereo_matcher.compute(gray_l, gray_r).astype(np.float32) / 16.0
         points3d = cv2.reprojectImageTo3D(disparity, self.Q)
+        # Found live 2026-08-28: Z was coming out consistently NEGATIVE for
+        # real, in-front-of-camera geometry (confirmed via diagnostic log --
+        # z range at disparity-passing pixels was e.g. [-2.22, -0.44]m,
+        # matching the CENTROID method's real ~0.78m distance in magnitude,
+        # just sign-flipped). Root cause: cv2.reprojectImageTo3D's formula
+        # has X/Y/Z all sharing the same (-Tx/disparity) scale factor from
+        # Q, so this calibration's baseline (T) sign convention vs. what
+        # OpenCV's Q formula assumes produced a uniform sign flip across
+        # all three axes together, not a per-axis bug -- negating the whole
+        # array once is the correct, minimal fix (same class of issue as
+        # the documented LEFT_SENSOR_ID/RIGHT_SENSOR_ID swap bug elsewhere
+        # in this file, different mechanism, same root cause: an unverified
+        # sign convention assumption).
+        points3d = -points3d
 
         h, w = disparity.shape
         x1 = max(0, min(w - 1, int(round(lx1))))
@@ -1022,9 +1036,26 @@ class SearchAndRescue(Node):
         n_valid = int(np.count_nonzero(valid))
         compute_ms = (time.time() - t0) * 1000.0
         if n_valid < POINTCLOUD_MIN_VALID_POINTS:
+            # Diagnostic breakdown (2026-08-28, live debugging: first real
+            # test consistently got 0 valid points) -- which individual
+            # condition is actually failing, not just the combined count.
+            # SGBM marks a pixel as unmatched with disparity -1 (raw -16
+            # before the /16.0 scaling) when it can't find a confident
+            # correlation -- a real, common failure mode on a smooth,
+            # low-texture object like a rubber duck, which block-matching
+            # stereo has nothing to latch onto (unlike the centroid method,
+            # which only needs YOLO's box, not per-pixel texture).
+            n_disp_ok = int(np.count_nonzero(region_disp > STEREO_MIN_DISPARITY_PX))
+            n_finite = int(np.count_nonzero(np.isfinite(z)))
+            disp_ok_mask = region_disp > STEREO_MIN_DISPARITY_PX
+            z_at_disp_ok = z[disp_ok_mask] if n_disp_ok > 0 else np.array([0.0])
             self.get_logger().warn(
                 f"Point-cloud estimate: only {n_valid} valid points in box "
-                f"(need {POINTCLOUD_MIN_VALID_POINTS}) -- skipping, compute={compute_ms:.0f}ms"
+                f"(need {POINTCLOUD_MIN_VALID_POINTS}) -- skipping, compute={compute_ms:.0f}ms. "
+                f"Diagnostic: disparity range [{region_disp.min():.1f}, {region_disp.max():.1f}]px "
+                f"(mean {region_disp.mean():.1f}px), {n_disp_ok}/{region_disp.size} pixels pass "
+                f">threshold, {n_finite}/{region_disp.size} pixels finite depth, "
+                f"z range at disp-ok pixels [{z_at_disp_ok.min():.3f}, {z_at_disp_ok.max():.3f}]m"
             )
             return
 
