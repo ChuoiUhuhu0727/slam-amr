@@ -85,6 +85,7 @@ from rclpy.node import Node
 from geometry_msgs.msg import Twist
 from nav_msgs.msg import Odometry
 from std_msgs.msg import String
+from visualization_msgs.msg import Marker
 
 # ---------------------------------------------------------------------------
 # CONFIG -- confirm/measure these before trusting the output
@@ -186,6 +187,66 @@ DUCK_HEIGHT_M = 0.13
 ENABLE_DUCK_SIZE_CHECK = True
 DUCK_SIZE_MIN_RATIO = 0.4
 DUCK_SIZE_MAX_RATIO = 2.5
+
+# Point-cloud 3D position estimate (2026-08-27 night, experimental -- built
+# while vịt was away, NOT yet tested against real hardware since Jetson
+# network access was down this session. See PR description before trusting
+# this live.) Runs a SECOND, independent distance/position estimate
+# alongside the existing single-disparity centroid method above, specifically
+# to compare accuracy between the two (vịt's ask: get error down toward
+# 1-2%, which the single-point centroid method structurally can't reach --
+# see project memory ruler benchmark, 6-10% error, worsening with range
+# because distance=fx*baseline/disparity is 1/x and a single box-centroid
+# disparity has no averaging to reject jitter). This method instead runs
+# dense stereo matching (cv2.StereoSGBM) on the FULL rectified frame pair
+# (same self.latest_frame_left/right the dashboard already shows), reprojects
+# to a real 3D point cloud (cv2.reprojectImageTo3D), and takes the MEDIAN of
+# just the points falling inside the duck's already-detected box -- many
+# points averaged (robust to per-pixel noise) instead of one disparity value
+# from two box centroids (fragile to either box being off by a few px).
+#
+# Deliberately NOT using the existing Isaac ROS stereo_image_proc pipeline
+# (jetson/slam/stereo_depth_argus.launch.py) for this even though it already
+# does dense stereo -- that needs the full Isaac ROS Docker container +
+# rectified visual_slam launch running, which claims the cameras exclusively
+# and can't run alongside this script's own camera capture (see module
+# docstring's existing "Deliberately does NOT use ... Isaac ROS stereo
+# depth" reasoning, same logic extends here). Runs full-frame (not cropped
+# to the box before matching) specifically to avoid a subtle correctness
+# bug: cropping the disparity input by rows shifts the image's effective
+# principal point, which cv2.reprojectImageTo3D's Q matrix doesn't know
+# about unless Q itself is adjusted to match -- easy to get quietly wrong.
+# Cropping the OUTPUT point cloud to the box instead (after reprojecting
+# the full frame) needs no such correction. Isaac's own stereo_image_proc
+# equivalent was independently measured at ~1-1.5Hz on this same class of
+# Jetson CPU workload (see stereo_depth_argus.launch.py's 2026-08-11 note)
+# -- POINTCLOUD_ESTIMATE_PERIOD_S below is set to roughly match that
+# precedent rather than guessing blind, but the real achieved rate is
+# logged every time this runs so it can be corrected against real data.
+ENABLE_POINTCLOUD_ESTIMATE = True
+POINTCLOUD_ESTIMATE_PERIOD_S = 1.0     # rate limit -- dense stereo is much
+                                        # more expensive than the existing
+                                        # centroid method, don't run it every
+                                        # vision-loop tick
+POINTCLOUD_MIN_VALID_POINTS = 20       # reject the reading if fewer than
+                                        # this many pixels inside the box
+                                        # produced a valid (finite, in-range)
+                                        # depth -- mirrors the existing
+                                        # disparity/distance/size sanity
+                                        # gates above rather than trusting a
+                                        # near-empty region's median
+
+# Camera mount offset from base_link -- copied verbatim from
+# jetson/slam/visual_slam-adjacent jetson/slam/stereo_depth_argus.launch.py
+# (measured there 2026-08-11, tape measure against the real chassis: camera
+# sits ~directly over the wheel axle, centered left-right, 14cm up). NOT the
+# rotation from that file (BASE_TO_LEFT_CAM_QUAT) -- this mission's rig has
+# since been yawed 45deg (CAMERA_BEARING_OFFSET_RAD), so the rotation is
+# derived fresh in _estimate_pointcloud_position instead of reused. This
+# XYZ offset is carried over on the assumption that yawing the rig about its
+# own mount point doesn't change its height/centering -- plausible but NOT
+# independently re-measured for this specific rig.
+BASE_TO_LEFT_CAM_XYZ = (0.0, 0.0, 0.14)
 
 GOAL_TOLERANCE_M = 0.10       # "close enough" to a waypoint
 # Raised 2026-08-28 (was 0.35 rad / ~20deg): this threshold predates the
@@ -410,6 +471,12 @@ class SearchAndRescue(Node):
                                              # comment). Kept separate from latest_stereo_reading
                                              # (raw) deliberately -- both shown on the dashboard so
                                              # the raw jitter is still visible, not hidden by smoothing.
+        self.latest_pointcloud_reading = None  # {'x_m','y_m','z_m','distance_m','world_x','world_y',
+                                                # 'world_z','n_points','compute_ms','t'} -- see
+                                                # ENABLE_POINTCLOUD_ESTIMATE comment above. Independent
+                                                # of latest_stereo_reading, meant to be compared
+                                                # against it, not to replace it (yet).
+        self._last_pointcloud_estimate_t = 0.0  # rate-limit gate, see POINTCLOUD_ESTIMATE_PERIOD_S
 
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.pid_pub = self.create_publisher(String, '/pid_gains', 10)
@@ -455,10 +522,13 @@ class SearchAndRescue(Node):
         # aligns principal points; alpha=0 crops to the valid-pixel region only.
         # This rig-rotation doesn't touch R/T (camera-to-camera geometry is
         # unchanged), so this is the same R/T that was already trusted before.
-        R1, R2, P1, P2, _, _, _ = cv2.stereoRectify(
+        # Q captured (was discarded as `_`) -- needed by cv2.reprojectImageTo3D
+        # for the point-cloud position estimate, see ENABLE_POINTCLOUD_ESTIMATE.
+        R1, R2, P1, P2, Q, _, _ = cv2.stereoRectify(
             K1, D1, K2, D2, size, R, T,
             flags=cv2.CALIB_ZERO_DISPARITY, alpha=0,
         )
+        self.Q = Q
         self.map_left_x, self.map_left_y = cv2.initUndistortRectifyMap(
             K1, D1, R1, P1, size, cv2.CV_32FC1)
         self.map_right_x, self.map_right_y = cv2.initUndistortRectifyMap(
@@ -486,6 +556,31 @@ class SearchAndRescue(Node):
         self.baseline_m = baseline_m
 
         self.model = YOLO(str(WEIGHTS_PATH))
+
+        if ENABLE_POINTCLOUD_ESTIMATE:
+            # Parameters are the well-known OpenCV stereo_match.py sample
+            # defaults, NOT tuned for this specific rig/scene yet -- a
+            # reasonable untested starting point, not a validated choice.
+            # numDisparities=192 (must be a multiple of 16) comfortably
+            # covers the ~90-190px disparity range already observed live
+            # for a duck at 0.5-1.5m with this rig's fx_rect/baseline.
+            self.stereo_matcher = cv2.StereoSGBM_create(
+                minDisparity=0,
+                numDisparities=192,
+                blockSize=7,
+                P1=8 * 3 * 7 ** 2,
+                P2=32 * 3 * 7 ** 2,
+                disp12MaxDiff=1,
+                uniquenessRatio=10,
+                speckleWindowSize=100,
+                speckleRange=2,
+            )
+            self.duck_marker_pub = self.create_publisher(Marker, '/duck_position_marker', 10)
+            self.get_logger().info(
+                "Point-cloud position estimate ENABLED (experimental, unverified against "
+                "real hardware as of 2026-08-27 -- Jetson was offline when this was built)."
+            )
+
         self.cap_left = cv2.VideoCapture(csi_pipeline(LEFT_SENSOR_ID), cv2.CAP_GSTREAMER)
         if not self.cap_left.isOpened():
             raise RuntimeError(f"Could not open LEFT CSI camera (sensor-id={LEFT_SENSOR_ID})")
@@ -869,6 +964,151 @@ class SearchAndRescue(Node):
             f"({size_ratio:.1f}x) -> estimated world ({world_x:.2f}, {world_y:.2f})"
         )
 
+        if ENABLE_POINTCLOUD_ESTIMATE:
+            now = time.time()
+            if now - self._last_pointcloud_estimate_t >= POINTCLOUD_ESTIMATE_PERIOD_S:
+                self._last_pointcloud_estimate_t = now
+                try:
+                    self._estimate_pointcloud_position(lx1, ly1, lx2, ly2, distance)
+                except Exception as e:
+                    # Experimental path, not allowed to take the proven
+                    # centroid-based pipeline above down with it if
+                    # something in here is wrong -- log and move on.
+                    self.get_logger().warn(f"Point-cloud position estimate failed: {e}")
+
+    def _estimate_pointcloud_position(self, lx1, ly1, lx2, ly2, centroid_distance_m):
+        """Dense-stereo alternative to the single-disparity centroid distance
+        above -- see ENABLE_POINTCLOUD_ESTIMATE comment for why. Takes the
+        rectified box corners (already computed by the caller) plus the
+        existing method's distance for side-by-side comparison logging."""
+        import cv2
+
+        frame_l = self.latest_frame_left
+        frame_r = self.latest_frame_right
+        if frame_l is None or frame_r is None:
+            return
+
+        t0 = time.time()
+        gray_l = cv2.cvtColor(frame_l, cv2.COLOR_BGR2GRAY)
+        gray_r = cv2.cvtColor(frame_r, cv2.COLOR_BGR2GRAY)
+        # Full-frame, not cropped to the box -- see the "correctness bug"
+        # note in ENABLE_POINTCLOUD_ESTIMATE's comment (row-cropping before
+        # matching would silently invalidate Q's principal point). Cropped
+        # to the box AFTER reprojecting instead, below.
+        disparity = self.stereo_matcher.compute(gray_l, gray_r).astype(np.float32) / 16.0
+        points3d = cv2.reprojectImageTo3D(disparity, self.Q)
+
+        h, w = disparity.shape
+        x1 = max(0, min(w - 1, int(round(lx1))))
+        x2 = max(0, min(w, int(round(lx2))))
+        y1 = max(0, min(h - 1, int(round(ly1))))
+        y2 = max(0, min(h, int(round(ly2))))
+        if x2 <= x1 or y2 <= y1:
+            return
+
+        region_disp = disparity[y1:y2, x1:x2]
+        region_pts = points3d[y1:y2, x1:x2]
+        # X/Y/Z in OpenCV's optical convention: X=right, Y=down, Z=forward
+        # (into the scene) -- same convention cv2.reprojectImageTo3D always
+        # uses, matches REP103 "optical frame" (see stereo_depth_argus.
+        # launch.py's own note on this exact convention).
+        z = region_pts[:, :, 2]
+        valid = (
+            (region_disp > STEREO_MIN_DISPARITY_PX)
+            & np.isfinite(z)
+            & (z > 0.05)
+            & (z < STEREO_MAX_DISTANCE_M)
+        )
+        n_valid = int(np.count_nonzero(valid))
+        compute_ms = (time.time() - t0) * 1000.0
+        if n_valid < POINTCLOUD_MIN_VALID_POINTS:
+            self.get_logger().warn(
+                f"Point-cloud estimate: only {n_valid} valid points in box "
+                f"(need {POINTCLOUD_MIN_VALID_POINTS}) -- skipping, compute={compute_ms:.0f}ms"
+            )
+            return
+
+        # Median, not mean -- same reasoning as STEREO_SMOOTHING_WINDOW
+        # above: reject outliers (background bleeding into the box edges,
+        # bad individual disparity pixels) rather than let them drag an
+        # average around.
+        x_cam = float(np.median(region_pts[:, :, 0][valid]))
+        y_cam = float(np.median(region_pts[:, :, 1][valid]))
+        z_cam = float(np.median(z[valid]))
+        distance_m = math.sqrt(x_cam ** 2 + y_cam ** 2 + z_cam ** 2)
+
+        # camera_optical (X=right,Y=down,Z=forward) -> a ROS-convention local
+        # frame (x=forward,y=left,z=up) -- the same fixed axis relationship
+        # stereo_depth_argus.launch.py's BASE_TO_LEFT_CAM_QUAT encodes, just
+        # applied here as explicit trig instead of a quaternion/TF (so this
+        # number is correct on its own without depending on a TF chain this
+        # session has no way to visually verify -- see PR description).
+        x_local = z_cam
+        y_local = -x_cam
+        z_local = -y_cam
+
+        # Rig-mount yaw (same CAMERA_BEARING_OFFSET_RAD used by the existing
+        # centroid method's bearing math) -- rotates the camera-forward local
+        # frame into base_link's frame. NOT the same as stereo_depth_argus.
+        # launch.py's BASE_TO_LEFT_CAM_QUAT verbatim -- that constant assumes
+        # a straight-forward (unyawed) mount, which stopped being true once
+        # this mission's rig got rotated 45deg for perimeter-hugging
+        # (2026-08-26). Composing them wrong was a real, easy mistake to
+        # make here -- flagging explicitly since it can't be tested tonight.
+        c, s = math.cos(CAMERA_BEARING_OFFSET_RAD), math.sin(CAMERA_BEARING_OFFSET_RAD)
+        dx_base = x_local * c - y_local * s
+        dy_base = x_local * s + y_local * c
+        dz_base = z_local
+
+        # BASE_TO_LEFT_CAM_XYZ (camera mount offset from base_link) reused
+        # from stereo_depth_argus.launch.py -- that offset is about mount
+        # HEIGHT/position relative to the wheel axle, which the 45deg yaw
+        # rotation (a rotation about the mount's own vertical axis) plausibly
+        # doesn't change, but this carry-over is NOT independently
+        # re-measured for this rig, unlike the yaw composition above which
+        # IS derived correctly. Worth a real tape-measure check, not just
+        # trusted, if this number ever needs to be precise.
+        base_x = dx_base + BASE_TO_LEFT_CAM_XYZ[0]
+        base_y = dy_base + BASE_TO_LEFT_CAM_XYZ[1]
+        base_z = dz_base + BASE_TO_LEFT_CAM_XYZ[2]
+
+        # base_link -> world/odom -- same flat-ground, theta-only rotation
+        # the existing centroid method's world_x/world_y already use.
+        wc, ws = math.cos(self.theta), math.sin(self.theta)
+        world_x = self.x + base_x * wc - base_y * ws
+        world_y = self.y + base_x * ws + base_y * wc
+        world_z = base_z
+
+        self.latest_pointcloud_reading = {
+            'x_m': x_cam, 'y_m': y_cam, 'z_m': z_cam,
+            'distance_m': distance_m,
+            'world_x': world_x, 'world_y': world_y, 'world_z': world_z,
+            'n_points': n_valid,
+            'compute_ms': compute_ms,
+            't': time.time(),
+        }
+        self.get_logger().info(
+            f"Point-cloud position: dist={distance_m:.2f}m (centroid method said "
+            f"{centroid_distance_m:.2f}m, diff={distance_m - centroid_distance_m:+.2f}m) "
+            f"n_points={n_valid} compute={compute_ms:.0f}ms -> world ({world_x:.2f}, {world_y:.2f}, {world_z:.2f})"
+        )
+
+        marker = Marker()
+        marker.header.frame_id = 'odom'
+        marker.header.stamp = self.get_clock().now().to_msg()
+        marker.ns = 'duck_pointcloud'
+        marker.id = 0
+        marker.type = Marker.SPHERE
+        marker.action = Marker.ADD
+        marker.pose.position.x = world_x
+        marker.pose.position.y = world_y
+        marker.pose.position.z = world_z
+        marker.pose.orientation.w = 1.0
+        marker.scale.x = marker.scale.y = marker.scale.z = DUCK_HEIGHT_M
+        marker.color.r, marker.color.g, marker.color.b, marker.color.a = 1.0, 0.85, 0.0, 0.9
+        marker.lifetime.sec = 2  # disappears in RViz2 if sightings stop, instead of a stale marker lingering forever
+        self.duck_marker_pub.publish(marker)
+
     def duck_estimate(self):
         """Running average of every duck sighting so far -- a single-duck
         assumption by design (no multi-target clustering). Used live by the
@@ -958,6 +1198,7 @@ class SearchAndRescue(Node):
                 'duck_sightings': node.duck_sightings,
                 'duck_estimate': node.duck_estimate(),
                 'latest_stereo': node.latest_stereo_reading,
+                'latest_pointcloud': node.latest_pointcloud_reading,
                 'stereo_distance_smoothed_m': (
                     statistics.median(node.stereo_distance_history)
                     if node.stereo_distance_history else None
@@ -1618,6 +1859,7 @@ VISION_HTML_PAGE = """<!doctype html>
     </div>
   </div>
   <div id="stereoBox" class="stat-highlight">connecting...</div>
+  <div id="pointcloudBox" class="stat-highlight">connecting...</div>
   <div id="diagBox" class="diag">-</div>
   <pre id="rawJson">-</pre>
 
@@ -1634,6 +1876,7 @@ function poll() {
     pollCount++;
     document.getElementById('rawJson').innerText = JSON.stringify(
       { latest_stereo: state.latest_stereo,
+        latest_pointcloud: state.latest_pointcloud,
         stereo_distance_smoothed_m: state.stereo_distance_smoothed_m,
         has_camera: state.has_camera },
       null, 2
@@ -1663,6 +1906,29 @@ function tick() {
   } else {
     stereoBox.className = 'stat-highlight stale';
     stereoBox.innerHTML = 'no current stereo lock (duck not seen by both cameras right now)';
+  }
+
+  // Point-cloud method (2026-08-27 night, experimental, see
+  // ENABLE_POINTCLOUD_ESTIMATE in search_and_rescue.py) -- runs much slower
+  // (~1Hz target vs the centroid method's ~5Hz) so its freshness window is
+  // looser. Shown side by side with the box above specifically so the two
+  // methods' distance numbers can be eyeballed against each other live --
+  // that comparison IS the point of this box, not just a duplicate readout.
+  const pcFresh = lastState && lastState.latest_pointcloud &&
+    (now / 1000 - lastState.latest_pointcloud.t) < 3.0;
+  const pcBox = document.getElementById('pointcloudBox');
+  if (pcFresh) {
+    const p = lastState.latest_pointcloud;
+    const s = lastState.latest_stereo;
+    const diffTxt = (stereoFresh && s)
+      ? ` (centroid method: ${s.distance_m.toFixed(2)}m, diff ${(p.distance_m - s.distance_m).toFixed(2)}m)`
+      : '';
+    pcBox.className = 'stat-highlight';
+    pcBox.innerHTML = `point-cloud distance: <b>${p.distance_m.toFixed(2)}m</b>${diffTxt} ` +
+      `<span style="color:#8a94a6;">(${p.n_points} points, ${p.compute_ms.toFixed(0)}ms compute)</span>`;
+  } else {
+    pcBox.className = 'stat-highlight stale';
+    pcBox.innerHTML = 'no current point-cloud estimate';
   }
 
   const ageTxt = lastState && lastState.latest_stereo
