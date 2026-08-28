@@ -430,10 +430,15 @@ static bool g_mag_calibrated = false;
 #define GYRO_RAW_TO_RAD_PER_S (PI_F / (180.0f * 131.0f))
 
 /* Number of samples averaged for the boot-time gyro bias calibration (see
- * g_gyro_z_bias_raw / calibration loop in setup_imu()). 100 samples @ ~10ms
- * apart is ~1s total - long enough to average out ordinary sample noise,
- * short enough not to meaningfully delay boot. */
-#define GYRO_CAL_SAMPLES 100
+ * g_gyro_z_bias_raw / calibration loop in setup_imu()). Bumped 100->400
+ * (2026-08-28) for better real accuracy - random sample noise averages down
+ * with the square root of sample count, so 4x the samples is roughly 2x
+ * less noise in the final number. Deliberately NOT paired with a settle
+ * delay or any change to when sampling starts (see the calibration loop's
+ * own comment) - that combination is what caused the earlier regression;
+ * this only runs the same already-proven averaging loop longer. 400 @
+ * ~10ms apart is ~4s total, a one-time boot cost. */
+#define GYRO_CAL_SAMPLES 400
 
 /* Number of independent samples averaged for the boot-time compass
  * heading-zero calibration (see g_mag_heading_offset_rad / the calibration
@@ -1416,7 +1421,7 @@ static void setup_imu(void) {
         imu_dev = NULL;  /* wiring/address wrong - don't let later reads run */
     }
 
-    /* Gyro zero-rate bias calibration (2026-08-28, refined 2026-08-28) - see
+    /* Gyro zero-rate bias calibration (2026-08-28, reverted 2026-08-28) - see
      * g_gyro_z_bias_raw comment above for the why. Runs once here, blocking,
      * before either task starts - the robot MUST be stationary through this
      * (nothing else is driving it yet at this point in boot, so that's
@@ -1425,58 +1430,33 @@ static void setup_imu(void) {
      * 0.0f default (imu_gz_valid_shared will be false anyway in that case,
      * so this bias is never even applied to anything).
      *
-     * Two refinements on top of plain averaging, since raw averaging alone
-     * still leaves a small residual (observed ~-1.9deg/s, close but not
-     * exact):
-     * 1. Short settle delay before the first sample - the wake write above
-     *    only confirms the I2C transaction succeeded, not that the gyro's
-     *    internal oscillator/DLPF has actually settled after coming out of
-     *    sleep. A brief post-wake transient reading as part of the average
-     *    would skew it.
-     * 2. Two-pass outlier rejection - collect all samples first, then
-     *    re-average excluding anything more than 2.5 standard deviations
-     *    from the rough mean. Guards against a single bump/vibration/EMI
-     *    glitch during calibration silently biasing the whole session's
-     *    heading tracking - plain averaging dilutes an outlier, this
-     *    discards it outright. */
+     * A same-day attempt at "improving" this (a 60ms post-wake settle delay
+     * before the first sample, plus two-pass outlier rejection) made the
+     * real-hardware result WORSE, not better - confirmed live: ~1.8-1.9deg/s
+     * with this plain version below, ~3.8deg/s with the settle-delay
+     * version, on the same physical setup. Best guess, not confirmed: the
+     * MPU6050's zero-rate output isn't actually stable immediately after
+     * wake - it can drift for a bit as the internal oscillator/die
+     * temperature settles - and shifting WHEN the sampling window starts
+     * (even by 60ms) likely moved it into a worse part of that transient
+     * rather than past it. Reverted rather than guessing again with no way
+     * to verify on real hardware from here - simple immediate averaging is
+     * the version with actual evidence behind it. If this needs revisiting,
+     * the settle time would need to be verified empirically (try several
+     * delay values against a known-good reading), not just picked. */
     if (wake_ok) {
-        vTaskDelay(pdMS_TO_TICKS(60));  /* let the gyro settle post-wake, see above */
-
-        float samples[GYRO_CAL_SAMPLES];
+        float bias_sum = 0.0f;
         int good_samples = 0;
         for (int i = 0; i < GYRO_CAL_SAMPLES; i++) {
             int16_t cal_ax, cal_ay, cal_az, cal_gx, cal_gy, cal_gz;
             if (imu_read_raw(&cal_ax, &cal_ay, &cal_az, &cal_gx, &cal_gy, &cal_gz)) {
-                samples[good_samples++] = (float)cal_gz;
+                bias_sum += (float)cal_gz;
+                good_samples++;
             }
             vTaskDelay(pdMS_TO_TICKS(10));
         }
-
         if (good_samples > 0) {
-            float sum = 0.0f;
-            for (int i = 0; i < good_samples; i++) sum += samples[i];
-            float rough_mean = sum / (float)good_samples;
-
-            float sq_sum = 0.0f;
-            for (int i = 0; i < good_samples; i++) {
-                float d = samples[i] - rough_mean;
-                sq_sum += d * d;
-            }
-            float std_dev = sqrtf(sq_sum / (float)good_samples);
-
-            /* std_dev < 0.01f guards the (unlikely) case every sample came
-             * back bit-identical, where the filter below would have nothing
-             * to discard against and could reject everything instead. */
-            float refined_sum = 0.0f;
-            int refined_count = 0;
-            for (int i = 0; i < good_samples; i++) {
-                if (std_dev < 0.01f || fabsf(samples[i] - rough_mean) <= 2.5f * std_dev) {
-                    refined_sum += samples[i];
-                    refined_count++;
-                }
-            }
-            g_gyro_z_bias_raw = (refined_count > 0) ? (refined_sum / (float)refined_count)
-                                                     : rough_mean;
+            g_gyro_z_bias_raw = bias_sum / (float)good_samples;
         }
     }
 

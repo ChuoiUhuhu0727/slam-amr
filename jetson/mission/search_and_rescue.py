@@ -340,9 +340,17 @@ class SearchAndRescue(Node):
         self.started = False  # gated by the dashboard's Start button -- camera/
                                # detection run regardless, only driving waits
 
-        self.motor_killed = False  # live kill switch (2026-08-28, tuning
-                                    # convenience) -- see set_motor_killed and
-                                    # motor_f1.c's MOTOR_OFF/MOTOR_ON sentinels
+        self.motor_killed = False  # what we last ASKED the ESP32 for -- see
+                                    # set_motor_killed and motor_f1.c's
+                                    # MOTOR_OFF/MOTOR_ON sentinels. Drives the
+                                    # 2s periodic re-assert in
+                                    # _publish_pid_gains, NOT what the
+                                    # dashboard displays (see motor_confirmed_
+                                    # killed / on_diag for that - ground
+                                    # truth from the ESP32 itself).
+        self.motor_confirmed_killed = False  # what the ESP32 itself last
+                                              # reported via /esp32_diag's
+                                              # MOTOR=on/off field
 
         self.manual_move = None  # None, or a dict describing an in-progress
                                   # manual drive/turn test -- see MANUAL_MOVE_
@@ -495,6 +503,18 @@ class SearchAndRescue(Node):
 
     def on_diag(self, msg: String):
         self.esp32_diag = msg.data
+        # Ground truth for the motor kill switch (2026-08-28 fix): the
+        # dashboard used to show self.motor_killed, which is just "what we
+        # last asked for" - set the instant the button is clicked, with no
+        # confirmation the ESP32 ever actually got the message. For a safety
+        # switch that's not good enough (a single dropped fire-and-forget
+        # publish would show "OFF" while the robot is still fully powered).
+        # Parse the ESP32's own MOTOR=on/off out of its diagnostic line
+        # instead - this only flips once the firmware itself reports it.
+        for token in msg.data.split():
+            if token.startswith('MOTOR='):
+                self.motor_confirmed_killed = (token[len('MOTOR='):] == 'off')
+                break
 
     # -- PID tuning -----------------------------------------------------------
 
@@ -518,11 +538,20 @@ class SearchAndRescue(Node):
         """Live motor kill switch - pulls the TB6612FNG's STBY pin instead
         of just commanding zero speed, so it's a real power cut the PID/
         heading loops can't fight (see motor_f1.c's MOTOR_OFF/MOTOR_ON
-        sentinels on this same /pid_gains channel)."""
+        sentinels on this same /pid_gains channel).
+
+        Fires the command 5x over ~100ms rather than once (2026-08-28 fix) -
+        this is a fire-and-forget publish over a serial link, and a single
+        dropped message on a safety switch is a real problem, not just an
+        inconvenience. The dashboard doesn't take this call's word for it
+        either - see motor_confirmed_killed / on_diag, which only flips once
+        the ESP32 itself reports the change back."""
         self.motor_killed = killed
         msg = String()
         msg.data = "MOTOR_OFF" if killed else "MOTOR_ON"
-        self.pid_pub.publish(msg)
+        for _ in range(5):
+            self.pid_pub.publish(msg)
+            time.sleep(0.02)
 
     def set_pid_gains(self, kp: float, ki: float, max_i: float, khead: float,
                        trim_left: float, trim_right: float, max_head_trim: float,
@@ -896,7 +925,11 @@ class SearchAndRescue(Node):
                 'target_waypoint': WAYPOINTS[node.waypoint_idx] if node.waypoint_idx < len(WAYPOINTS) else None,
                 'pid_gains': node.pid_gains,
                 'manual_move': node._manual_move_status(),
-                'motor_killed': node.motor_killed,
+                'motor_killed': node.motor_confirmed_killed,  # ground truth
+                                                                # from the ESP32
+                                                                # itself, not
+                                                                # just what
+                                                                # we asked for
             })
 
         @app.route('/pid_gains', methods=['POST'])
