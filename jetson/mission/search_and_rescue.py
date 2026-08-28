@@ -340,6 +340,10 @@ class SearchAndRescue(Node):
         self.started = False  # gated by the dashboard's Start button -- camera/
                                # detection run regardless, only driving waits
 
+        self.motor_killed = False  # live kill switch (2026-08-28, tuning
+                                    # convenience) -- see set_motor_killed and
+                                    # motor_f1.c's MOTOR_OFF/MOTOR_ON sentinels
+
         self.manual_move = None  # None, or a dict describing an in-progress
                                   # manual drive/turn test -- see MANUAL_MOVE_
                                   # TIMEOUT_S comment and _manual_move_tick.
@@ -500,6 +504,24 @@ class SearchAndRescue(Node):
         msg.data = (f"KP={g['kp']:.4f},KI={g['ki']:.4f},MAXI={g['max_i']:.4f},KHEAD={g['khead']:.4f},"
                     f"TRIML={g['trim_left']:.4f},TRIMR={g['trim_right']:.4f},MAXHEAD={g['max_head_trim']:.4f},"
                     f"KLOCK={g['klock']:.4f},MAXLOCK={g['max_lock']:.4f}")
+        self.pid_pub.publish(msg)
+        if self.motor_killed:
+            # Re-assert on the same 2s cadence as the gains above, for the
+            # same reason: the ESP32 resets g_motor_killed to False on
+            # reboot, and a silent motor re-enable would defeat the whole
+            # point of this switch.
+            kill_msg = String()
+            kill_msg.data = "MOTOR_OFF"
+            self.pid_pub.publish(kill_msg)
+
+    def set_motor_killed(self, killed: bool):
+        """Live motor kill switch - pulls the TB6612FNG's STBY pin instead
+        of just commanding zero speed, so it's a real power cut the PID/
+        heading loops can't fight (see motor_f1.c's MOTOR_OFF/MOTOR_ON
+        sentinels on this same /pid_gains channel)."""
+        self.motor_killed = killed
+        msg = String()
+        msg.data = "MOTOR_OFF" if killed else "MOTOR_ON"
         self.pid_pub.publish(msg)
 
     def set_pid_gains(self, kp: float, ki: float, max_i: float, khead: float,
@@ -874,6 +896,7 @@ class SearchAndRescue(Node):
                 'target_waypoint': WAYPOINTS[node.waypoint_idx] if node.waypoint_idx < len(WAYPOINTS) else None,
                 'pid_gains': node.pid_gains,
                 'manual_move': node._manual_move_status(),
+                'motor_killed': node.motor_killed,
             })
 
         @app.route('/pid_gains', methods=['POST'])
@@ -959,6 +982,22 @@ class SearchAndRescue(Node):
             node.cmd_pub.publish(Twist())
             node.get_logger().info("Patrol STOPPED (via dashboard)")
             return jsonify({'started': False})
+
+        @app.route('/motor_kill', methods=['POST'])
+        def motor_kill():
+            # Zero any pending drive command first so re-enabling doesn't
+            # lurch forward with a stale nonzero /cmd_vel the instant STBY
+            # goes back HIGH.
+            node.cmd_pub.publish(Twist())
+            node.set_motor_killed(True)
+            node.get_logger().info("Motor kill switch: OFF (via dashboard)")
+            return jsonify({'motor_killed': True})
+
+        @app.route('/motor_resume', methods=['POST'])
+        def motor_resume():
+            node.set_motor_killed(False)
+            node.get_logger().info("Motor kill switch: ON (via dashboard)")
+            return jsonify({'motor_killed': False})
 
         @app.route('/reset', methods=['POST'])
         def reset():
@@ -1089,6 +1128,8 @@ HTML_PAGE = """<!doctype html>
   #stopBtn { background: #5a1c1c; color: #ffb3b3; }
   #stopBtn:disabled { background: #23282f; color: #555; cursor: not-allowed; }
   #resetBtn { background: #2a2f3a; color: #c8ccd4; }
+  #motorKillBtn.on { background: #5a1c1c; color: #ffb3b3; }
+  #motorKillBtn.off { background: #7a1414; color: #ffe3e3; box-shadow: 0 0 0 2px #ff5b5b; }
   .pid-row { display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end; }
   .pid-row label { font-size: 0.72rem; color: #8a94a6; display: flex; flex-direction: column; gap: 4px; }
   .pid-row input {
@@ -1104,6 +1145,7 @@ HTML_PAGE = """<!doctype html>
     <button id="startBtn" onclick="sendCmd('/start')">Start Patrol</button>
     <button id="stopBtn" onclick="sendCmd('/stop')">Stop</button>
     <button id="resetBtn" onclick="sendCmd('/reset')">Reset All</button>
+    <button id="motorKillBtn" class="on" onclick="toggleMotorKill()">Motors: ON</button>
   </div>
   <div class="layout">
     <div class="column">
@@ -1300,6 +1342,12 @@ function sendCmd(path) {
   fetch(path, { method: 'POST' }).catch(() => {});
 }
 
+let motorKilled = false;  // updated from /state each poll -- see poll() below
+
+function toggleMotorKill() {
+  sendCmd(motorKilled ? '/motor_resume' : '/motor_kill');
+}
+
 let pidFieldsInitialized = false;  // only fill the inputs once from the server --
                                     // otherwise the 400ms poll would overwrite
                                     // whatever vịt is mid-typing
@@ -1406,6 +1454,11 @@ function poll() {
 
     document.getElementById('startBtn').disabled = state.started || state.done || !!state.manual_move;
     document.getElementById('stopBtn').disabled = !state.started;
+
+    motorKilled = !!state.motor_killed;
+    const motorBtn = document.getElementById('motorKillBtn');
+    motorBtn.innerText = motorKilled ? 'Motors: OFF (tap to resume)' : 'Motors: ON';
+    motorBtn.className = motorKilled ? 'off' : 'on';
 
     const manualActive = !!state.manual_move;
     document.getElementById('manualDriveBtn').disabled = state.started || manualActive;
