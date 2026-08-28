@@ -82,9 +82,12 @@ from pathlib import Path
 import numpy as np
 import rclpy
 from rclpy.node import Node
-from geometry_msgs.msg import Twist
+from geometry_msgs.msg import Twist, TransformStamped
 from nav_msgs.msg import Odometry
+from sensor_msgs.msg import PointCloud2
+from sensor_msgs_py import point_cloud2
 from std_msgs.msg import String
+from tf2_ros import TransformBroadcaster, StaticTransformBroadcaster
 from visualization_msgs.msg import Marker
 
 # ---------------------------------------------------------------------------
@@ -236,6 +239,17 @@ POINTCLOUD_MIN_VALID_POINTS = 20       # reject the reading if fewer than
                                         # gates above rather than trusting a
                                         # near-empty region's median
 
+# How many recent sightings' SPHERE markers to keep on screen at once
+# (2026-08-28) -- each sighting used to overwrite id=0, so RViz2 only ever
+# showed the single latest median point, with no way to visually judge
+# repeatability/precision across readings (vịt's actual ask: use RViz to
+# see WHERE accuracy is weak, not just read one number). Cycling through
+# this many distinct marker ids instead makes recent sightings persist
+# simultaneously as a visible scatter -- tight cluster = stable/trustworthy,
+# spread out = real per-reading noise, exactly the kind of pattern a single
+# webpage number can't show.
+POINTCLOUD_MARKER_HISTORY = 20
+
 # Camera mount offset from base_link -- copied verbatim from
 # jetson/slam/visual_slam-adjacent jetson/slam/stereo_depth_argus.launch.py
 # (measured there 2026-08-11, tape measure against the real chassis: camera
@@ -247,6 +261,28 @@ POINTCLOUD_MIN_VALID_POINTS = 20       # reject the reading if fewer than
 # own mount point doesn't change its height/centering -- plausible but NOT
 # independently re-measured for this specific rig.
 BASE_TO_LEFT_CAM_XYZ = (0.0, 0.0, 0.14)
+
+# Fixed optical-frame axis-convention rotation (X=right,Y=down,Z=forward ->
+# x=forward,y=left,z=up), as a quaternion -- same one stereo_depth_argus.
+# launch.py's BASE_TO_LEFT_CAM_QUAT encodes for an UNYAWED mount. Kept
+# separate here (not reused as a single fixed quaternion) because this
+# mission's rig IS yawed (CAMERA_BEARING_OFFSET_RAD) -- see _quat_mul below,
+# composed fresh at runtime instead of hand-computing one composed constant,
+# to avoid a silent quaternion-math arithmetic error with no way to check it
+# tonight (same reasoning as the explicit-trig position math above).
+_OPTICAL_FRAME_FIX_QUAT_XYZW = (-0.5, 0.5, -0.5, 0.5)
+
+
+def _quat_mul(q1, q2):
+    """Hamilton product, (x,y,z,w) order -- q1 applied after q2 (q1*q2*v*q2^-1*q1^-1)."""
+    x1, y1, z1, w1 = q1
+    x2, y2, z2, w2 = q2
+    return (
+        w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2,
+        w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2,
+        w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2,
+        w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2,
+    )
 
 GOAL_TOLERANCE_M = 0.10       # "close enough" to a waypoint
 # Raised 2026-08-28 (was 0.35 rad / ~20deg): this threshold predates the
@@ -489,9 +525,21 @@ class SearchAndRescue(Node):
                                                 # of latest_stereo_reading, meant to be compared
                                                 # against it, not to replace it (yet).
         self._last_pointcloud_estimate_t = 0.0  # rate-limit gate, see POINTCLOUD_ESTIMATE_PERIOD_S
+        self._pointcloud_marker_id_counter = 0  # cycles 0..POINTCLOUD_MARKER_HISTORY-1, see that constant
 
         self.cmd_pub = self.create_publisher(Twist, '/cmd_vel', 10)
         self.pid_pub = self.create_publisher(String, '/pid_gains', 10)
+        # odom->base_link TF, broadcast here directly (2026-08-28) instead of
+        # needing the separate jetson/nav2/odom_to_tf.py node running --
+        # this script already tracks self.x/y/theta from the same /odom
+        # messages, so it's the same data, just also published as real TF.
+        # Added specifically so RViz2 has SOMETHING that registers the
+        # "odom" frame -- with zero TF ever published, RViz's Fixed Frame
+        # can't be set to "odom" at all ("Frame [odom] does not exist"),
+        # even though Marker messages already carry frame_id="odom" --
+        # message frame_id alone doesn't register a frame with tf2, only
+        # actual /tf publications do.
+        self.tf_broadcaster = TransformBroadcaster(self)
         self.create_subscription(Odometry, '/odom', self.on_odom, 10)
         self.create_subscription(String, '/esp32_diag', self.on_diag, 10)
         self.control_timer = self.create_timer(CONTROL_PERIOD_S, self.control_tick)
@@ -588,6 +636,31 @@ class SearchAndRescue(Node):
                 speckleRange=2,
             )
             self.duck_marker_pub = self.create_publisher(Marker, '/duck_position_marker', 10)
+            self.duck_cloud_pub = self.create_publisher(PointCloud2, '/duck_pointcloud_region', 10)
+
+            # Static base_link -> camera_optical TF (2026-08-28) -- lets
+            # RViz2 place the raw point-cloud debug view (published in
+            # camera_optical frame below) correctly relative to odom/
+            # base_link, instead of only ever seeing the single reduced-to-
+            # one-point Marker. Composed at runtime via _quat_mul rather
+            # than hand-computing one constant quaternion -- see that
+            # function's comment for why.
+            q_yaw = (0.0, 0.0, math.sin(CAMERA_BEARING_OFFSET_RAD / 2), math.cos(CAMERA_BEARING_OFFSET_RAD / 2))
+            q_cam = _quat_mul(q_yaw, _OPTICAL_FRAME_FIX_QUAT_XYZW)
+            static_tf = TransformStamped()
+            static_tf.header.stamp = self.get_clock().now().to_msg()
+            static_tf.header.frame_id = 'base_link'
+            static_tf.child_frame_id = 'camera_optical'
+            static_tf.transform.translation.x = BASE_TO_LEFT_CAM_XYZ[0]
+            static_tf.transform.translation.y = BASE_TO_LEFT_CAM_XYZ[1]
+            static_tf.transform.translation.z = BASE_TO_LEFT_CAM_XYZ[2]
+            static_tf.transform.rotation.x = q_cam[0]
+            static_tf.transform.rotation.y = q_cam[1]
+            static_tf.transform.rotation.z = q_cam[2]
+            static_tf.transform.rotation.w = q_cam[3]
+            self.static_tf_broadcaster = StaticTransformBroadcaster(self)
+            self.static_tf_broadcaster.sendTransform(static_tf)
+
             self.get_logger().info(
                 "Point-cloud position estimate ENABLED (experimental, unverified against "
                 "real hardware as of 2026-08-27 -- Jetson was offline when this was built)."
@@ -645,6 +718,18 @@ class SearchAndRescue(Node):
         self.y = msg.pose.pose.position.y
         self.theta = yaw_from_quaternion(msg.pose.pose.orientation)
         self.have_odom = True
+
+        # Same pattern as jetson/nav2/odom_to_tf.py -- inlined here so RViz2
+        # gets a real odom->base_link TF without needing that separate node.
+        t = TransformStamped()
+        t.header.stamp = msg.header.stamp
+        t.header.frame_id = msg.header.frame_id       # "odom"
+        t.child_frame_id = msg.child_frame_id         # "base_link"
+        t.transform.translation.x = msg.pose.pose.position.x
+        t.transform.translation.y = msg.pose.pose.position.y
+        t.transform.translation.z = msg.pose.pose.position.z
+        t.transform.rotation = msg.pose.pose.orientation
+        self.tf_broadcaster.sendTransform(t)
 
     def on_diag(self, msg: String):
         self.esp32_diag = msg.data
@@ -1175,21 +1260,70 @@ class SearchAndRescue(Node):
             f"n_points={n_valid} compute={compute_ms:.0f}ms -> world ({world_x:.2f}, {world_y:.2f}, {world_z:.2f})"
         )
 
+        # Cycles through POINTCLOUD_MARKER_HISTORY distinct ids instead of
+        # always id=0 -- see that constant's comment. The latest sighting
+        # is still the newest/brightest-looking one to the eye (freshly
+        # (re)published each time), older ones in the ring just haven't
+        # been overwritten yet and fade out via lifetime if sightings stop.
+        sphere_id = self._pointcloud_marker_id_counter % POINTCLOUD_MARKER_HISTORY
+        self._pointcloud_marker_id_counter += 1
+
         marker = Marker()
         marker.header.frame_id = 'odom'
         marker.header.stamp = self.get_clock().now().to_msg()
         marker.ns = 'duck_pointcloud'
-        marker.id = 0
+        marker.id = sphere_id
         marker.type = Marker.SPHERE
         marker.action = Marker.ADD
         marker.pose.position.x = world_x
         marker.pose.position.y = world_y
         marker.pose.position.z = world_z
         marker.pose.orientation.w = 1.0
-        marker.scale.x = marker.scale.y = marker.scale.z = DUCK_HEIGHT_M
-        marker.color.r, marker.color.g, marker.color.b, marker.color.a = 1.0, 0.85, 0.0, 0.9
-        marker.lifetime.sec = 2  # disappears in RViz2 if sightings stop, instead of a stale marker lingering forever
+        # Smaller than DUCK_HEIGHT_M (was full-size when there was only ever
+        # one) -- POINTCLOUD_MARKER_HISTORY spheres at full duck size would
+        # just overlap into a blob, defeating the point of seeing the scatter.
+        marker.scale.x = marker.scale.y = marker.scale.z = DUCK_HEIGHT_M * 0.3
+        marker.color.r, marker.color.g, marker.color.b, marker.color.a = 1.0, 0.85, 0.0, 0.75
+        marker.lifetime.sec = 15  # long enough to see ~15s of recent scatter, clears out once sightings stop
         self.duck_marker_pub.publish(marker)
+
+        # Text label (2026-08-28) -- same topic, reserved id right after the
+        # cycling sphere range so it never collides with one of those (RViz2's
+        # Marker display tracks markers per (ns, id), so this renders
+        # alongside the spheres above, not instead of them). Reading the
+        # number straight off the terminal log was the original complaint
+        # this solves -- now it floats right next to the latest marker.
+        text_marker = Marker()
+        text_marker.header.frame_id = 'odom'
+        text_marker.header.stamp = marker.header.stamp
+        text_marker.ns = 'duck_pointcloud'
+        text_marker.id = POINTCLOUD_MARKER_HISTORY
+        text_marker.type = Marker.TEXT_VIEW_FACING
+        text_marker.action = Marker.ADD
+        text_marker.pose.position.x = world_x
+        text_marker.pose.position.y = world_y
+        text_marker.pose.position.z = world_z + DUCK_HEIGHT_M  # float above the sphere, not inside it
+        text_marker.pose.orientation.w = 1.0
+        text_marker.scale.z = 0.08  # text height, meters -- RViz2 ignores scale.x/y for TEXT_VIEW_FACING
+        text_marker.color.r, text_marker.color.g, text_marker.color.b, text_marker.color.a = 1.0, 1.0, 1.0, 1.0
+        text_marker.text = f"{distance_m:.2f}m ({n_valid}pts)"
+        text_marker.lifetime.sec = 2
+        self.duck_marker_pub.publish(text_marker)
+
+        # Raw point-cloud debug view (2026-08-28) -- the single median point
+        # above throws away everything about WHERE on the duck stereo
+        # matching actually succeeded vs. failed. Published in camera_optical
+        # frame (untransformed region_pts, as SGBM/reprojectImageTo3D
+        # produced them) so RViz2 places it via the static base_link->
+        # camera_optical TF instead of needing a second copy of the world-
+        # transform math here -- one geometry source of truth, not two.
+        valid_pts = region_pts[valid]  # already filtered -- same points the median above used
+        cloud_msg = point_cloud2.create_cloud_xyz32(
+            header=marker.header,  # stamp reused, but frame_id gets overwritten below
+            points=valid_pts.reshape(-1, 3).tolist(),
+        )
+        cloud_msg.header.frame_id = 'camera_optical'
+        self.duck_cloud_pub.publish(cloud_msg)
 
     def duck_estimate(self):
         """Running average of every duck sighting so far -- a single-duck
