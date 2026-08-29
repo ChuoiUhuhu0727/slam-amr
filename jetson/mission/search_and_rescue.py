@@ -660,6 +660,21 @@ class SearchAndRescue(Node):
             static_tf.transform.rotation.w = q_cam[3]
             self.static_tf_broadcaster = StaticTransformBroadcaster(self)
             self.static_tf_broadcaster.sendTransform(static_tf)
+            # Also re-sent periodically over the REGULAR (non-static)
+            # broadcaster (2026-08-29) -- found live: a one-time-only
+            # publish relies on /tf_static's transient-local QoS correctly
+            # delivering to a subscriber that joins later (any RViz2 session
+            # started after this node), and that didn't reliably happen --
+            # confirmed via RViz2's own terminal log spamming "Message
+            # Filter dropping message: frame 'camera_optical' ... queue is
+            # full", the exact same symptom the missing odom->base_link TF
+            # caused earlier, just for this frame instead. Re-publishing
+            # every 2s (matches PID_GAINS_REPUBLISH_PERIOD_S's existing
+            # "keep re-asserting, don't trust delivery once" pattern in this
+            # file) means any RViz2 session picks it up within a couple
+            # seconds of connecting, regardless of when it was launched.
+            self._camera_static_tf = static_tf
+            self.create_timer(2.0, self._republish_camera_tf)
 
             self.get_logger().info(
                 "Point-cloud position estimate ENABLED (experimental, unverified against "
@@ -730,6 +745,14 @@ class SearchAndRescue(Node):
         t.transform.translation.z = msg.pose.pose.position.z
         t.transform.rotation = msg.pose.pose.orientation
         self.tf_broadcaster.sendTransform(t)
+
+    def _republish_camera_tf(self):
+        """Re-sends the base_link->camera_optical transform every 2s over
+        the regular broadcaster -- see the comment where self._camera_
+        static_tf is built in _init_vision for why a one-time /tf_static
+        publish alone wasn't reliably reaching RViz2 sessions started later."""
+        self._camera_static_tf.header.stamp = self.get_clock().now().to_msg()
+        self.tf_broadcaster.sendTransform(self._camera_static_tf)
 
     def on_diag(self, msg: String):
         self.esp32_diag = msg.data
