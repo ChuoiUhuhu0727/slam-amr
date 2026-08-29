@@ -44,7 +44,12 @@ def find_corners(img_paths):
 
         corners = cv2.cornerSubPix(gray, corners, (11, 11), (-1, -1), SUBPIX_CRITERIA)
         objpoints.append(objp)
-        imgpoints.append(corners.reshape(1, -1, 2))
+        # cv2.cornerSubPix returns float32 -- cv2.fisheye.stereoCalibrate's
+        # binding is strict about matching float64 throughout (objp above
+        # is float64), and mixing the two throws a bare "different types"
+        # arithm_op error deep inside the C++ call, not a helpful message
+        # pointing at this line (found live 2026-08-29).
+        imgpoints.append(corners.reshape(1, -1, 2).astype(np.float64))
         used_paths.append(path)
 
     return objpoints, imgpoints, used_paths, image_size

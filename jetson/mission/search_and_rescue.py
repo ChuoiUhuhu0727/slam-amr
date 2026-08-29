@@ -471,6 +471,21 @@ def wrap_angle(a):
     return math.atan2(math.sin(a), math.cos(a))
 
 
+def _median_xyz_distance(region_pts, mask):
+    """Median X/Y/Z (camera_optical convention) + Euclidean distance over
+    the masked points of a reprojectImageTo3D region. Shared by the
+    full-box and core-region computations in _estimate_pointcloud_position
+    so a future change to the distance formula only has to happen once --
+    2026-08-29 code review flagged the previous copy-pasted version of
+    this as a real drift risk (exactly the class of bug that made the
+    core-region fix's own debug point cloud go stale, see the
+    used_region_pts/used_valid_mask comment below)."""
+    x = float(np.median(region_pts[:, :, 0][mask]))
+    y = float(np.median(region_pts[:, :, 1][mask]))
+    z = float(np.median(region_pts[:, :, 2][mask]))
+    return x, y, z, math.sqrt(x ** 2 + y ** 2 + z ** 2)
+
+
 class SearchAndRescue(Node):
     def __init__(self, nav_only: bool):
         super().__init__('search_and_rescue')
@@ -752,8 +767,26 @@ class SearchAndRescue(Node):
 
         # Same pattern as jetson/nav2/odom_to_tf.py -- inlined here so RViz2
         # gets a real odom->base_link TF without needing that separate node.
+        #
+        # Real bug found 2026-08-29: msg.header.stamp is ALWAYS sec=0/
+        # nanosec=0 (confirmed via `ros2 topic echo /odom --field
+        # header.stamp` -- every single message, not intermittent) because
+        # the ESP32/micro-ROS firmware never sets a real timestamp on the
+        # Odometry message it publishes. Blindly copying that zero stamp
+        # into this TF broadcast pinned odom->base_link at "time 0" forever
+        # in tf2's buffer -- `x`/`y`/`theta` kept updating fine (this
+        # callback still runs every message), but any TF lookup AT THE
+        # CURRENT time (tf2_echo showed "Lookup would require extrapolation
+        # into the future") failed. This is why the sphere Markers (placed
+        # directly in the 'odom' frame via already-computed world_x/world_y,
+        # no tf2 lookup needed) kept rendering fine while /duck_pointcloud_
+        # region (a real PointCloud2, which RViz2 must tf2-transform into
+        # the Fixed Frame at the message's own stamp) silently never
+        # rendered -- not a rendering/size/QoS issue, a stale-TF-buffer one.
+        # Fixed: stamp with the Jetson's own wall clock instead, same
+        # pattern _republish_camera_tf already uses below.
         t = TransformStamped()
-        t.header.stamp = msg.header.stamp
+        t.header.stamp = self.get_clock().now().to_msg()
         t.header.frame_id = msg.header.frame_id       # "odom"
         t.child_frame_id = msg.child_frame_id         # "base_link"
         t.transform.translation.x = msg.pose.pose.position.x
@@ -1237,41 +1270,48 @@ class SearchAndRescue(Node):
         # Median, not mean -- same reasoning as STEREO_SMOOTHING_WINDOW
         # above: reject outliers (background bleeding into the box edges,
         # bad individual disparity pixels) rather than let them drag an
-        # average around.
-        x_cam = float(np.median(region_pts[:, :, 0][valid]))
-        y_cam = float(np.median(region_pts[:, :, 1][valid]))
-        z_cam = float(np.median(z[valid]))
-        distance_m = math.sqrt(x_cam ** 2 + y_cam ** 2 + z_cam ** 2)
+        # average around. This full-box median is kept only as the
+        # FALLBACK value now (see below) -- production readings prefer the
+        # core-region median once the edge-bleeding bias was confirmed.
+        full_x_cam, full_y_cam, full_z_cam, full_distance_m = _median_xyz_distance(region_pts, valid)
 
-        # Diagnostic only (2026-08-29) -- does NOT change distance_m/the
-        # reported reading. Testing a specific hypothesis for the real bias
-        # found via the ruler benchmark (point-cloud consistently reading
-        # FARTHER than the centroid method, not just noisier): if the
-        # detection box is a little looser than the duck's real silhouette,
-        # background pixels near the box EDGES (farther away than the duck)
-        # get pulled into the full-box median and drag it toward "farther"
-        # -- a well-known "edge bleeding" artifact in block-matching stereo.
-        # Recomputes the same median from just the CENTER of the box
-        # (POINTCLOUD_EROSION_MARGIN_FRAC inset on each side, i.e. edges
-        # excluded) -- if this core-only distance comes out closer to the
-        # centroid method's number than the full-box one does, that's
-        # direct evidence for the edge-bleeding hypothesis, and the real
-        # fix is shrinking the region used, not smoothing/filtering after
-        # the fact. If it comes out about the same, edge bleeding is NOT
-        # the (main) cause and this rules that hypothesis out cleanly.
+        # Promoted to production 2026-08-29 (was diagnostic-only): the
+        # edge-bleeding hypothesis was directly confirmed live (full-box
+        # 2.10m vs centroid's simultaneous 0.87m on a frame where the SAME
+        # region's core gave 0.90m) -- a loosely-fit detection box lets
+        # background pixels near the EDGES (farther than the duck) drag the
+        # full-box median toward "farther". Recomputing the median from just
+        # the CENTER of the box (POINTCLOUD_EROSION_MARGIN_FRAC inset on
+        # each side) excludes that background bleed.
         h_box, w_box = valid.shape
         my = int(h_box * POINTCLOUD_EROSION_MARGIN_FRAC)
         mx = int(w_box * POINTCLOUD_EROSION_MARGIN_FRAC)
         core_valid = valid[my:h_box - my, mx:w_box - mx]
         core_disparity_ok = int(np.count_nonzero(core_valid))
         core_distance_txt = "n/a"
-        if core_disparity_ok >= max(5, POINTCLOUD_MIN_VALID_POINTS // 4):
+        # Coverage trade-off flagged when this was still diagnostic-only:
+        # a distant/small duck can erode down to too few points. Require
+        # the SAME POINTCLOUD_MIN_VALID_POINTS bar the full box uses (not
+        # the looser bar the old diagnostic-only log line used) before
+        # trusting the core region -- fall back to the full-box reading
+        # rather than dropping the tick entirely when it doesn't clear that
+        # bar, so a tight/small box doesn't just go silent.
+        if core_disparity_ok >= POINTCLOUD_MIN_VALID_POINTS:
             core_region_pts = region_pts[my:h_box - my, mx:w_box - mx]
-            core_x = float(np.median(core_region_pts[:, :, 0][core_valid]))
-            core_y = float(np.median(core_region_pts[:, :, 1][core_valid]))
-            core_z = float(np.median(core_region_pts[:, :, 2][core_valid]))
-            core_distance_m = math.sqrt(core_x ** 2 + core_y ** 2 + core_z ** 2)
-            core_distance_txt = f"{core_distance_m:.2f}m ({core_disparity_ok}pts)"
+            x_cam, y_cam, z_cam, distance_m = _median_xyz_distance(core_region_pts, core_valid)
+            n_valid = core_disparity_ok
+            core_distance_txt = f"{distance_m:.2f}m ({core_disparity_ok}pts) [USED]"
+            # Keep the /duck_pointcloud_region debug cloud published below
+            # in sync with whichever region actually produced distance_m --
+            # 2026-08-29 code review caught this still pointing at the
+            # full-box points unconditionally, which would silently show
+            # background edge-bleeding pixels in the exact debug view built
+            # to rule that out.
+            used_region_pts, used_valid_mask = core_region_pts, core_valid
+        else:
+            x_cam, y_cam, z_cam, distance_m = full_x_cam, full_y_cam, full_z_cam, full_distance_m
+            core_distance_txt = f"n/a ({core_disparity_ok}pts, below {POINTCLOUD_MIN_VALID_POINTS} min) [fell back to full-box]"
+            used_region_pts, used_valid_mask = region_pts, valid
 
         # camera_optical (X=right,Y=down,Z=forward) -> a ROS-convention local
         # frame (x=forward,y=left,z=up) -- the same fixed axis relationship
@@ -1326,7 +1366,7 @@ class SearchAndRescue(Node):
         self.get_logger().info(
             f"Point-cloud position: dist={distance_m:.2f}m (centroid method said "
             f"{centroid_distance_m:.2f}m, diff={distance_m - centroid_distance_m:+.2f}m, "
-            f"core-only={core_distance_txt}) "
+            f"full-box was {full_distance_m:.2f}m, core={core_distance_txt}) "
             f"n_points={n_valid} compute={compute_ms:.0f}ms -> world ({world_x:.2f}, {world_y:.2f}, {world_z:.2f})"
         )
 
@@ -1387,7 +1427,11 @@ class SearchAndRescue(Node):
         # produced them) so RViz2 places it via the static base_link->
         # camera_optical TF instead of needing a second copy of the world-
         # transform math here -- one geometry source of truth, not two.
-        valid_pts = region_pts[valid]  # already filtered -- same points the median above used
+        # Uses used_region_pts/used_valid_mask (core region when [USED],
+        # full box on fallback) -- NOT unconditionally the full box -- so
+        # this debug cloud always matches the points that actually produced
+        # distance_m above it.
+        valid_pts = used_region_pts[used_valid_mask]
         cloud_msg = point_cloud2.create_cloud_xyz32(
             header=marker.header,  # stamp reused, but frame_id gets overwritten below
             points=valid_pts.reshape(-1, 3).tolist(),
