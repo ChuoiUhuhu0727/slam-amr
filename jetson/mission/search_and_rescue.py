@@ -239,6 +239,14 @@ POINTCLOUD_MIN_VALID_POINTS = 20       # reject the reading if fewer than
                                         # gates above rather than trusting a
                                         # near-empty region's median
 
+# Diagnostic-only inset fraction (2026-08-29) -- see the "edge bleeding"
+# hypothesis comment in _estimate_pointcloud_position. Shrinks each side of
+# the box by this fraction before computing a SECOND, comparison-only
+# median, testing whether background pixels near the box edges are
+# dragging the full-box distance farther than the truth. Does not change
+# the actual reported distance_m.
+POINTCLOUD_EROSION_MARGIN_FRAC = 0.25
+
 # How many recent sightings' SPHERE markers to keep on screen at once
 # (2026-08-28) -- each sighting used to overwrite id=0, so RViz2 only ever
 # showed the single latest median point, with no way to visually judge
@@ -621,12 +629,20 @@ class SearchAndRescue(Node):
             # Parameters are the well-known OpenCV stereo_match.py sample
             # defaults, NOT tuned for this specific rig/scene yet -- a
             # reasonable untested starting point, not a validated choice.
-            # numDisparities=192 (must be a multiple of 16) comfortably
-            # covers the ~90-190px disparity range already observed live
-            # for a duck at 0.5-1.5m with this rig's fx_rect/baseline.
+            # numDisparities RAISED 192->384 (2026-08-29, real bug found via
+            # ruler benchmark): a duck at 0.30m needs disparity ~= fx*baseline
+            # /0.30 = 875*0.085/0.30 ~= 248px, which the old 192 cap couldn't
+            # search at all -- confirmed by back-solving the wrong 0.43m
+            # reading that came out instead: 875*0.085/0.43 ~= 173px, which
+            # DOES fall inside [0,192), meaning SGBM was silently finding a
+            # spurious in-range match instead of the true out-of-range one.
+            # 384 covers down to ~19cm with margin; real compute cost scales
+            # with this value (already ~1000-1100ms at 192), expect it to
+            # rise meaningfully -- watch the logged compute_ms after this
+            # change, don't assume the old ~1s estimate still holds.
             self.stereo_matcher = cv2.StereoSGBM_create(
                 minDisparity=0,
-                numDisparities=192,
+                numDisparities=384,
                 blockSize=7,
                 P1=8 * 3 * 7 ** 2,
                 P2=32 * 3 * 7 ** 2,
@@ -1227,6 +1243,36 @@ class SearchAndRescue(Node):
         z_cam = float(np.median(z[valid]))
         distance_m = math.sqrt(x_cam ** 2 + y_cam ** 2 + z_cam ** 2)
 
+        # Diagnostic only (2026-08-29) -- does NOT change distance_m/the
+        # reported reading. Testing a specific hypothesis for the real bias
+        # found via the ruler benchmark (point-cloud consistently reading
+        # FARTHER than the centroid method, not just noisier): if the
+        # detection box is a little looser than the duck's real silhouette,
+        # background pixels near the box EDGES (farther away than the duck)
+        # get pulled into the full-box median and drag it toward "farther"
+        # -- a well-known "edge bleeding" artifact in block-matching stereo.
+        # Recomputes the same median from just the CENTER of the box
+        # (POINTCLOUD_EROSION_MARGIN_FRAC inset on each side, i.e. edges
+        # excluded) -- if this core-only distance comes out closer to the
+        # centroid method's number than the full-box one does, that's
+        # direct evidence for the edge-bleeding hypothesis, and the real
+        # fix is shrinking the region used, not smoothing/filtering after
+        # the fact. If it comes out about the same, edge bleeding is NOT
+        # the (main) cause and this rules that hypothesis out cleanly.
+        h_box, w_box = valid.shape
+        my = int(h_box * POINTCLOUD_EROSION_MARGIN_FRAC)
+        mx = int(w_box * POINTCLOUD_EROSION_MARGIN_FRAC)
+        core_valid = valid[my:h_box - my, mx:w_box - mx]
+        core_disparity_ok = int(np.count_nonzero(core_valid))
+        core_distance_txt = "n/a"
+        if core_disparity_ok >= max(5, POINTCLOUD_MIN_VALID_POINTS // 4):
+            core_region_pts = region_pts[my:h_box - my, mx:w_box - mx]
+            core_x = float(np.median(core_region_pts[:, :, 0][core_valid]))
+            core_y = float(np.median(core_region_pts[:, :, 1][core_valid]))
+            core_z = float(np.median(core_region_pts[:, :, 2][core_valid]))
+            core_distance_m = math.sqrt(core_x ** 2 + core_y ** 2 + core_z ** 2)
+            core_distance_txt = f"{core_distance_m:.2f}m ({core_disparity_ok}pts)"
+
         # camera_optical (X=right,Y=down,Z=forward) -> a ROS-convention local
         # frame (x=forward,y=left,z=up) -- the same fixed axis relationship
         # stereo_depth_argus.launch.py's BASE_TO_LEFT_CAM_QUAT encodes, just
@@ -1279,7 +1325,8 @@ class SearchAndRescue(Node):
         }
         self.get_logger().info(
             f"Point-cloud position: dist={distance_m:.2f}m (centroid method said "
-            f"{centroid_distance_m:.2f}m, diff={distance_m - centroid_distance_m:+.2f}m) "
+            f"{centroid_distance_m:.2f}m, diff={distance_m - centroid_distance_m:+.2f}m, "
+            f"core-only={core_distance_txt}) "
             f"n_points={n_valid} compute={compute_ms:.0f}ms -> world ({world_x:.2f}, {world_y:.2f}, {world_z:.2f})"
         )
 
