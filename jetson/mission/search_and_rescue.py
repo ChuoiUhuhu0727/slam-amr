@@ -239,6 +239,21 @@ POINTCLOUD_MIN_VALID_POINTS = 20       # reject the reading if fewer than
                                         # gates above rather than trusting a
                                         # near-empty region's median
 
+# Sanity gate vs. the centroid method (2026-09-04). Live-diagnosed at range
+# (1.0-1.3m, see COMMIT_HISTORY.md): core/full-box can lock onto background
+# right at the box edges instead of the duck (the duck's own smooth surface
+# gives SGBM too little texture to match confidently there) -- both
+# adaptive core-region sizing AND the plain 25% fixed margin were tested
+# live and both still produce this, since it's a texture problem, not a
+# crop-size problem. The centroid method (single disparity across the whole
+# box, no dense per-pixel matching) was accurate at every distance tested
+# this session (~1% error at 1.3m). If this method's distance disagrees
+# with centroid by more than this fraction, rescale this reading's
+# magnitude onto centroid's distance -- keeps this method's direction
+# (lateral position within the box is far less likely to be wrong than its
+# depth) but not a magnitude that likely came from the wrong object.
+POINTCLOUD_CENTROID_MAX_DISAGREEMENT_FRAC = 0.30
+
 # Diagnostic-only inset fraction (2026-08-29) -- see the "edge bleeding"
 # hypothesis comment in _estimate_pointcloud_position. Shrinks each side of
 # the box by this fraction before computing a SECOND, comparison-only
@@ -1330,6 +1345,18 @@ class SearchAndRescue(Node):
             core_distance_txt = f"n/a ({core_disparity_ok}pts, below {POINTCLOUD_MIN_VALID_POINTS} min) [fell back to full-box]"
             used_region_pts, used_valid_mask = region_pts, valid
 
+        # See POINTCLOUD_CENTROID_MAX_DISAGREEMENT_FRAC's comment above --
+        # rescale onto the centroid reading (proven reliable this session)
+        # if this method's raw depth disagrees too much, likely from
+        # locking onto background instead of the duck.
+        raw_distance_m = distance_m
+        agreement_frac = abs(distance_m - centroid_distance_m) / max(centroid_distance_m, 0.05)
+        gated = agreement_frac > POINTCLOUD_CENTROID_MAX_DISAGREEMENT_FRAC
+        if gated and distance_m > 1e-6:
+            scale = centroid_distance_m / distance_m
+            x_cam, y_cam, z_cam = x_cam * scale, y_cam * scale, z_cam * scale
+            distance_m = centroid_distance_m
+
         # camera_optical (X=right,Y=down,Z=forward) -> a ROS-convention local
         # frame (x=forward,y=left,z=up) -- the same fixed axis relationship
         # stereo_depth_argus.launch.py's BASE_TO_LEFT_CAM_QUAT encodes, just
@@ -1378,12 +1405,17 @@ class SearchAndRescue(Node):
             'world_x': world_x, 'world_y': world_y, 'world_z': world_z,
             'n_points': n_valid,
             'compute_ms': compute_ms,
+            'gated': gated,
             't': time.time(),
         }
+        gated_txt = (
+            f" [GATED, raw was {raw_distance_m:.2f}m -> rescaled onto centroid]"
+            if gated else ""
+        )
         self.get_logger().info(
             f"Point-cloud position: dist={distance_m:.2f}m (centroid method said "
             f"{centroid_distance_m:.2f}m, diff={distance_m - centroid_distance_m:+.2f}m, "
-            f"full-box was {full_distance_m:.2f}m, core={core_distance_txt}) "
+            f"full-box was {full_distance_m:.2f}m, core={core_distance_txt}){gated_txt} "
             f"n_points={n_valid} compute={compute_ms:.0f}ms -> world ({world_x:.2f}, {world_y:.2f}, {world_z:.2f})"
         )
 
@@ -2305,8 +2337,14 @@ function tick() {
     const diffTxt = (stereoFresh && s)
       ? ` (centroid method: ${s.distance_m.toFixed(2)}m, diff ${(p.distance_m - s.distance_m).toFixed(2)}m)`
       : '';
+    // p.gated (2026-09-04): true when this reading disagreed with the
+    // centroid method by more than POINTCLOUD_CENTROID_MAX_DISAGREEMENT_FRAC
+    // and got rescaled onto centroid's distance instead of its own raw
+    // (likely background-locked) depth -- see that constant's comment.
+    const gatedTxt = p.gated
+      ? ' <span style="color:#e0a030;">[gated -> using centroid]</span>' : '';
     pcBox.className = 'stat-highlight';
-    pcBox.innerHTML = `point-cloud distance: <b>${p.distance_m.toFixed(2)}m</b>${diffTxt} ` +
+    pcBox.innerHTML = `point-cloud distance: <b>${p.distance_m.toFixed(2)}m</b>${diffTxt}${gatedTxt} ` +
       `<span style="color:#8a94a6;">(${p.n_points} points, ${p.compute_ms.toFixed(0)}ms compute)</span>`;
   } else {
     pcBox.className = 'stat-highlight stale';
