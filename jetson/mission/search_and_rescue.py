@@ -1199,6 +1199,23 @@ class SearchAndRescue(Node):
         t0 = time.time()
         gray_l = cv2.cvtColor(frame_l, cv2.COLOR_BGR2GRAY)
         gray_r = cv2.cvtColor(frame_r, cv2.COLOR_BGR2GRAY)
+        # Photometric L/R normalization (2026-09-04): live-measured on the
+        # Jetson (6s, 38 samples) -- each camera's OWN auto-exposure is very
+        # stable frame-to-frame (std~0.3 gray levels), but the two CSI
+        # modules independently converge to different brightness for the
+        # SAME scene (right ~3-4 levels / ~3% brighter than left, stable,
+        # not flicker -- a fixed per-module offset). SGBM's cost function
+        # assumes matching L/R intensities, so a constant brightness gap
+        # biases which disparity looks like the "best" match. Rescaling R's
+        # mean onto L's mean every frame (cheaper/more robust than an Argus
+        # exposure/gain hardware lock, which needs a hand-picked fixed
+        # exposure risking under/over-exposure or motion blur once the
+        # robot moves, and won't self-adjust if the offset drifts).
+        r_mean = gray_r.mean()
+        if r_mean > 1.0:
+            gray_r = np.clip(
+                gray_r.astype(np.float32) * (gray_l.mean() / r_mean), 0, 255
+            ).astype(np.uint8)
         # Full-frame, not cropped to the box -- see the "correctness bug"
         # note in ENABLE_POINTCLOUD_ESTIMATE's comment (row-cropping before
         # matching would silently invalidate Q's principal point). Cropped
