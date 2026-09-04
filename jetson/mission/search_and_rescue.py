@@ -46,6 +46,16 @@ Deliberately does NOT use Nav2, VSLAM, or the Isaac ROS stereo depth pipeline:
   epipolar-aligned coordinates) exact while detection itself never sees a
   geometrically altered frame. See _detect_tick / _undistort_point.
 
+Physical start placement (CHANGED 2026-09-04): the robot must be set down
+in a corner ALREADY FACING DOWN THE LONG (2.23m) STRAIGHT, about 30cm out
+from the wall behind it and 30cm out from the wall on its right. The
+mission then opens with a straight 1.63m leg and only ever turns right
+(see WAYPOINTS). Previously it started facing down the SHORT wall and had
+to open with a blind in-place turn, whose heading error then compounded
+over the following long straight -- the "drives into walls" behaviour.
+Nothing detects a misplacement: odometry starts at zero wherever the robot
+is switched on, so a crooked start pose silently offsets the entire run.
+
 Physical setup this assumes (confirmed with vịt 2026-08-25): both cameras
 still exactly 8.3cm apart, same height as each other, rigidly mounted as one
 unit -- ONLY the whole rig's heading changed (rotated 45deg right, same as
@@ -94,13 +104,26 @@ from visualization_msgs.msg import Marker
 # CONFIG -- confirm/measure these before trusting the output
 # ---------------------------------------------------------------------------
 
-# Room origin = robot's start position, facing +x down one wall (confirmed
-# with vịt 2026-08-24). Room extent -- x-axis is the direction the robot
-# initially faces (down one wall), y-axis the other. Confirmed with vịt
-# 2026-08-26 for this specific room: robot's +x direction runs along the
-# 1m wall.
-ROOM_WIDTH_M = 1.0    # x-axis extent
-ROOM_LENGTH_M = 2.23  # y-axis extent
+# Room frame (CHANGED 2026-09-04 -- see START_X_M/START_Y_M below).
+#
+# Previously the room frame was the raw odom frame: origin exactly at the
+# robot's start pose, +x = the robot's initial heading, and the robot
+# started in a corner facing down the room's SHORT (1m) wall. That meant
+# the very first thing the mission did was an in-place turn toward the far
+# wall, immediately followed by a long leg -- any heading error in that
+# opening turn got integrated over the whole 2.23m straight, which is where
+# the "runs into walls" behaviour came from (odometry-only, nothing
+# corrects a bad initial heading).
+#
+# Now the robot is PHYSICALLY PLACED already aligned down the long straight,
+# so the mission opens with a pure straight leg (no blind opening turn) and
+# only ever makes 90deg right turns after that. To keep that true, the x-axis
+# is now the LONG axis (the direction the robot faces at start) and the
+# y-axis the short one -- i.e. the two values below are swapped vs. before.
+ROOM_WIDTH_M = 2.23   # x-axis extent -- the LONG straight, robot faces down
+                       # this at start
+ROOM_LENGTH_M = 1.0   # y-axis extent -- the short axis, crossed by the two
+                       # short legs
 
 # Inset from the walls for the patrol path (physical clearance while
 # perimeter-hugging) -- same 0.3m used in the original 2x2m room. On this
@@ -110,25 +133,60 @@ ROOM_LENGTH_M = 2.23  # y-axis extent
 # physical eyeball check before the real run given how tight this one is.
 WAYPOINT_INSET_M = 0.3
 
+# Where the robot physically starts, in ROOM coordinates (meters). Odometry
+# still reports (0,0) at power-on, so on_odom adds this offset to convert
+# odom -> room frame (a pure translation: heading/theta is unchanged, since
+# the robot starts facing +x in both frames).
+#
+# Why an offset at all instead of just leaving the origin at the robot like
+# before: the camera rig looks 45deg to the robot's RIGHT
+# (CAMERA_BEARING_OFFSET_RAD), so the patrol must run CLOCKWISE for the
+# camera to face the room interior the whole time (see the WAYPOINTS comment
+# below). Starting aligned down the long wall + turning right means the room
+# interior lies on the -y side of the start pose, which would make every room
+# coordinate negative in the raw odom frame -- and the grid report, the
+# dashboard map, and the RViz view all assume a room spanning 0..extent.
+# Shifting the origin to the room's corner keeps all of them working
+# unchanged.
+#
+# Start pose = the first patrol corner itself (inset from both walls), so the
+# robot begins ON the patrol rectangle rather than having to drive onto it.
+START_X_M = WAYPOINT_INSET_M                    # 0.3 -- inset from the wall behind the robot
+START_Y_M = ROOM_LENGTH_M - WAYPOINT_INSET_M    # 0.7 -- inset from the wall on the robot's left
+
 # Loop direction matters: the camera rig is mounted looking toward the
 # robot's RIGHT (CAMERA_BEARING_OFFSET_RAD below). For it to look toward
 # the room's interior (not out past the wall) the whole loop, the interior
 # must stay on the robot's right side throughout -- which only happens
-# walking the loop CLOCKWISE (right turn at every corner). Fixed
-# 2026-08-26: this order starts with one in-place left turn (normal,
-# already-supported behavior) toward the far wall first, then turns right
-# at every corner from there -- the previous order turned left at every
-# corner (counter-clockwise), which pointed the camera outward the entire
-# patrol, never toward the duck.
+# walking the loop CLOCKWISE (right turn at every corner).
+#
+# Rewritten 2026-09-04 for the new start pose (see START_X_M/START_Y_M):
+# the robot is now placed already aligned down the long straight and
+# already ON the first patrol corner, so the loop opens with a pure
+# straight leg and is nothing but right turns after that --
+#
+#   start (0.30, 0.70) facing +x
+#     -> WP0 (1.93, 0.70)  drive straight 1.63m down the long wall
+#     -> turn right 90deg
+#     -> WP1 (1.93, 0.30)  cross the short end, 0.40m
+#     -> turn right 90deg
+#     -> WP2 (0.30, 0.30)  back 1.63m down the far long wall
+#     -> turn right 90deg
+#     -> WP3 (0.30, 0.70)  cross back to start, 0.40m
+#
+# WP3 is the start pose, so the position error reported on reaching it is
+# still the real accumulated loop drift, same as the old final waypoint.
+# Note the start pose is deliberately NOT in this list: the robot is
+# already standing on it, so listing it would be instantly "reached" and
+# skipped on the first control tick.
 WAYPOINTS = [
-    (WAYPOINT_INSET_M, WAYPOINT_INSET_M),
-    (WAYPOINT_INSET_M, ROOM_LENGTH_M - WAYPOINT_INSET_M),
     (ROOM_WIDTH_M - WAYPOINT_INSET_M, ROOM_LENGTH_M - WAYPOINT_INSET_M),
     (ROOM_WIDTH_M - WAYPOINT_INSET_M, WAYPOINT_INSET_M),
-    (WAYPOINT_INSET_M, WAYPOINT_INSET_M),  # back to start -- also how we measure real loop drift
+    (WAYPOINT_INSET_M, WAYPOINT_INSET_M),
+    (WAYPOINT_INSET_M, ROOM_LENGTH_M - WAYPOINT_INSET_M),  # back to start -- also how we measure real loop drift
 ]
 
-GRID_CELL_M = 0.5  # grid reporting resolution, same in both directions -> 2x4 grid here
+GRID_CELL_M = 0.5  # grid reporting resolution, same in both directions -> 4x2 grid here
 
 # How far the camera RIG (both cameras, rigidly mounted together) is
 # physically rotated relative to the chassis' forward direction (base_link
@@ -775,8 +833,17 @@ class SearchAndRescue(Node):
     # -- odometry -----------------------------------------------------------
 
     def on_odom(self, msg: Odometry):
-        self.x = msg.pose.pose.position.x
-        self.y = msg.pose.pose.position.y
+        # odom -> room frame (2026-09-04). The ESP32 zeroes odometry at
+        # power-on, so raw /odom is "meters from wherever the robot was
+        # switched on". START_X_M/START_Y_M shift that onto the room's own
+        # corner-origin coordinates, which is what WAYPOINTS, the grid
+        # report, and the dashboard map are all written in. Pure
+        # translation -- theta needs no correction because the robot is
+        # placed facing +x in the room frame too (that placement IS the
+        # assumption this whole mission rests on; if the robot is set down
+        # misaligned, everything downstream inherits that error).
+        self.x = msg.pose.pose.position.x + START_X_M
+        self.y = msg.pose.pose.position.y + START_Y_M
         self.theta = yaw_from_quaternion(msg.pose.pose.orientation)
         self.have_odom = True
 
@@ -804,8 +871,15 @@ class SearchAndRescue(Node):
         t.header.stamp = self.get_clock().now().to_msg()
         t.header.frame_id = msg.header.frame_id       # "odom"
         t.child_frame_id = msg.child_frame_id         # "base_link"
-        t.transform.translation.x = msg.pose.pose.position.x
-        t.transform.translation.y = msg.pose.pose.position.y
+        # Broadcast the ROOM-frame pose (self.x/self.y), not the raw odom
+        # numbers (2026-09-04). The duck Markers below are published in the
+        # frame literally named 'odom' but positioned with room-frame
+        # world_x/world_y -- so the TF has to use the same shifted frame or
+        # RViz would draw the robot and its duck sightings 0.3/0.7m apart
+        # from each other. Net effect: the frame called 'odom' in RViz IS
+        # the room frame, origin at the room corner.
+        t.transform.translation.x = self.x
+        t.transform.translation.y = self.y
         t.transform.translation.z = msg.pose.pose.position.z
         t.transform.rotation = msg.pose.pose.orientation
         self.tf_broadcaster.sendTransform(t)
@@ -1569,6 +1643,7 @@ class SearchAndRescue(Node):
                 'esp32_diag': node.esp32_diag,
                 'waypoint_idx': node.waypoint_idx,
                 'waypoints': WAYPOINTS,
+                'start': [START_X_M, START_Y_M],
                 'room_width': ROOM_WIDTH_M,
                 'room_length': ROOM_LENGTH_M,
                 'grid_cell': GRID_CELL_M,
@@ -1861,9 +1936,10 @@ HTML_PAGE = """<!doctype html>
     <div class="column">
       <div class="panel">
         <div class="panel-title">Room map</div>
-        <canvas id="map" width="150" height="335"></canvas>
+        <canvas id="map" width="335" height="150"></canvas>
         <div class="legend">
           solid box = room walls &middot; dashed box = patrol path &middot;
+          hollow circle = start pose &middot;
           <span style="color:#ff5b5b;">&#9679;</span> = current best duck estimate &middot;
           <span style="color:#ffd76b;">&#9679;</span> = individual sightings &middot;
           <span style="color:#9fd3ff;">&#9654;</span> = robot &middot;
@@ -1945,6 +2021,7 @@ HTML_PAGE = """<!doctype html>
         <div class="panel-title">Duck detection</div>
         <div class="status-line" id="duckStatus">connecting...</div>
         <div id="stereoBox"></div>
+        <div id="pointcloudBox"></div>
         <div id="reportBox"></div>
       </div>
     </div>
@@ -1990,9 +2067,13 @@ function draw(state) {
   ctx.setLineDash([6, 5]);
   ctx.lineWidth = 2;
   ctx.beginPath();
-  state.waypoints.forEach((wp, i) => {
+  // Path starts at the robot's start pose, not at waypoint 0 -- the robot is
+  // placed already standing on the loop, so the first leg is start -> WP0.
+  const [stx, sty] = toScreen(state.start[0], state.start[1]);
+  ctx.moveTo(stx, sty);
+  state.waypoints.forEach((wp) => {
     const [sx, sy] = toScreen(wp[0], wp[1]);
-    if (i === 0) ctx.moveTo(sx, sy); else ctx.lineTo(sx, sy);
+    ctx.lineTo(sx, sy);
   });
   ctx.stroke();
   ctx.setLineDash([]);
@@ -2003,6 +2084,12 @@ function draw(state) {
     ctx.fillStyle = '#3a5a7a';
     ctx.beginPath(); ctx.arc(sx, sy, 4, 0, 7); ctx.fill();
   });
+
+  // start pose -- hollow marker, so it reads as "put the robot here" rather
+  // than as another waypoint to drive to
+  ctx.strokeStyle = '#6f8fae';
+  ctx.lineWidth = 2;
+  ctx.beginPath(); ctx.arc(stx, sty, 6, 0, 7); ctx.stroke();
 
   // raw duck sightings -- faint, small: a cloud of noisy individual readings,
   // not meant to be read precisely on their own, just context for the estimate
@@ -2165,6 +2252,28 @@ function poll() {
     } else {
       stereoBox.innerHTML = `<div class="stat-highlight stale">no current stereo lock ` +
         `(duck not seen by both cameras right now)</div>`;
+    }
+
+    // Point-cloud (dense-stereo) distance, mirrored here from the /vision
+    // debug page (2026-09-04) so it's visible without switching pages --
+    // this is the box that shows POINTCLOUD_CENTROID_MAX_DISAGREEMENT_FRAC
+    // gating (search_and_rescue.py) when point-cloud disagrees with the
+    // centroid method above by too much.
+    const pointcloudBox = document.getElementById('pointcloudBox');
+    const pcFresh = state.latest_pointcloud && (Date.now() / 1000 - state.latest_pointcloud.t) < 3.0;
+    if (pcFresh) {
+      const p = state.latest_pointcloud;
+      const s = state.latest_stereo;
+      const diffTxt = (stereoFresh && s)
+        ? ` (centroid method: ${s.distance_m.toFixed(2)}m, diff ${(p.distance_m - s.distance_m).toFixed(2)}m)`
+        : '';
+      const gatedTxt = p.gated
+        ? ' <span style="color:#e0a030;">[gated -&gt; using centroid]</span>' : '';
+      pointcloudBox.innerHTML = `<div class="stat-highlight">point-cloud distance: ` +
+        `<b>${p.distance_m.toFixed(2)}m</b>${diffTxt}${gatedTxt} ` +
+        `<span style="color:#8a94a6;">(${p.n_points} points, ${p.compute_ms.toFixed(0)}ms compute)</span></div>`;
+    } else {
+      pointcloudBox.innerHTML = `<div class="stat-highlight stale">no current point-cloud estimate</div>`;
     }
 
     document.getElementById('startBtn').disabled = state.started || state.done || !!state.manual_move;
