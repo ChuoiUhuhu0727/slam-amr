@@ -48,7 +48,9 @@ Deliberately does NOT use Nav2, VSLAM, or the Isaac ROS stereo depth pipeline:
 
 Physical start placement (CHANGED 2026-09-04): the robot must be set down
 in a corner ALREADY FACING DOWN THE LONG (2.23m) STRAIGHT, about 30cm out
-from the wall behind it and 30cm out from the wall on its right. The
+from the wall behind it and 30cm out from the wall on its LEFT -- so the
+rest of the room (and the duck) opens out to the robot's RIGHT, which is
+the side the camera rig looks toward (CAMERA_BEARING_OFFSET_RAD). The
 mission then opens with a straight 1.63m leg and only ever turns right
 (see WAYPOINTS). Previously it started facing down the SHORT wall and had
 to open with a blind in-place turn, whose heading error then compounded
@@ -151,8 +153,11 @@ WAYPOINT_INSET_M = 0.3
 #
 # Start pose = the first patrol corner itself (inset from both walls), so the
 # robot begins ON the patrol rectangle rather than having to drive onto it.
-START_X_M = WAYPOINT_INSET_M                    # 0.3 -- inset from the wall behind the robot
-START_Y_M = ROOM_LENGTH_M - WAYPOINT_INSET_M    # 0.7 -- inset from the wall on the robot's left
+START_X_M = WAYPOINT_INSET_M                    # 0.3 -- 30cm from the wall BEHIND the robot
+START_Y_M = ROOM_LENGTH_M - WAYPOINT_INSET_M    # 0.7 -- 30cm from the wall on the robot's LEFT
+                                                 # (robot faces +x, so +y is its left, REP103).
+                                                 # The other 0.7m of the room is on its right --
+                                                 # the side the camera rig looks toward.
 
 # Loop direction matters: the camera rig is mounted looking toward the
 # robot's RIGHT (CAMERA_BEARING_OFFSET_RAD below). For it to look toward
@@ -1573,6 +1578,46 @@ class SearchAndRescue(Node):
         avg_y = sum(p[1] for p in self.duck_sightings) / len(self.duck_sightings)
         return {'x': avg_x, 'y': avg_y, 'sightings': len(self.duck_sightings)}
 
+    def duck_from_start(self):
+        """The search-and-rescue answer, phrased for the human doing the
+        rescuing: how far and in which direction the duck is FROM THE ROBOT'S
+        START POSE.
+
+        Why the start pose specifically -- it's the one point in the room a
+        person is guaranteed to be able to stand on and face correctly,
+        because they put the robot there themselves. Room coordinates like
+        "duck at (1.40, 0.35)" are exact but useless to someone standing in
+        the doorway with no origin marked on the floor; "1.1m away, 35deg to
+        your right" is directly actionable.
+
+        Bearing is measured from the direction the robot FACED AT START (+x
+        in the room frame, i.e. straight down the long wall), REP103 sign
+        convention -- positive = to the left, negative = to the right. So
+        the human instruction is: stand where the robot started, face the way
+        it was pointing, then turn by this angle and walk this distance.
+
+        ACCURACY CAVEAT -- this is NOT as trustworthy as the raw "distance to
+        duck now" reading, even though both are printed in meters on the same
+        dashboard. That one is pure stereo (~1% error at 1.3m, measured
+        2026-09-04). This one is stereo PLUS wherever odometry thinks the
+        robot is standing, so it inherits the full accumulated odometry drift
+        of the run -- and odometry drift is the known-weak layer here (no
+        localisation, wheel encoders + gyro heading only). Worth measuring
+        rather than assuming: put the duck at a tape-measured spot, run one
+        loop, compare this number against the tape. The difference IS the
+        odometry error, in the units that actually matter for the mission.
+        """
+        estimate = self.duck_estimate()
+        if estimate is None:
+            return None
+        dx = estimate['x'] - START_X_M
+        dy = estimate['y'] - START_Y_M
+        return {
+            'distance_m': math.hypot(dx, dy),
+            'bearing_deg': math.degrees(math.atan2(dy, dx)),
+            'sightings': estimate['sightings'],
+        }
+
     def _report(self):
         estimate = self.duck_estimate()
         if estimate is None:
@@ -1584,14 +1629,24 @@ class SearchAndRescue(Node):
         cell_x = max(0, min(int(ROOM_WIDTH_M / GRID_CELL_M) - 1, int(avg_x // GRID_CELL_M)))
         cell_y = max(0, min(int(ROOM_LENGTH_M / GRID_CELL_M) - 1, int(avg_y // GRID_CELL_M)))
 
+        from_start = self.duck_from_start()
+        side = 'left' if from_start['bearing_deg'] >= 0 else 'right'
         self.get_logger().info(
             f"=== REPORT: {estimate['sightings']} sighting(s), "
             f"averaged position ({avg_x:.2f}, {avg_y:.2f}) -> grid cell ({cell_x}, {cell_y}) ==="
+        )
+        self.get_logger().info(
+            f"=== TO REACH THE DUCK: from the robot's start pose, facing the way it "
+            f"started, turn {abs(from_start['bearing_deg']):.0f}deg to your {side} and "
+            f"walk {from_start['distance_m']:.2f}m "
+            f"(odometry-dependent -- see duck_from_start docstring) ==="
         )
         self.report = {
             'sightings': estimate['sightings'],
             'avg_x': avg_x, 'avg_y': avg_y,
             'cell_x': cell_x, 'cell_y': cell_y,
+            'from_start_m': from_start['distance_m'],
+            'from_start_bearing_deg': from_start['bearing_deg'],
         }
 
     # -- web dashboard --------------------------------------------------------
@@ -1651,6 +1706,7 @@ class SearchAndRescue(Node):
                 'started': node.started,
                 'duck_sightings': node.duck_sightings,
                 'duck_estimate': node.duck_estimate(),
+                'duck_from_start': node.duck_from_start(),
                 'latest_stereo': node.latest_stereo_reading,
                 'latest_pointcloud': node.latest_pointcloud_reading,
                 'stereo_distance_smoothed_m': (
@@ -1892,6 +1948,20 @@ HTML_PAGE = """<!doctype html>
     background: #10201c; border: 1px solid #1c4d2b; color: #9fe6ae;
   }
   .stat-highlight.stale { background: #201c10; border-color: #4a3f18; color: #8a94a6; }
+  /* The rescue directions -- deliberately styled differently (and larger)
+     than .stat-highlight, because it is the mission's actual OUTPUT, not
+     another live sensor readout. Blue, not the green used for "a sensor is
+     currently reading fine", so the two don't get scanned as the same kind
+     of number. */
+  .rescue {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    padding: 10px 12px; margin-top: 8px; border-radius: 8px;
+    background: #101a26; border: 1px solid #24506f; color: #9fd3ff;
+    line-height: 1.5;
+  }
+  .rescue .big { font-size: 1.25rem; font-weight: 700; }
+  .rescue .caveat { font-size: 0.7rem; color: #7d8ba0; margin-top: 6px; display: block; }
+  .rescue.stale { background: #1b1f27; border-color: #2a2f3a; color: #8a94a6; }
   .badge {
     display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 0.75rem;
     background: #2a2f3a; margin-left: 6px;
@@ -1939,7 +2009,7 @@ HTML_PAGE = """<!doctype html>
         <canvas id="map" width="335" height="150"></canvas>
         <div class="legend">
           solid box = room walls &middot; dashed box = patrol path &middot;
-          hollow circle = start pose &middot;
+          hollow circle = start pose &middot; blue line = start &rarr; duck (the rescue vector) &middot;
           <span style="color:#ff5b5b;">&#9679;</span> = current best duck estimate &middot;
           <span style="color:#ffd76b;">&#9679;</span> = individual sightings &middot;
           <span style="color:#9fd3ff;">&#9654;</span> = robot &middot;
@@ -2019,6 +2089,7 @@ HTML_PAGE = """<!doctype html>
       </div>
       <div class="panel">
         <div class="panel-title">Duck detection</div>
+        <div id="rescueBox"></div>
         <div class="status-line" id="duckStatus">connecting...</div>
         <div id="stereoBox"></div>
         <div id="pointcloudBox"></div>
@@ -2098,6 +2169,17 @@ function draw(state) {
     ctx.fillStyle = 'rgba(255, 215, 107, 0.35)';
     ctx.beginPath(); ctx.arc(sx, sy, 3, 0, 7); ctx.fill();
   });
+
+  // The rescue vector: start pose -> duck estimate. Drawn because the two
+  // numbers in the rescue box (turn X, walk Y) are exactly this arrow --
+  // seeing it on the map is how you catch a wrong-side sign error at a
+  // glance instead of by walking into a wall.
+  if (state.duck_estimate) {
+    const [dsx, dsy] = toScreen(state.duck_estimate.x, state.duck_estimate.y);
+    ctx.strokeStyle = 'rgba(159, 211, 255, 0.55)';
+    ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(stx, sty); ctx.lineTo(dsx, dsy); ctx.stroke();
+  }
 
   // running average of all sightings so far -- THE answer, updates live the
   // whole time (not just once the loop finishes)
@@ -2234,6 +2316,27 @@ function poll() {
       pidFieldsInitialized = true;
     }
 
+    // Rescue directions from the start pose -- the mission's actual answer.
+    // Updates live off the running average, not only at the end of the loop,
+    // so it can be watched converging (or not) as sightings accumulate.
+    const rescueBox = document.getElementById('rescueBox');
+    if (state.duck_from_start) {
+      const fs = state.duck_from_start;
+      const side = fs.bearing_deg >= 0 ? 'left' : 'right';
+      rescueBox.className = 'rescue';
+      rescueBox.innerHTML =
+        `<div>&#128020; TO REACH THE DUCK &mdash; from the robot's start pose, ` +
+        `facing the way it started:</div>` +
+        `<div class="big">turn ${Math.abs(fs.bearing_deg).toFixed(0)}&deg; ` +
+        `${side}, walk ${fs.distance_m.toFixed(2)}m</div>` +
+        `<span class="caveat">averaged over ${fs.sightings} sighting(s). ` +
+        `Depends on odometry (where the robot thinks it is), not just stereo &mdash; ` +
+        `less accurate than the raw distance below.</span>`;
+    } else {
+      rescueBox.className = 'rescue stale';
+      rescueBox.innerHTML = `&#128020; TO REACH THE DUCK &mdash; no sighting yet`;
+    }
+
     const stereoFresh = state.latest_stereo && (Date.now() / 1000 - state.latest_stereo.t) < 2.0;
     document.getElementById('duckStatus').innerHTML =
       `camera: <b>${state.has_camera ? 'on' : 'off (--nav-only)'}</b><br>` +
@@ -2300,7 +2403,8 @@ function poll() {
     const reportBox = document.getElementById('reportBox');
     if (state.report) {
       if (state.report.sightings > 0) {
-        reportBox.innerHTML = `<div class="report">REPORT<br>duck at (${state.report.avg_x.toFixed(2)}, ${state.report.avg_y.toFixed(2)})<br>grid cell (${state.report.cell_x}, ${state.report.cell_y})<br>from ${state.report.sightings} sighting(s)</div>`;
+        const rSide = state.report.from_start_bearing_deg >= 0 ? 'left' : 'right';
+        reportBox.innerHTML = `<div class="report">REPORT<br>duck at (${state.report.avg_x.toFixed(2)}, ${state.report.avg_y.toFixed(2)})<br>grid cell (${state.report.cell_x}, ${state.report.cell_y})<br>from start: ${Math.abs(state.report.from_start_bearing_deg).toFixed(0)}&deg; ${rSide}, ${state.report.from_start_m.toFixed(2)}m<br>from ${state.report.sightings} sighting(s)</div>`;
       } else {
         reportBox.innerHTML = `<div class="report">REPORT<br>loop complete, no duck sighted</div>`;
       }
