@@ -1945,6 +1945,7 @@ HTML_PAGE = """<!doctype html>
         <div class="panel-title">Duck detection</div>
         <div class="status-line" id="duckStatus">connecting...</div>
         <div id="stereoBox"></div>
+        <div id="pointcloudBox"></div>
         <div id="reportBox"></div>
       </div>
     </div>
@@ -2165,6 +2166,28 @@ function poll() {
     } else {
       stereoBox.innerHTML = `<div class="stat-highlight stale">no current stereo lock ` +
         `(duck not seen by both cameras right now)</div>`;
+    }
+
+    // Point-cloud (dense-stereo) distance, mirrored here from the /vision
+    // debug page (2026-09-04) so it's visible without switching pages --
+    // this is the box that shows POINTCLOUD_CENTROID_MAX_DISAGREEMENT_FRAC
+    // gating (search_and_rescue.py) when point-cloud disagrees with the
+    // centroid method above by too much.
+    const pointcloudBox = document.getElementById('pointcloudBox');
+    const pcFresh = state.latest_pointcloud && (Date.now() / 1000 - state.latest_pointcloud.t) < 3.0;
+    if (pcFresh) {
+      const p = state.latest_pointcloud;
+      const s = state.latest_stereo;
+      const diffTxt = (stereoFresh && s)
+        ? ` (centroid method: ${s.distance_m.toFixed(2)}m, diff ${(p.distance_m - s.distance_m).toFixed(2)}m)`
+        : '';
+      const gatedTxt = p.gated
+        ? ' <span style="color:#e0a030;">[gated -&gt; using centroid]</span>' : '';
+      pointcloudBox.innerHTML = `<div class="stat-highlight">point-cloud distance: ` +
+        `<b>${p.distance_m.toFixed(2)}m</b>${diffTxt}${gatedTxt} ` +
+        `<span style="color:#8a94a6;">(${p.n_points} points, ${p.compute_ms.toFixed(0)}ms compute)</span></div>`;
+    } else {
+      pointcloudBox.innerHTML = `<div class="stat-highlight stale">no current point-cloud estimate</div>`;
     }
 
     document.getElementById('startBtn').disabled = state.started || state.done || !!state.manual_move;
