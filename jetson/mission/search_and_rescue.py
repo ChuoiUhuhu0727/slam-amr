@@ -48,7 +48,7 @@ Deliberately does NOT use Nav2, VSLAM, or the Isaac ROS stereo depth pipeline:
 
 Physical start placement (CHANGED 2026-09-04): the robot must be set down
 in a corner ALREADY FACING DOWN THE LONG (2.23m) STRAIGHT, about 30cm out
-from the wall behind it and 30cm out from the wall on its LEFT -- so the
+from the wall behind it and 25cm out from the wall on its LEFT -- so the
 rest of the room (and the duck) opens out to the robot's RIGHT, which is
 the side the camera rig looks toward (CAMERA_BEARING_OFFSET_RAD). The
 mission then opens with a straight 1.63m leg and only ever turns right
@@ -128,12 +128,26 @@ ROOM_LENGTH_M = 1.0   # y-axis extent -- the short axis, crossed by the two
                        # short legs
 
 # Inset from the walls for the patrol path (physical clearance while
-# perimeter-hugging) -- same 0.3m used in the original 2x2m room. On this
-# room's 1m-wide axis that's still the same absolute 0.3m wall clearance
-# as before (just a visually narrower 0.4m gap between the two inset
-# lines) -- should still be safe based on that room's testing, but worth a
-# physical eyeball check before the real run given how tight this one is.
-WAYPOINT_INSET_M = 0.3
+# perimeter-hugging). Split per-axis 2026-09-04 (was one shared 0.3m): the
+# two axes are doing different jobs here, so one number can't be tuned for
+# both.
+#
+# X (along the 2.23m long wall) sets how far the robot stops short of the
+# end walls -- braking distance, basically. Unchanged at 0.3m, which makes
+# each long straight 2.23 - 0.6 = 1.63m.
+#
+# Y (across the 1.0m short axis) sets the WIDTH OF THE PATROL LOOP -- the
+# gap between the two long straights, which is what the camera sweeps
+# between. Widened 0.30 -> 0.25 at vịt's request, taking that gap from
+# 0.40m to 0.50m.
+#
+# The trade-off is explicit: side-wall clearance drops 30cm -> 25cm. Given
+# the earlier wall-collision trouble came from heading error compounding
+# over a long straight (fixed by the new aligned start pose), not from the
+# insets being too small, 25cm should hold -- but this is the number to put
+# back to 0.3 first if it starts clipping walls again.
+WAYPOINT_INSET_X_M = 0.30   # along the long axis -> 1.63m straights
+WAYPOINT_INSET_Y_M = 0.25   # across the short axis -> 0.50m loop width
 
 # Where the robot physically starts, in ROOM coordinates (meters). Odometry
 # still reports (0,0) at power-on, so on_odom adds this offset to convert
@@ -153,8 +167,8 @@ WAYPOINT_INSET_M = 0.3
 #
 # Start pose = the first patrol corner itself (inset from both walls), so the
 # robot begins ON the patrol rectangle rather than having to drive onto it.
-START_X_M = WAYPOINT_INSET_M                    # 0.3 -- 30cm from the wall BEHIND the robot
-START_Y_M = ROOM_LENGTH_M - WAYPOINT_INSET_M    # 0.7 -- 30cm from the wall on the robot's LEFT
+START_X_M = WAYPOINT_INSET_X_M                    # 0.30 -- 30cm from the wall BEHIND the robot
+START_Y_M = ROOM_LENGTH_M - WAYPOINT_INSET_Y_M    # 0.75 -- 25cm from the wall on the robot's LEFT
                                                  # (robot faces +x, so +y is its left, REP103).
                                                  # The other 0.7m of the room is on its right --
                                                  # the side the camera rig looks toward.
@@ -170,14 +184,14 @@ START_Y_M = ROOM_LENGTH_M - WAYPOINT_INSET_M    # 0.7 -- 30cm from the wall on t
 # already ON the first patrol corner, so the loop opens with a pure
 # straight leg and is nothing but right turns after that --
 #
-#   start (0.30, 0.70) facing +x
-#     -> WP0 (1.93, 0.70)  drive straight 1.63m down the long wall
+#   start (0.30, 0.75) facing +x
+#     -> WP0 (1.93, 0.75)  drive straight 1.63m down the long wall
 #     -> turn right 90deg
-#     -> WP1 (1.93, 0.30)  cross the short end, 0.40m
+#     -> WP1 (1.93, 0.25)  cross the short end, 0.50m
 #     -> turn right 90deg
-#     -> WP2 (0.30, 0.30)  back 1.63m down the far long wall
+#     -> WP2 (0.30, 0.25)  back 1.63m down the far long wall
 #     -> turn right 90deg
-#     -> WP3 (0.30, 0.70)  cross back to start, 0.40m
+#     -> WP3 (0.30, 0.75)  cross back to start, 0.50m
 #
 # WP3 is the start pose, so the position error reported on reaching it is
 # still the real accumulated loop drift, same as the old final waypoint.
@@ -185,10 +199,10 @@ START_Y_M = ROOM_LENGTH_M - WAYPOINT_INSET_M    # 0.7 -- 30cm from the wall on t
 # already standing on it, so listing it would be instantly "reached" and
 # skipped on the first control tick.
 WAYPOINTS = [
-    (ROOM_WIDTH_M - WAYPOINT_INSET_M, ROOM_LENGTH_M - WAYPOINT_INSET_M),
-    (ROOM_WIDTH_M - WAYPOINT_INSET_M, WAYPOINT_INSET_M),
-    (WAYPOINT_INSET_M, WAYPOINT_INSET_M),
-    (WAYPOINT_INSET_M, ROOM_LENGTH_M - WAYPOINT_INSET_M),  # back to start -- also how we measure real loop drift
+    (ROOM_WIDTH_M - WAYPOINT_INSET_X_M, ROOM_LENGTH_M - WAYPOINT_INSET_Y_M),
+    (ROOM_WIDTH_M - WAYPOINT_INSET_X_M, WAYPOINT_INSET_Y_M),
+    (WAYPOINT_INSET_X_M, WAYPOINT_INSET_Y_M),
+    (WAYPOINT_INSET_X_M, ROOM_LENGTH_M - WAYPOINT_INSET_Y_M),  # back to start -- also how we measure real loop drift
 ]
 
 GRID_CELL_M = 0.5  # grid reporting resolution, same in both directions -> 4x2 grid here
