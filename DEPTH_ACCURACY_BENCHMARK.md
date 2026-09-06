@@ -171,6 +171,44 @@ distances, same session as §4.3:
 > point breaks that pattern, so a single scale factor does not explain it
 > either. Unresolved.
 
+### 4.5 End-to-end mission result — 2026-09-06 (robot driving)
+
+The first measurement of the number the mission actually outputs: distance
+from the robot's start pose to the target, read off the dashboard's rescue box
+**while the robot was driving its patrol**, against a tape-measured ground
+truth.
+
+| Ground truth | Reported | Error | Absolute |
+|---:|---:|---:|---:|
+| 0.31 m | 0.30 m | −3.2 % | **1 cm** |
+| 0.90 m | 0.74 m | −17.8 % | 16 cm |
+| 1.04 m | 1.00 m | −3.8 % | **4 cm** |
+
+This is a **different and harder quantity** than §4.1–4.4. Those isolate the
+stereo distance with the robot stationary. This one stacks four error sources:
+
+1. centroid stereo distance,
+2. the bearing (lateral angle) — whose **sign has never been empirically
+   verified** (see the comment at `_detect_tick`),
+3. odometry position *and* heading, accumulated over the drive,
+4. `duck_estimate()`'s running **mean** over every sighting in the run.
+
+**On (4) — a real inconsistency in the code, found 2026-09-06:** the live
+distance readout uses a rolling **median**, with an explicit comment saying
+median was chosen *"specifically to reject the occasional badly-localized box
+outright rather than let it drag an average around."* But `duck_estimate()` —
+the function producing the final answer — uses a plain **mean** over the whole
+run, with no outlier rejection and no sliding window. One bad sighting that
+passes the gates biases the result permanently. This is the leading candidate
+for the 0.90 m outlier above. Not yet fixed.
+
+**Read the result for what it is.** Two of three placements land within 1–4 cm
+end-to-end, from a moving robot with odometry-only localisation and passive
+stereo on ambient light. For the mission's purpose — telling a human where to
+walk to find the target — that is comfortably good enough, and it is the
+honest headline result of the project. It is *not* evidence about the stereo
+distance sensor's own accuracy; §4.4 is, and it says ~10 %.
+
 ---
 
 ## 5. Current status — what is and is not verified
@@ -184,8 +222,10 @@ distances, same session as §4.3:
 | Method B 6–10 % below 0.5 m | ✅ Measured 2026-08-29 |
 | Method B unreliable beyond ~0.5 m | ✅ Measured 2026-09-04 |
 | The centroid gate (PR #68) works | ❌ **Shipped but never live-verified** |
-| Any accuracy while the robot is *moving* | ❌ Never measured |
-| Duck position in room coordinates | ❌ Never measured — inherits odometry drift on top of all the above |
+| Any accuracy while the robot is *moving* | ✅ Measured 2026-09-06 (§4.5) — 1–4 cm on two of three placements, one 16 cm outlier |
+| Which of the four stacked layers causes the §4.5 outlier | ❌ Not separable from the data collected |
+| Bearing (lateral angle) sign | ❌ **Never empirically verified** — flagged in the code since it was written |
+| Odometry drift over one patrol loop | ❌ Never measured on its own |
 
 > **The honest headline is:** *"~10 % error over 0.3–1.0 m, dropping to ~1 % at
 > 1.30 m, robot stationary, one placement per distance."*
@@ -315,6 +355,7 @@ decision made here.
 | Dense point cloud | 0.3–0.5 m | 6–10 % | static, core-region median | 2026-08-29 |
 | Dense point cloud | > 0.5 m | unusable | background-lock on textureless duck | 2026-09-04 |
 | Theoretical floor (1 px) | 1.30 m | 1.74 % | geometry of this rig | derived |
+| **End-to-end mission output** | **0.31–1.04 m** | **1–4 cm (one 16 cm outlier)** | **robot driving, stereo + odometry** | **2026-09-06** |
 | *RealSense D435 (reference)* | *2.0 m* | *< 2 %* | *active IR stereo* | *datasheet* |
 
 ---
