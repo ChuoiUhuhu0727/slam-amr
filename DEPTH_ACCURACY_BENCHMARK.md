@@ -147,6 +147,30 @@ disagrees with A's by more than 30 %, rescale B's position vector onto A's
 distance — keeps B's lateral direction, discards a depth that probably came
 from the wrong object.
 
+### 4.4 Full-range sweep — 2026-09-04, end of session (Method A, post-fix)
+
+Read live off the main dashboard's smoothed centroid readout, all four
+distances, same session as §4.3:
+
+| Ground truth | Measured | Error | Implied disparity error |
+|---:|---:|---:|---:|
+| 0.30 m | 0.34 m | **+13.3 %** | −29.3 px |
+| 0.50 m | 0.54–0.59 m | **+9 to +18 %** | ~−12 px |
+| 1.00 m | 1.10 m | **+10.0 %** | −6.8 px |
+| 1.30 m | 1.30–1.31 m | **~+1 %** | −0.4 px |
+
+> **This is the table that matters most, and it changes the headline.**
+> Method A is **not** a ~1 % system. It sits around **+9 to +13 % across
+> 0.3–1.0 m and only lands near 1 % at 1.30 m.** The 1.30 m result is one
+> point at the end of a curve, not the system's typical accuracy.
+>
+> Note also the sign: every reading here **over-reads** (reports the duck as
+> farther than it is), by a roughly constant ~10 % between 0.3 and 1.0 m.
+> A near-constant *percentage* error is the signature of a scale problem
+> (baseline or focal length), not of random matching noise — but the 1.30 m
+> point breaks that pattern, so a single scale factor does not explain it
+> either. Unresolved.
+
 ---
 
 ## 5. Current status — what is and is not verified
@@ -154,17 +178,21 @@ from the wrong object.
 | Claim | Status |
 |---|---|
 | Method A ≈ 1 % at 1.30 m | ✅ Measured live, many consecutive ticks, 2026-09-04 |
-| Method A 6–10 % at 0.5–1.5 m | ✅ Measured — **but before the photometric fix** |
-| Method A ≈ 1 % across the full 0.3–1.5 m range | ❌ **Never measured.** Only 1.3 m was re-run post-fix |
+| Method A 6–10 % at 0.5–1.5 m | ✅ Measured — before the photometric fix (§4.1) |
+| Method A ≈ 1 % across the full 0.3–1.5 m range | ❌ **Disproven.** The post-fix sweep (§4.4) shows +9 to +13 % at 0.3–1.0 m |
+| A repeatable error-vs-distance curve (mean ± σ, repeat trials) | ❌ Never measured — every number above is a single placement |
 | Method B 6–10 % below 0.5 m | ✅ Measured 2026-08-29 |
 | Method B unreliable beyond ~0.5 m | ✅ Measured 2026-09-04 |
 | The centroid gate (PR #68) works | ❌ **Shipped but never live-verified** |
 | Any accuracy while the robot is *moving* | ❌ Never measured |
 | Duck position in room coordinates | ❌ Never measured — inherits odometry drift on top of all the above |
 
-> **The honest headline is:** *"~1 % error at 1.30 m, single distance, single
-> session, robot stationary."* Not *"~1 % accurate."* The difference is the
-> whole credibility of the claim.
+> **The honest headline is:** *"~10 % error over 0.3–1.0 m, dropping to ~1 % at
+> 1.30 m, robot stationary, one placement per distance."*
+>
+> Not *"~1 % accurate."* Quoting the 1.30 m figure alone would be cherry-picking
+> the single best point out of a four-point sweep taken in the same session —
+> and §4.4 is in the repo, so anyone checking would find it.
 
 ### 5.1 The one experiment that would fix this
 
@@ -281,7 +309,8 @@ decision made here.
 
 | Method | Range | Error | Conditions | Verified |
 |---|---|---|---|---|
-| Centroid disparity | 1.30 m | **~1 %** | static, post-photometric-fix | single session |
+| Centroid disparity | 0.30–1.00 m | **+9 to +13 %** | static, post-photometric-fix, over-reads | 2026-09-04, one placement each |
+| Centroid disparity | 1.30 m | **~1 %** | static, post-photometric-fix | 2026-09-04, single session |
 | Centroid disparity | 0.5–1.5 m | 6–10 % | static, pre-photometric-fix | 2026-08-27 |
 | Dense point cloud | 0.3–0.5 m | 6–10 % | static, core-region median | 2026-08-29 |
 | Dense point cloud | > 0.5 m | unusable | background-lock on textureless duck | 2026-09-04 |
