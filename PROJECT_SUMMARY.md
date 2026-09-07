@@ -5,10 +5,9 @@ single consolidated view: the results, the data behind them, and the engineering
 insights that came out of building it.
 
 Detail lives elsewhere and is not repeated here:
-[`SYSTEM_BENCHMARKS.md`](SYSTEM_BENCHMARKS.md) (all measurements by layer) ·
-[`DEPTH_ACCURACY_BENCHMARK.md`](DEPTH_ACCURACY_BENCHMARK.md) (perception depth
-study + external comparisons) · [`full report.md`](full%20report.md) (the formal
-written report) · `README.md` (dated session logs).
+[`BENCHMARKS.md`](BENCHMARKS.md) (every measured number, by layer, plus the
+external comparisons) · [`full report.md`](full%20report.md) (the formal written
+report) · `README.md` (dated session logs).
 
 ---
 
@@ -320,7 +319,7 @@ Nothing here blocks the system; all are known and recorded.
 
 ## 7. Where this sits against published work
 
-Full treatment in [`DEPTH_ACCURACY_BENCHMARK.md`](DEPTH_ACCURACY_BENCHMARK.md) §6.
+Full treatment in [`BENCHMARKS.md`](BENCHMARKS.md) §9.
 
 - **Intel RealSense D435** — better than 2 % at 2 m, 50 mm baseline, active IR
   pattern projector. The fair comparison, because it uses the same metric type.
