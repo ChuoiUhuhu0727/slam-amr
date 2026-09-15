@@ -6,8 +6,8 @@ insights that came out of building it.
 
 Detail lives elsewhere and is not repeated here:
 [`BENCHMARKS.md`](BENCHMARKS.md) (every measured number, by layer, plus the
-external comparisons) · [`full report.md`](full%20report.md) (the formal written
-report) · `README.md` (dated session logs).
+external comparisons) · [`FULL_REPORT.md`](FULL_REPORT.md) (the formal written
+report) · [`../archive/README_devlog.md`](../archive/README_devlog.md) (dated session logs).
 
 ---
 

@@ -262,7 +262,7 @@ Three cheap fixes, each under 20 minutes:
 ## Sources
 
 **Internal:** `README.md` (2026-08-27 / 08-29 / 09-04 / 09-06 session entries),
-`COMMIT_HISTORY.md`, `stereo_calibration.npz`, `motor_f1.c`, PRs #67 / #68.
+`../archive/COMMIT_HISTORY.md`, `stereo_calibration.npz`, `motor_f1.c`, PRs #67 / #68.
 
 **External:**
 - [FoundationStereo: Zero-Shot Stereo Matching, CVPR 2025](https://arxiv.org/abs/2501.09898) · [project](https://nvlabs.github.io/FoundationStereo/) · [code](https://github.com/NVlabs/FoundationStereo)
