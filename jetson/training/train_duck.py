@@ -1,7 +1,7 @@
 """Fine-tune YOLOv8n on the custom duck dataset. Run on the Jetson (GPU).
 Expects duck_dataset_roboflow/ (exported from Roboflow, 1240 images,
 CC BY 4.0) in the same directory -- replaces the original hand-labeled
-164-image duck_dataset/ as of 2026-08-26.
+164-image data/duck_dataset/ as of 2026-08-26.
 """
 from ultralytics import YOLO
 

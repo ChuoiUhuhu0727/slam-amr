@@ -1,9 +1,23 @@
+# --- Python ---
+__pycache__/
+*.pyc
+
+# --- ESP-IDF build artefacts ---
 build/
 sdkconfig
 managed_components/
 *.o
 *.elf
 *.bin
+
+# --- Editor / OS ---
 .claude/
 .DS_Store
+
+# --- Runtime state, not source ---
 jetson/mission/pid_gains.json
+jetson/tools/logs/
+
+# --- Bulk captures kept locally, regenerable (see data/README.md) ---
+data/stereo_pairs/
+archive/scratch_duck_frames/

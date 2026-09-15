@@ -6,9 +6,9 @@ import os
 import random
 import shutil
 
-IMAGES_DIR = "duck_frames"
-LABELS_DIR = "labeled_image"
-OUTPUT_DIR = "duck_dataset"
+IMAGES_DIR = "data/raw_frames"      # paths are relative to the repo root
+LABELS_DIR = "data/raw_labels"
+OUTPUT_DIR = "data/duck_dataset"
 VAL_FRACTION = 0.1
 CLASS_NAMES = ["duck"]
 

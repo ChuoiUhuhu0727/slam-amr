@@ -1,5 +1,5 @@
 """Test what a single Roboflow inference call returns, before batch-labeling
-all images. Run this on the laptop where duck_frames/ lives.
+all images. Run this on the laptop where data/raw_frames/ lives.
 Set ROBOFLOW_API_KEY as an environment variable first - don't hardcode it.
 """
 import os
@@ -11,7 +11,7 @@ client = InferenceHTTPClient(
     api_key=os.environ["ROBOFLOW_API_KEY"],
 )
 
-IMAGES_DIR = "duck_frames"
+IMAGES_DIR = "data/raw_frames"      # relative to the repo root
 test_image = sorted(os.listdir(IMAGES_DIR))[0]
 test_path = os.path.join(IMAGES_DIR, test_image)
 
