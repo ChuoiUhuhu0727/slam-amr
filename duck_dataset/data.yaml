@@ -1,5 +1,0 @@
-path: C:\Users\Admin\Downloads\SLAM robot\duck_dataset
-train: images/train
-val: images/val
-nc: 1
-names: ['duck']
